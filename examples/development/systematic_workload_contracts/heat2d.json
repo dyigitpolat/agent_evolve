@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "workload_id": "heat2d",
+  "runtime": {
+    "kind": "uv_python",
+    "requirements": [
+      "numpy==2.3.5"
+    ]
+  },
+  "arms": {
+    "control": {
+      "runner": "agent_evolve/examples/development/run_heat2d_generic_uniform_control.py",
+      "artifact_root": "papers/agent_evolve_aaai_2027/research_artifacts/experiment_logs/benchmark_q1/engibench_heat2d/generic_campaign_control",
+      "prepare_arguments": [
+        "prepare",
+        "--run-id",
+        "{prepare_run_id}"
+      ],
+      "live_arguments": [
+        "live",
+        "--run-id",
+        "{live_run_id}",
+        "--prereg",
+        "{preregistration_path}"
+      ],
+      "preregistration_relative_path": "manifest.json"
+    },
+    "treatment": {
+      "runner": "agent_evolve/examples/development/run_heat2d_generic_campaign.py",
+      "artifact_root": "papers/agent_evolve_aaai_2027/research_artifacts/experiment_logs/benchmark_q1/engibench_heat2d/generic_campaign",
+      "prepare_arguments": [
+        "prepare",
+        "--run-id",
+        "{prepare_run_id}"
+      ],
+      "live_arguments": [
+        "live",
+        "--run-id",
+        "{live_run_id}",
+        "--prereg",
+        "{preregistration_path}"
+      ],
+      "preregistration_relative_path": "manifest.json"
+    }
+  }
+}

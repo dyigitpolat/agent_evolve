@@ -27,15 +27,25 @@ from pydantic import BaseModel
 
 from agent_evolve.application.insight_memory import (
     InsightEvidenceLineage,
+    InsightLifecycleState,
     InsightLifecycleTransition,
     InsightMemoryBank,
     InsightMemoryEntry,
     InsightOrigin,
+    InsightRelationKind,
     ReflectedInsightBatchItem,
     context_stratum_hash,
 )
+from agent_evolve.application.executable_hypothesis import (
+    CompiledHypothesisTreatment,
+    registered_source_evidence_sha256,
+)
+from agent_evolve.application.finite_action_selection import (
+    seal_model_finite_action_decision,
+)
 from agent_evolve.application.reflection_workflow import (
     PlannedReflectionCall,
+    PlannedReflectionBatchCall,
     ReflectionCardContractError,
     ReflectionPromptShard,
     ReflectionWorkflow,
@@ -68,9 +78,12 @@ from agent_evolve.core.optimization_semantics import (
     render_optimization_semantics,
 )
 from agent_evolve.domain.finite_variation import (
+    FiniteActionEvidenceBinding,
     FiniteVariationContract,
+    bind_finite_action_evidence,
     validate_finite_variation_contract,
 )
+from agent_evolve.domain.finite_action_set import FiniteActionSetAuthority
 from agent_evolve.domain.ids import CandidateId, LLMCallId, OperatorInvocationId
 from agent_evolve.domain.insight import InsightRef
 from agent_evolve.domain.lineage import (
@@ -107,7 +120,7 @@ from agent_evolve.domain.typed_json import (
 )
 from agent_evolve.policies.memory.randomized_subset import InsightSelectionDecision
 from agent_evolve.policies.memory.prompt_shape import (
-    DefaultEvidencePromptShapePolicyV1,
+    DefaultEvidencePromptShapePolicyV3,
     PromptShapeCommitmentPolicy,
     PromptShapeInputs,
 )
@@ -137,6 +150,19 @@ from agent_evolve.policies.selection.phenotype_recourse import (
     PhenotypeIdentityPolicy,
     TypedConfigurationPhenotypeIdentityPolicy,
 )
+from agent_evolve.policies.variation.crossover_inheritance import (
+    CrossoverInheritanceClaim,
+    CrossoverInheritanceSource,
+    materialize_crossover_inheritance,
+)
+from agent_evolve.policies.variation.exact_parent_crossover import (
+    ExactParentCrossoverContract,
+    ExactParentSource,
+    derive_exact_parent_crossover_contract,
+    exact_parent_import_exclusions_sha256,
+    materialize_exact_parent_crossover,
+    validate_exact_parent_import_exclusions,
+)
 from agent_evolve.policies.variation.typed_patch import (
     ParentConfiguration,
     PatchResolution,
@@ -159,24 +185,41 @@ from agent_evolve.ports.generation_failure import (
     GenerationFailureDisposition,
     classify_generation_failure,
 )
+from agent_evolve.ports.finite_action_selection import (
+    FiniteActionDecision,
+    FiniteActionSelectorKind,
+    validate_finite_action_decision,
+)
 from agent_evolve.ports.structured_output_budget import (
     StructuredOutputBudgetPolicy,
     StructuredOutputRequestKind,
     resolve_structured_output_budget,
     structured_output_budget_policy_metadata,
 )
+from agent_evolve.ports.objective_resolution import (
+    ObjectiveResolutionPort,
+    ObjectiveResolutionReceipt,
+    ObjectiveResolutionRequest,
+    objective_resolution_policy_metadata,
+    resolve_objectives,
+)
 from agent_evolve.ports.agentic_generator import (
     AgenticCallTelemetry,
     AgenticGenerator,
     AtomicMutationDraft,
     AtomicMutationOutputContract,
+    CANDIDATE_COMPONENT_PATH_CONTRACT,
     CandidateDraft,
     ConflictResolutionDraft,
+    ExactParentCrossoverDraft,
+    ExactParentCrossoverOutputContract,
     FiniteVariationSelectionDraft,
     InsightDraft,
     ReflectionInsightContract,
     ReflectionGenerationRequest,
+    ReflectionGenerationResult,
     SourceAttribution,
+    TWO_PARENT_CROSSOVER_EVIDENCE_CONTRACT,
     VariationGenerationRequest,
     resolve_finite_variation_selection,
     validate_reflection_insight_draft,
@@ -238,22 +281,61 @@ _REWARD_DEFINITION = (
     b"agent-evolve:reward:v1:operator-compliant-parent-relative-scalarization"
 )
 REWARD_DEFINITION_HASH = hashlib.sha256(_REWARD_DEFINITION).hexdigest()
-_DETAILED_EVALUATION_CACHE_DOMAIN = (
-    b"agent-evolve:detailed-evaluation-cache-key:v1\x00"
+_REWARD_BINDING_DOMAIN = b"agent-evolve:reward-binding:v1\x00"
+_DETAILED_EVALUATION_CACHE_DOMAIN = b"agent-evolve:detailed-evaluation-cache-key:v1\x00"
+_REFLECTION_CALL_RECEIPT_DOMAIN = (
+    b"agent-evolve:reflection-call-receipt:v2-request-bound\x00"
 )
+_REFLECTION_CALL_REQUEST_DOMAIN = b"agent-evolve:reflection-call-request:v1\x00"
+_REFLECTION_CALL_TELEMETRY_DOMAIN = b"agent-evolve:reflection-call-telemetry:v1\x00"
+_REFLECTION_PUBLICATION_DOMAIN = b"agent-evolve:reflection-publication:v1\x00"
+_REFLECTION_SOURCE_OUTCOME_DOMAIN = b"agent-evolve:reflection-source-outcome:v1\x00"
 
 
 @dataclass(frozen=True, slots=True)
 class RewardPolicyBinding:
-    """One callable reward rule and the exact semantic identity it publishes."""
+    """One total reward rule and the exact semantic identity it publishes.
+
+    ``failure_score`` is the preregistered endpoint value for an invocation
+    that cannot publish a scored candidate (model/schema, treatment,
+    materialization, candidate-boundary, or infrastructure failure).  Keeping
+    it on the binding prevents the engine from silently mixing a generic
+    sentinel with a benchmark-owned absolute endpoint.
+    """
 
     score: RewardPolicy
     definition_hash: str
+    failure_score: float = -1.0
 
     def __post_init__(self) -> None:
         if not callable(self.score):
             raise TypeError("score must be callable")
         require_sha256(self.definition_hash, "definition_hash")
+        if type(self.failure_score) is not float or not math.isfinite(
+            self.failure_score
+        ):
+            raise TypeError("failure_score must be a finite canonical float")
+
+    def to_record(self) -> dict[str, object]:
+        self.__post_init__()
+        return {
+            "schema_version": 1,
+            "definition_hash": self.definition_hash,
+            "failure_score_hex": self.failure_score.hex(),
+        }
+
+    @property
+    def binding_sha256(self) -> str:
+        return hashlib.sha256(
+            _REWARD_BINDING_DOMAIN
+            + json.dumps(
+                self.to_record(),
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+        ).hexdigest()
 
 
 class OperatorKind(str, Enum):
@@ -274,6 +356,13 @@ class MutationResponseMode(str, Enum):
     FULL_CONFIGURATION = "full_configuration"
     ATOMIC_SCALAR_REPLACEMENT_V1 = "atomic_scalar_replacement_v1"
     FINITE_OPTION_SELECTION_V1 = "finite_option_selection_v1"
+
+
+class CrossoverResponseMode(str, Enum):
+    """Semantic representation requested from a two-parent crossover call."""
+
+    FULL_CONFIGURATION = "full_configuration"
+    EXACT_PARENT_IMPORT_V1 = "exact_parent_import_v1"
 
 
 def _operator_version(response_mode: MutationResponseMode) -> int:
@@ -302,7 +391,9 @@ class _TerminalDetailedEvaluationError(RuntimeError):
             raise TypeError("evaluation must be an exact DetailedEvaluation")
         failure = evaluation.failure
         if failure is None or failure.category is FailureCategory.CANDIDATE:
-            raise ValueError("terminal evaluation requires infrastructure/system failure")
+            raise ValueError(
+                "terminal evaluation requires infrastructure/system failure"
+            )
         super().__init__("detailed evaluator returned terminal failure evidence")
         self.evaluation = evaluation
 
@@ -350,6 +441,7 @@ class EvolutionCandidate:
     selected_insight_refs: tuple[InsightRef, ...] = ()
     insight_assignment_kind: InsightAssignmentKind | None = None
     detailed_evaluation: DetailedEvaluation | None = None
+    objective_resolution_receipt: ObjectiveResolutionReceipt | None = None
 
     def __post_init__(self) -> None:
         if type(self.occurrence) is not CandidateOccurrence:
@@ -376,6 +468,28 @@ class EvolutionCandidate:
             raise ValueError("valid candidates require a complete objective vector")
         if not self.valid and self.objectives:
             raise ValueError("invalid candidates cannot carry objectives")
+        resolution_receipt = self.objective_resolution_receipt
+        if resolution_receipt is not None:
+            if type(resolution_receipt) is not ObjectiveResolutionReceipt:
+                raise TypeError(
+                    "objective_resolution_receipt must be an exact receipt or None"
+                )
+            resolution_receipt.revalidate()
+            if not self.valid:
+                raise ValueError(
+                    "invalid candidates cannot carry an objective-resolution receipt"
+                )
+            if (
+                resolution_receipt.configuration_sha256
+                != self.occurrence.configuration_hash
+            ):
+                raise ValueError(
+                    "objective-resolution receipt identifies another configuration"
+                )
+            if resolution_receipt.decision_objectives != self.objectives:
+                raise ValueError(
+                    "candidate objectives must equal resolved decision objectives"
+                )
         if self.detailed_evaluation is not None:
             if type(self.detailed_evaluation) is not DetailedEvaluation:
                 raise TypeError(
@@ -386,9 +500,14 @@ class EvolutionCandidate:
                 raise ValueError(
                     "candidate validity must agree with detailed evaluation success"
                 )
-            if self.detailed_evaluation.objectives != self.objectives:
+            expected_detailed_objectives = (
+                self.objectives
+                if resolution_receipt is None
+                else resolution_receipt.raw_objectives
+            )
+            if self.detailed_evaluation.objectives != expected_detailed_objectives:
                 raise ValueError(
-                    "candidate objectives must be the detailed evaluation projection"
+                    "detailed evaluation must preserve the raw objective projection"
                 )
             detailed_failure = self.detailed_evaluation.failure
             expected_message = (
@@ -456,6 +575,11 @@ class EvolutionCandidate:
     @property
     def objective_map(self) -> dict[str, float]:
         return dict(self.objectives)
+
+    @property
+    def raw_objective_map(self) -> dict[str, float]:
+        receipt = self.objective_resolution_receipt
+        return dict(self.objectives if receipt is None else receipt.raw_objectives)
 
 
 @dataclass(frozen=True, slots=True)
@@ -561,9 +685,17 @@ class InvocationPlan:
     )
     atomic_replacement_options: tuple[FrozenJsonValue, ...] = ()
     finite_variation_contract: FiniteVariationContract | None = None
+    crossover_response_mode: CrossoverResponseMode = (
+        CrossoverResponseMode.FULL_CONFIGURATION
+    )
+    exact_parent_crossover_contract: ExactParentCrossoverContract | None = None
+    forbidden_exact_parent_import_sets: tuple[tuple[str, ...], ...] = ()
     quarantine_test_insights: tuple[InsightRef, ...] = ()
     resolved_insight_assignment: ResolvedInsightAssignment | None = None
     insight_treatment_requirement: InsightTreatmentRequirement | None = None
+    compiled_hypothesis_treatment: CompiledHypothesisTreatment | None = None
+    compiled_hypothesis_eligibility: tuple[CompiledHypothesisTreatment, ...] = ()
+    finite_action_set_authority: FiniteActionSetAuthority | None = None
 
     def __post_init__(self) -> None:
         if type(self.operator_kind) is not OperatorKind:
@@ -695,9 +827,7 @@ class InvocationPlan:
                 )
             mutation_contract = self.mutation_contract
             if mutation_contract is None:
-                raise ValueError(
-                    "finite option selection requires a mutation contract"
-                )
+                raise ValueError("finite option selection requires a mutation contract")
             parent = self.parents[0]
             if type(parent.configuration) is not FrozenJsonObject:
                 raise TypeError("finite option parent must be a FrozenJsonObject")
@@ -732,6 +862,68 @@ class InvocationPlan:
                 raise ValueError(
                     "finite_variation_contract requires finite option selection"
                 )
+        if type(self.crossover_response_mode) is not CrossoverResponseMode:
+            raise TypeError("crossover_response_mode must be a CrossoverResponseMode")
+        if type(self.forbidden_exact_parent_import_sets) is not tuple or any(
+            type(value) is not tuple
+            for value in self.forbidden_exact_parent_import_sets
+        ):
+            raise TypeError(
+                "forbidden_exact_parent_import_sets must be an exact tuple of tuples"
+            )
+        crossover_contract = self.exact_parent_crossover_contract
+        if self.crossover_response_mode is CrossoverResponseMode.EXACT_PARENT_IMPORT_V1:
+            if self.operator_kind is not OperatorKind.TWO_PARENT_CROSSOVER:
+                raise ValueError(
+                    "exact parent import is restricted to two-parent crossover"
+                )
+            if type(crossover_contract) is not ExactParentCrossoverContract:
+                raise TypeError(
+                    "exact parent import requires an exact crossover contract"
+                )
+            ExactParentCrossoverContract.__post_init__(crossover_contract)
+            left, right = self.parents
+            if (
+                crossover_contract.base_parent_sha256
+                != left.occurrence.configuration_hash
+                or crossover_contract.donor_parent_sha256
+                != right.occurrence.configuration_hash
+            ):
+                raise ValueError(
+                    "exact crossover contract is bound to different parents"
+                )
+            expected_crossover_contract = derive_exact_parent_crossover_contract(
+                base=left.configuration,
+                donor=right.configuration,
+                max_loci=crossover_contract.max_loci,
+            )
+            if (
+                expected_crossover_contract.to_record()
+                != crossover_contract.to_record()
+            ):
+                raise ValueError(
+                    "exact crossover contract differs from its ordered parents"
+                )
+            validate_exact_parent_import_exclusions(
+                crossover_contract,
+                self.forbidden_exact_parent_import_sets,
+            )
+        elif crossover_contract is not None:
+            raise ValueError(
+                "exact_parent_crossover_contract requires exact parent import"
+            )
+        elif (
+            self.operator_kind is not OperatorKind.TWO_PARENT_CROSSOVER
+            and self.crossover_response_mode
+            is not CrossoverResponseMode.FULL_CONFIGURATION
+        ):
+            raise ValueError(
+                "non-crossover plans cannot select a crossover response mode"
+            )
+        elif self.forbidden_exact_parent_import_sets:
+            raise ValueError(
+                "forbidden exact parent imports require exact parent import mode"
+            )
         if type(self.use_memory) is not bool:
             raise TypeError("use_memory must be bool")
         if type(self.quarantine_test_insights) is not tuple or any(
@@ -785,9 +977,7 @@ class InvocationPlan:
             if self.quarantine_test_insights:
                 assigned = self.quarantine_test_insights
             elif self.resolved_insight_assignment is not None:
-                assigned = (
-                    self.resolved_insight_assignment.selection_decision.selected
-                )
+                assigned = self.resolved_insight_assignment.selection_decision.selected
             else:
                 raise ValueError(
                     "insight treatment administration requires an explicit assignment"
@@ -809,6 +999,151 @@ class InvocationPlan:
                     raise ValueError(
                         "treatment action binding differs from the finite palette"
                     )
+        compiled = self.compiled_hypothesis_treatment
+        if compiled is not None:
+            if type(compiled) is not CompiledHypothesisTreatment:
+                raise TypeError(
+                    "compiled_hypothesis_treatment must be exact when supplied"
+                )
+            CompiledHypothesisTreatment.__post_init__(compiled)
+            requirement = self.insight_treatment_requirement
+            if requirement is None or requirement != compiled.requirement:
+                raise ValueError(
+                    "compiled treatment must own the plan treatment requirement"
+                )
+            if compiled.request.requested_operator_kind != self.operator_kind.value:
+                raise ValueError(
+                    "compiled treatment is bound to a different operator kind"
+                )
+            if compiled.request.parent_candidate_id != self.parents[0].candidate_id:
+                raise ValueError("compiled treatment is bound to a different parent")
+            contract = self.finite_variation_contract
+            if contract is None or (
+                compiled.request.finite_contract.identity_sha256
+                != contract.identity_sha256
+            ):
+                raise ValueError(
+                    "compiled treatment is bound to a different finite contract"
+                )
+            assigned = (
+                self.resolved_insight_assignment.selection_decision.selected
+                if self.resolved_insight_assignment is not None
+                else self.quarantine_test_insights
+            )
+            if assigned != (compiled.request.reference,):
+                raise ValueError(
+                    "compiled treatment differs from the exact plan assignment"
+                )
+        matrix = self.compiled_hypothesis_eligibility
+        if type(matrix) is not tuple or any(
+            type(value) is not CompiledHypothesisTreatment for value in matrix
+        ):
+            raise TypeError(
+                "compiled_hypothesis_eligibility must contain exact bindings"
+            )
+        for value in matrix:
+            CompiledHypothesisTreatment.__post_init__(value)
+        matrix_refs = tuple(value.request.reference for value in matrix)
+        if matrix_refs != tuple(sorted(set(matrix_refs))):
+            raise ValueError(
+                "compiled hypothesis eligibility must be unique and canonical"
+            )
+        if matrix:
+            resolved = self.resolved_insight_assignment
+            if resolved is None:
+                raise ValueError(
+                    "compiled hypothesis eligibility requires a resolved assignment"
+                )
+            if matrix_refs != resolved.selection_decision.eligible:
+                raise ValueError(
+                    "compiled eligibility refs differ from assignment eligibility"
+                )
+            if compiled is None or compiled not in matrix:
+                raise ValueError(
+                    "selected compiled treatment must be an eligibility member"
+                )
+            if resolved.selection_decision.selected != (compiled.request.reference,):
+                raise ValueError(
+                    "selected compilation differs from resolved selected insight"
+                )
+            shared = {
+                (
+                    value.request.parent_candidate_id,
+                    value.request.parent_configuration_sha256,
+                    value.request.finite_contract.identity_sha256,
+                    value.request.context_projection_sha256,
+                    value.request.endpoint_definition_sha256,
+                    value.request.requested_operator_kind,
+                )
+                for value in matrix
+            }
+            if len(shared) != 1:
+                raise ValueError("compiled eligibility matrix mixes execution contexts")
+            if next(iter(shared)) != (
+                self.parents[0].candidate_id,
+                self.parents[0].occurrence.configuration_hash,
+                self.finite_variation_contract.identity_sha256,
+                resolved.exact_context_hash,
+                compiled.request.endpoint_definition_sha256,
+                self.operator_kind.value,
+            ):
+                raise ValueError(
+                    "compiled eligibility matrix differs from invocation context"
+                )
+        elif compiled is not None and self.resolved_insight_assignment is not None:
+            raise ValueError(
+                "resolved compiled treatment requires a complete eligibility matrix"
+            )
+        finite_authority = self.finite_action_set_authority
+        if finite_authority is not None:
+            if type(finite_authority) is not FiniteActionSetAuthority:
+                raise TypeError(
+                    "finite_action_set_authority must be exact when supplied"
+                )
+            FiniteActionSetAuthority.__post_init__(finite_authority)
+            if (
+                self.mutation_response_mode
+                is not MutationResponseMode.FINITE_OPTION_SELECTION_V1
+            ):
+                raise ValueError(
+                    "finite action authority requires finite option selection"
+                )
+            finite_contract = self.finite_variation_contract
+            if finite_contract != finite_authority.support.support_contract:
+                raise ValueError(
+                    "finite action authority differs from the plan support contract"
+                )
+            parent = self.parents[0]
+            if (
+                finite_authority.support.parent_candidate_id != parent.candidate_id
+                or finite_authority.support.parent_configuration_sha256
+                != parent.occurrence.configuration_hash
+                or finite_authority.support.support_contract.parent_configuration
+                != parent.configuration
+            ):
+                raise ValueError(
+                    "finite action authority is bound to a different plan parent"
+                )
+            if (
+                self.insight_treatment_requirement is not None
+                or self.compiled_hypothesis_treatment is not None
+                or self.compiled_hypothesis_eligibility
+            ):
+                raise ValueError(
+                    "finite action authority is parallel to exact treatment contracts"
+                )
+            if self.use_memory:
+                raise ValueError(
+                    "finite action authority requires an explicitly resolved card"
+                )
+            if self.resolved_insight_assignment is not None:
+                assigned = self.resolved_insight_assignment.selection_decision.selected
+            else:
+                assigned = self.quarantine_test_insights
+            if assigned != (finite_authority.card.reference,):
+                raise ValueError(
+                    "finite action authority differs from its assigned exact card"
+                )
         if type(self.memory_subset_size) is not int or self.memory_subset_size < 0:
             raise ValueError("memory_subset_size must be non-negative")
         if self.memory_exploration_probability is not None:
@@ -831,6 +1166,27 @@ class InvocationPlan:
             raise ValueError("phase must be non-empty")
 
 
+def _plan_operator_version(plan: InvocationPlan) -> int:
+    """Return the executable operator-contract version, not a model version."""
+
+    if type(plan) is not InvocationPlan:
+        raise TypeError("plan must be an exact InvocationPlan")
+    if plan.operator_kind is OperatorKind.TWO_PARENT_CROSSOVER:
+        return {
+            CrossoverResponseMode.FULL_CONFIGURATION: 1,
+            CrossoverResponseMode.EXACT_PARENT_IMPORT_V1: 3,
+        }[plan.crossover_response_mode]
+    return _operator_version(plan.mutation_response_mode)
+
+
+def _proposal_representation(plan: InvocationPlan) -> str:
+    if type(plan) is not InvocationPlan:
+        raise TypeError("plan must be an exact InvocationPlan")
+    if plan.operator_kind is OperatorKind.TWO_PARENT_CROSSOVER:
+        return plan.crossover_response_mode.value
+    return plan.mutation_response_mode.value
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedInvocation:
     plan: InvocationPlan
@@ -849,6 +1205,8 @@ class PreparedInvocation:
     materialization_receipt_hash: str | None = None
     materialized_candidate_id: CandidateId | None = None
     treatment_preflight_receipt: TreatmentPreflightReceipt | None = None
+    materialized_finite_action_authority: FiniteActionSetAuthority | None = None
+    materialized_finite_action_decision: FiniteActionDecision | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -861,6 +1219,8 @@ class MaterializedInvocation:
     materialization_policy_id: str
     materialization_policy_version: int
     materialization_receipt_hash: str
+    materialized_finite_action_authority: FiniteActionSetAuthority | None = None
+    materialized_finite_action_decision: FiniteActionDecision | None = None
 
     def __post_init__(self) -> None:
         if type(self.plan) is not InvocationPlan:
@@ -907,9 +1267,71 @@ class MaterializedInvocation:
             or self.plan.quarantine_test_insights
             or self.plan.resolved_insight_assignment is not None
             or self.plan.insight_treatment_requirement is not None
+            or self.plan.compiled_hypothesis_treatment is not None
+            or self.plan.compiled_hypothesis_eligibility
+            or self.plan.finite_action_set_authority is not None
         ):
             raise ValueError(
                 "engine-materialized invocations cannot receive prompt memory"
+            )
+        finite_authority = self.materialized_finite_action_authority
+        finite_decision = self.materialized_finite_action_decision
+        if (finite_authority is None) != (finite_decision is None):
+            raise ValueError(
+                "materialized finite action authority and decision must be paired"
+            )
+        if finite_authority is None:
+            return
+        if type(finite_authority) is not FiniteActionSetAuthority:
+            raise TypeError("materialized_finite_action_authority must be exact")
+        FiniteActionSetAuthority.__post_init__(finite_authority)
+        if type(finite_decision) is not FiniteActionDecision:
+            raise TypeError("materialized_finite_action_decision must be exact")
+        validate_finite_action_decision(finite_authority, finite_decision)
+        if finite_decision.selector_kind is not FiniteActionSelectorKind.ENGINE:
+            raise ValueError(
+                "materialized finite action provenance requires an engine selector"
+            )
+        if (
+            self.plan.operator_kind is not OperatorKind.TYPED_MUTATION
+            or len(self.plan.parents) != 1
+            or type(self.draft) is not CandidateDraft
+        ):
+            raise ValueError(
+                "materialized finite action provenance requires one "
+                "typed-mutation parent"
+            )
+        parent = self.plan.parents[0]
+        support = finite_authority.support
+        if (
+            support.parent_candidate_id != parent.candidate_id
+            or support.parent_configuration_sha256
+            != parent.occurrence.configuration_hash
+            or not typed_json_equal(
+                support.support_contract.parent_configuration,
+                parent.configuration,
+            )
+        ):
+            raise ValueError(
+                "materialized finite action authority is bound to a different parent"
+            )
+        selected = support.options[finite_decision.selected_ordinal].option
+        child = freeze_json(self.draft.configuration)
+        if (
+            not typed_json_equal(selected.child_configuration, child)
+            or typed_json_sha256(child) != finite_decision.child_configuration_sha256
+        ):
+            raise ValueError(
+                "materialized finite action decision is bound to a different child"
+            )
+        if (
+            self.materialization_policy_id != finite_decision.selector_policy_id
+            or self.materialization_policy_version
+            != finite_decision.selector_policy_version
+            or self.materialization_receipt_hash != finite_decision.decision_sha256
+        ):
+            raise ValueError(
+                "materialization identity differs from its finite action decision"
             )
 
 
@@ -927,6 +1349,7 @@ class InvocationOutcome:
     terminal_evaluation: DetailedEvaluation | None = None
     parent_relations: tuple[OutcomeRelation, ...] = ()
     treatment_admission_receipt: TreatmentAdmissionReceipt | None = None
+    finite_action_decision: FiniteActionDecision | None = None
 
     def __post_init__(self) -> None:
         if type(self.prepared) is not PreparedInvocation:
@@ -981,7 +1404,9 @@ class InvocationOutcome:
         if type(self.parent_relations) is not tuple or any(
             type(relation) is not OutcomeRelation for relation in self.parent_relations
         ):
-            raise TypeError("parent_relations must contain exact OutcomeRelation values")
+            raise TypeError(
+                "parent_relations must contain exact OutcomeRelation values"
+            )
         receipt = self.treatment_admission_receipt
         requirement = self.prepared.plan.insight_treatment_requirement
         if receipt is not None:
@@ -1021,6 +1446,30 @@ class InvocationOutcome:
             self.prepared.plan.parents
         ):
             raise ValueError("parent_relations must align with prepared parent order")
+        finite_authority = self.prepared.plan.finite_action_set_authority
+        finite_decision = self.finite_action_decision
+        if finite_decision is not None:
+            if finite_authority is None:
+                raise ValueError(
+                    "finite action decision requires a prepared finite authority"
+                )
+            validate_finite_action_decision(finite_authority, finite_decision)
+            if (
+                self.prepared.proposal_authority is not ProposalAuthority.MODEL
+                or self.prepared.call_id is None
+                or finite_decision.model_call_id != self.prepared.call_id
+            ):
+                raise ValueError(
+                    "finite action decision differs from its model invocation"
+                )
+        if finite_authority is not None:
+            if self.failure_stage == "llm":
+                if finite_decision is not None:
+                    raise ValueError("failed model calls cannot publish a decision")
+            elif self.failure_stage is None and finite_decision is None:
+                raise ValueError(
+                    "successful finite-action outcomes require a sealed decision"
+                )
 
     @property
     def detailed_evaluation(self) -> DetailedEvaluation | None:
@@ -1179,6 +1628,10 @@ def _candidate_evidence(candidate: EvolutionCandidate) -> dict[str, object]:
     }
     if candidate.detailed_evaluation is not None:
         evidence["detailed_evaluation"] = candidate.detailed_evaluation.to_record()
+    if candidate.objective_resolution_receipt is not None:
+        evidence["objective_resolution"] = (
+            candidate.objective_resolution_receipt.to_record()
+        )
     if candidate.insight_assignment_kind is InsightAssignmentKind.QUARANTINE_TEST:
         evidence.update(
             {
@@ -1214,24 +1667,56 @@ def _reflection_operation_projection(
     return row
 
 
+def _finite_action_evidence_for_citations(
+    cited_contrast_ids: tuple[str, ...],
+    contrast_action_bindings: Mapping[str, FiniteActionEvidenceBinding],
+) -> tuple[FiniteActionEvidenceBinding, ...]:
+    """Project only engine-derived action bindings without allowing permutation."""
+
+    bound_actions: list[FiniteActionEvidenceBinding] = []
+    for contrast_id in cited_contrast_ids:
+        binding = contrast_action_bindings.get(contrast_id)
+        if binding is None:
+            continue
+        if type(binding) is not FiniteActionEvidenceBinding:
+            raise ReflectionCardContractError(
+                "reflection received an untyped finite action binding"
+            )
+        try:
+            FiniteActionEvidenceBinding.__post_init__(binding)
+        except (TypeError, ValueError) as exc:
+            raise ReflectionCardContractError(
+                "reflection received an invalid finite action binding"
+            ) from exc
+        if binding.contrast_id != contrast_id:
+            raise ReflectionCardContractError(
+                "finite action evidence is bound to a different contrast"
+            )
+        bound_actions.append(binding)
+    return tuple(bound_actions)
+
+
 def _validate_reflected_action_origin(
     draft: InsightDraft,
     contract: ReflectionInsightContract | None,
     cited_contrast_ids: tuple[str, ...],
-    contrast_option_ids: Mapping[str, str],
+    contrast_action_bindings: Mapping[str, FiniteActionEvidenceBinding],
 ) -> None:
     """Bind an exact-action card to the finite actions that produced its evidence."""
 
     if contract is None or not contract.allowed_option_ids:
         return
-    try:
-        executed_option_ids = tuple(
-            sorted({contrast_option_ids[value] for value in cited_contrast_ids})
-        )
-    except KeyError as exc:
+    bound_actions = _finite_action_evidence_for_citations(
+        cited_contrast_ids,
+        contrast_action_bindings,
+    )
+    if len(bound_actions) != len(cited_contrast_ids):
         raise ReflectionCardContractError(
             "exact-action reflection cited evidence without a finite option"
-        ) from exc
+        )
+    executed_option_ids = tuple(
+        sorted({binding.option_id for binding in bound_actions})
+    )
     if draft.recommended_option_ids != executed_option_ids:
         raise ReflectionCardContractError(
             "recommended option IDs differ from the cited executed action"
@@ -1250,7 +1735,65 @@ def default_evidence_prompt(
         "You are an explicit evolutionary variation operator, not a fresh sampler.",
         f"OPERATOR: {plan.operator_kind.value}",
     ]
-    if plan.mutation_response_mode is MutationResponseMode.ATOMIC_SCALAR_REPLACEMENT_V1:
+    if (
+        plan.operator_kind is OperatorKind.TWO_PARENT_CROSSOVER
+        and plan.crossover_response_mode is CrossoverResponseMode.EXACT_PARENT_IMPORT_V1
+    ):
+        crossover_contract = plan.exact_parent_crossover_contract
+        if type(crossover_contract) is not ExactParentCrossoverContract:
+            raise ValueError("exact crossover mode lost its sealed contract")
+        sections.extend(
+            [
+                "Select a proper nonempty subset of donor-parent loci; do not "
+                "author or return candidate JSON. Emit only import_locus_ids "
+                "and honestly claimed insight IDs. Do not emit a rationale, "
+                "configuration, changed paths, or source attribution. The "
+                "engine starts from the exact left/base parent, imports the "
+                "selected exact right/donor subtrees, validates the candidate, "
+                "and derives exhaustive provenance.",
+                "",
+                "EXACT PARENT IMPORT CONTRACT",
+                _json(
+                    {
+                        "contract_sha256": crossover_contract.contract_sha256,
+                        "base_parent_candidate_id": (
+                            plan.parents[0].candidate_id.value
+                        ),
+                        "base_parent_configuration_sha256": (
+                            crossover_contract.base_parent_sha256
+                        ),
+                        "donor_parent_candidate_id": (
+                            plan.parents[1].candidate_id.value
+                        ),
+                        "donor_parent_configuration_sha256": (
+                            crossover_contract.donor_parent_sha256
+                        ),
+                        "locus_count": len(crossover_contract.loci),
+                        "ordered_loci": [
+                            {
+                                "locus_id": locus.locus_id,
+                                "path": locus.path_text,
+                            }
+                            for locus in crossover_contract.loci
+                        ],
+                        "forbidden_import_locus_sets": [
+                            list(value)
+                            for value in plan.forbidden_exact_parent_import_sets
+                        ],
+                    }
+                ),
+                "Choose at least one but not all locus IDs. Selected loci "
+                "come exactly from the right/donor parent; every omitted locus "
+                "remains exactly from the left/base parent. This proper-subset "
+                "rule guarantees a discriminating contribution from both "
+                "ordered parents. Never choose any forbidden_import_locus_sets "
+                "entry: each is machine-proven to materialize an already known "
+                "child, so it is not a novel crossover action.",
+            ]
+        )
+    elif (
+        plan.mutation_response_mode is MutationResponseMode.ATOMIC_SCALAR_REPLACEMENT_V1
+    ):
         sections.extend(
             [
                 "Return one atomic edit, not a complete candidate. Emit the exact contracted path, one replacement scalar, a concise design_rationale (not hidden chain-of-thought), and honestly report used insight IDs. "
@@ -1272,10 +1815,7 @@ def default_evidence_prompt(
                     "Use one short sentence for design_rationale and emit no extra fields.",
                 ]
             )
-    elif (
-        plan.mutation_response_mode
-        is MutationResponseMode.FINITE_OPTION_SELECTION_V1
-    ):
+    elif plan.mutation_response_mode is MutationResponseMode.FINITE_OPTION_SELECTION_V1:
         finite_contract = plan.finite_variation_contract
         if finite_contract is None:  # pragma: no cover - plan admission.
             raise ValueError("finite option mode requires a sealed contract")
@@ -1305,14 +1845,64 @@ def default_evidence_prompt(
                 "The sealed child configurations are engine-owned and intentionally absent from the output schema.",
             ]
         )
+        finite_authority = plan.finite_action_set_authority
+        if finite_authority is not None:
+            sections.extend(
+                [
+                    "",
+                    "MATCHED FINITE ACTION SET AUTHORITY",
+                    _json(
+                        {
+                            "authority_sha256": finite_authority.authority_sha256,
+                            "support_sha256": (finite_authority.support.support_sha256),
+                            "card_authority_sha256": (
+                                finite_authority.card.card_authority_sha256
+                            ),
+                            "card_reference": {
+                                "insight_id": (
+                                    finite_authority.card.reference.insight_id.value
+                                ),
+                                "version": finite_authority.card.reference.version,
+                            },
+                            "semantic_anchor_option_id": (
+                                finite_authority.support.anchor_option_id
+                            ),
+                            "cardinality": finite_authority.support.cardinality,
+                            "presentation_sha256": (
+                                finite_authority.support.presentation.presentation_sha256
+                            ),
+                            "current_outcome_access": False,
+                        }
+                    ),
+                    "The semantic anchor identifies the exact historical action "
+                    "that defined this local neighbourhood; it is not the only "
+                    "legal choice. Select whichever of all K listed options best "
+                    "instantiates the assigned hypothesis on the current parent. "
+                    "This same sealed support is also given to a prospective "
+                    "engine comparator.",
+                ]
+            )
     else:
         sections.extend(
             [
                 "Return exactly one typed candidate. Give a concise design_rationale (not hidden chain-of-thought), "
                 "list intended changed paths, and honestly report source attribution at the most specific useful JSON paths and used insight IDs. "
                 "Emit only fields present in the supplied output schema; follow any operator-specific evidence instructions below.",
-                "Every source_attribution item has exactly two fields: one canonical path beginning with $. and one source token from ancestor, left, right, synthesized, or mutation. "
-                "Use one path per item; do not emit candidate IDs, path arrays, descriptions, or prose in this field. Attribute only values that actually came from that source.",
+                "",
+                "CANDIDATE COMPONENT PATH CONTRACT",
+                CANDIDATE_COMPONENT_PATH_CONTRACT,
+                (
+                    "Every source_attribution item has exactly two fields: one "
+                    "canonical path beginning with $. and one source token from "
+                    + (
+                        "left, right, or synthesized. "
+                        if plan.operator_kind is OperatorKind.TWO_PARENT_CROSSOVER
+                        else "ancestor, left, right, synthesized, or mutation. "
+                    )
+                    + "Use one path per item; do not emit candidate IDs, path "
+                    "arrays, descriptions, or prose in this field. Attribute "
+                    "only values that actually came from that source."
+                ),
             ]
         )
     sections.extend(
@@ -1325,7 +1915,20 @@ def default_evidence_prompt(
             _json([_candidate_evidence(parent) for parent in plan.parents]),
         ]
     )
-    if (
+    requirement = plan.insight_treatment_requirement
+    if selected_insights and requirement is not None:
+        sections.extend(
+            [
+                "",
+                "ASSIGNED TREATMENT HYPOTHESES",
+                "These exact card versions form one enforced finite-action "
+                "treatment. They are experimental instructions, not established "
+                "facts. Instantiate every assigned card only through a compatible "
+                "sealed action and claim every required exact insight ID.",
+                _json(list(selected_insights)),
+            ]
+        )
+    elif (
         selected_insights
         and prepared.insight_assignment_kind is InsightAssignmentKind.QUARANTINE_TEST
     ):
@@ -1371,14 +1974,12 @@ def default_evidence_prompt(
             ]
         )
 
-    requirement = plan.insight_treatment_requirement
     preflight = prepared.treatment_preflight_receipt
     if requirement is not None:
         if preflight is None:  # pragma: no cover - preparation binds both.
             raise ValueError("treatment requirement is missing its preflight receipt")
         required_ids = [
-            reference.insight_id.value
-            for reference in requirement.required_insights
+            reference.insight_id.value for reference in requirement.required_insights
         ]
         claim_instruction = (
             "claimed_insight_ids must equal this exact set"
@@ -1403,15 +2004,39 @@ def default_evidence_prompt(
                             preflight.compatible_families
                         ),
                         "compatible_option_ids": [
-                            action.option_id
-                            for action in preflight.compatible_actions
+                            action.option_id for action in preflight.compatible_actions
                         ],
                         "requirement_sha256": requirement.requirement_sha256,
                         "preflight_receipt_sha256": preflight.receipt_sha256,
+                        "treatment_binding_kind": (
+                            "registered_sham_v1"
+                            if plan.compiled_hypothesis_treatment is None
+                            else "compiled_hypothesis_v1"
+                        ),
+                        "treatment_binding_sha256": (
+                            requirement.requirement_sha256
+                            if plan.compiled_hypothesis_treatment is None
+                            else plan.compiled_hypothesis_treatment.binding_sha256
+                        ),
                     }
                 ),
                 "Do not return an incompatible option and do not omit, invent, or "
                 "duplicate a required insight claim.",
+            ]
+        )
+    finite_authority = plan.finite_action_set_authority
+    if finite_authority is not None:
+        required_id = finite_authority.card.reference.insight_id.value
+        sections.extend(
+            [
+                "",
+                "FINITE-CHOICE CARD ADMINISTRATION",
+                "This is a distinct K-option choice treatment, not the exact "
+                "singleton treatment contract used by earlier workflows. The "
+                "assigned card must influence the choice, and "
+                f'claimed_insight_ids must equal ["{required_id}"]. Any of '
+                "the K sealed option IDs is legal; do not treat the anchor as "
+                "mandatory.",
             ]
         )
 
@@ -1464,15 +2089,29 @@ def default_evidence_prompt(
                 )
             sections.extend(contract_instructions)
     elif plan.operator_kind is OperatorKind.TWO_PARENT_CROSSOVER:
-        sections.extend(
-            [
-                "",
-                "CROSSOVER OBLIGATION",
-                "Construct a child meaningfully using both parents. Full configurations are supplied; "
-                "attribute exact inherited components to left/right and only genuinely new values to synthesized. "
-                "Use canonical paths beginning with $. The system independently verifies at least one exact contribution from each parent.",
-            ]
-        )
+        if plan.crossover_response_mode is CrossoverResponseMode.EXACT_PARENT_IMPORT_V1:
+            sections.extend(
+                [
+                    "",
+                    "CROSSOVER OBLIGATION",
+                    "Return only a proper nonempty donor-locus subset from the "
+                    "sealed catalog above. The output is a bounded executable "
+                    "selection, not a candidate witness.",
+                ]
+            )
+        else:
+            sections.extend(
+                [
+                    "",
+                    "CROSSOVER OBLIGATION",
+                    "Construct a child meaningfully using both parents. Full configurations are supplied; "
+                    "attribute exact inherited components to left/right and only genuinely new values to synthesized. "
+                    "Apply the candidate component path contract to both intended_changes and source_attribution: "
+                    "the PARENTS rows are evidence envelopes, never path roots. The system independently verifies "
+                    "at least one exact contribution from each parent. "
+                    + TWO_PARENT_CROSSOVER_EVIDENCE_CONTRACT,
+                ]
+            )
     elif plan.operator_kind is OperatorKind.THREE_WAY_RECOMBINATION:
         assert plan.common_ancestor is not None and prepared.classification is not None
         classification = prepared.classification
@@ -1574,6 +2213,460 @@ def _dominates(
     return weak and strict
 
 
+class ReflectionCallStatus(str, Enum):
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class ReflectionCallRequest:
+    """Engine-rendered, immutable boundary for one reflection provider call.
+
+    The caller may choose the source receipts, contract, and revision target,
+    but the engine binds those values to the *actual* rendered prompt and the
+    exact projected outcome rows.  A downstream curation authority can
+    therefore validate provider evidence without trusting interceptor metadata.
+    """
+
+    label: str
+    operation: str
+    prompt_sha256: str
+    min_insights: int
+    max_insights: int
+    max_output_tokens: int
+    temperature: float | None
+    insight_contract_sha256: str | None
+    revision_predecessors: tuple[InsightRef, ...]
+    revision_predecessor_content_sha256s: tuple[str, ...]
+    source_receipt_sha256s: tuple[str, ...]
+    source_operator_invocation_ids: tuple[OperatorInvocationId, ...]
+    source_outcome_sha256s: tuple[str, ...]
+    available_contrast_ids: tuple[str, ...]
+    request_sha256: str = ""
+
+    def __post_init__(self) -> None:
+        for name in ("label", "operation"):
+            value = getattr(self, name)
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError(f"reflection request {name} must be canonical")
+        require_sha256(self.prompt_sha256, "reflection prompt_sha256")
+        if (
+            type(self.min_insights) is not int
+            or type(self.max_insights) is not int
+            or not 0 <= self.min_insights <= self.max_insights <= 16
+            or self.max_insights < 1
+        ):
+            raise ValueError("reflection request cardinality is invalid")
+        if type(self.max_output_tokens) is not int or self.max_output_tokens <= 0:
+            raise ValueError("reflection max_output_tokens must be positive")
+        if self.temperature is not None and (
+            isinstance(self.temperature, bool)
+            or not isinstance(self.temperature, (int, float))
+            or not math.isfinite(float(self.temperature))
+        ):
+            raise ValueError("reflection temperature must be finite or None")
+        if self.insight_contract_sha256 is not None:
+            require_sha256(
+                self.insight_contract_sha256,
+                "reflection insight_contract_sha256",
+            )
+        if type(self.revision_predecessors) is not tuple or any(
+            type(value) is not InsightRef for value in self.revision_predecessors
+        ):
+            raise TypeError(
+                "revision_predecessors must contain exact InsightRef values"
+            )
+        for value in self.revision_predecessors:
+            InsightRef.__post_init__(value)
+        if len(set(self.revision_predecessors)) != len(self.revision_predecessors):
+            raise ValueError("revision_predecessors cannot repeat")
+        if len(self.revision_predecessors) != len(
+            self.revision_predecessor_content_sha256s
+        ):
+            raise ValueError("revision target references/content hashes differ")
+        for name in (
+            "revision_predecessor_content_sha256s",
+            "source_receipt_sha256s",
+            "source_outcome_sha256s",
+            "available_contrast_ids",
+        ):
+            values = getattr(self, name)
+            if type(values) is not tuple:
+                raise TypeError(f"{name} must be an exact tuple")
+            for value in values:
+                require_sha256(value, f"reflection request {name}")
+        if type(self.source_operator_invocation_ids) is not tuple or any(
+            type(value) is not OperatorInvocationId
+            for value in self.source_operator_invocation_ids
+        ):
+            raise TypeError("source_operator_invocation_ids must contain exact IDs")
+        for value in self.source_operator_invocation_ids:
+            OperatorInvocationId.__post_init__(value)
+        if len(set(self.source_operator_invocation_ids)) != len(
+            self.source_operator_invocation_ids
+        ):
+            raise ValueError("source operator invocation IDs cannot repeat")
+        if len(self.source_operator_invocation_ids) != len(self.source_outcome_sha256s):
+            raise ValueError("source operator IDs/outcome hashes differ")
+        if self.available_contrast_ids != tuple(
+            sorted(set(self.available_contrast_ids))
+        ):
+            raise ValueError("available_contrast_ids must be canonical")
+        expected = hashlib.sha256(
+            _REFLECTION_CALL_REQUEST_DOMAIN
+            + canonical_typed_json_bytes(freeze_json(self.to_record()))
+        ).hexdigest()
+        if self.request_sha256:
+            require_sha256(self.request_sha256, "reflection request_sha256")
+            if self.request_sha256 != expected:
+                raise ValueError("reflection request hash does not authenticate data")
+        else:
+            object.__setattr__(self, "request_sha256", expected)
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "label": self.label,
+            "operation": self.operation,
+            "prompt_sha256": self.prompt_sha256,
+            "min_insights": self.min_insights,
+            "max_insights": self.max_insights,
+            "max_output_tokens": self.max_output_tokens,
+            "temperature_hex": (
+                None if self.temperature is None else float(self.temperature).hex()
+            ),
+            "insight_contract_sha256": self.insight_contract_sha256,
+            "revision_predecessors": [
+                {
+                    "insight_id": value.insight_id.value,
+                    "version": value.version,
+                }
+                for value in self.revision_predecessors
+            ],
+            "revision_predecessor_content_sha256s": list(
+                self.revision_predecessor_content_sha256s
+            ),
+            "source_receipt_sha256s": list(self.source_receipt_sha256s),
+            "source_operator_invocation_ids": [
+                value.value for value in self.source_operator_invocation_ids
+            ],
+            "source_outcome_sha256s": list(self.source_outcome_sha256s),
+            "available_contrast_ids": list(self.available_contrast_ids),
+        }
+
+
+def _agentic_call_telemetry_record(
+    telemetry: AgenticCallTelemetry,
+) -> dict[str, object]:
+    if type(telemetry) is not AgenticCallTelemetry:
+        raise TypeError("reflection telemetry must be exact")
+    AgenticCallTelemetry.__post_init__(telemetry)
+    return {
+        "requested_model": telemetry.requested_model,
+        "resolved_model": telemetry.resolved_model,
+        "resolved_provider": telemetry.resolved_provider,
+        "provider_response_id": telemetry.provider_response_id,
+        "finish_reason": telemetry.finish_reason,
+        "input_tokens": telemetry.input_tokens,
+        "output_tokens": telemetry.output_tokens,
+        "reasoning_tokens": telemetry.reasoning_tokens,
+        "cache_read_tokens": telemetry.cache_read_tokens,
+        "cache_write_tokens": telemetry.cache_write_tokens,
+        "cost_usd": (None if telemetry.cost_usd is None else str(telemetry.cost_usd)),
+        "latency_ns": telemetry.latency_ns,
+        "attempt_count": telemetry.attempt_count,
+    }
+
+
+def _agentic_call_telemetry_sha256(telemetry: AgenticCallTelemetry) -> str:
+    return hashlib.sha256(
+        _REFLECTION_CALL_TELEMETRY_DOMAIN
+        + canonical_typed_json_bytes(
+            freeze_json(_agentic_call_telemetry_record(telemetry))
+        )
+    ).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ReflectionPublication:
+    """Engine-derived binding for one memory entry published by reflection."""
+
+    reference: InsightRef
+    content_sha256: str
+    evidence_lineage_sha256: str
+    lifecycle_state: InsightLifecycleState
+    origin: InsightOrigin
+    initial_score: float
+    revision_predecessor: InsightRef | None
+    relations_sha256: str
+    publication_sha256: str = ""
+
+    def __post_init__(self) -> None:
+        if type(self.reference) is not InsightRef:
+            raise TypeError("publication reference must be an exact InsightRef")
+        InsightRef.__post_init__(self.reference)
+        for name in (
+            "content_sha256",
+            "evidence_lineage_sha256",
+            "relations_sha256",
+        ):
+            require_sha256(getattr(self, name), f"reflection publication {name}")
+        if type(self.lifecycle_state) is not InsightLifecycleState:
+            raise TypeError("publication lifecycle_state must be exact")
+        if type(self.origin) is not InsightOrigin:
+            raise TypeError("publication origin must be exact")
+        if type(self.initial_score) is not float or not math.isfinite(
+            self.initial_score
+        ):
+            raise TypeError("publication initial_score must be a finite float")
+        if self.revision_predecessor is not None:
+            if type(self.revision_predecessor) is not InsightRef:
+                raise TypeError("revision_predecessor must be an exact InsightRef")
+            InsightRef.__post_init__(self.revision_predecessor)
+        expected = hashlib.sha256(
+            _REFLECTION_PUBLICATION_DOMAIN
+            + canonical_typed_json_bytes(freeze_json(self.to_record()))
+        ).hexdigest()
+        if self.publication_sha256:
+            require_sha256(self.publication_sha256, "publication_sha256")
+            if self.publication_sha256 != expected:
+                raise ValueError("publication hash does not authenticate data")
+        else:
+            object.__setattr__(self, "publication_sha256", expected)
+
+    def to_record(self) -> dict[str, object]:
+        predecessor = self.revision_predecessor
+        return {
+            "schema_version": 1,
+            "reference": {
+                "insight_id": self.reference.insight_id.value,
+                "version": self.reference.version,
+            },
+            "content_sha256": self.content_sha256,
+            "evidence_lineage_sha256": self.evidence_lineage_sha256,
+            "lifecycle_state": self.lifecycle_state.value,
+            "origin": self.origin.value,
+            "initial_score_hex": self.initial_score.hex(),
+            "revision_predecessor": (
+                None
+                if predecessor is None
+                else {
+                    "insight_id": predecessor.insight_id.value,
+                    "version": predecessor.version,
+                }
+            ),
+            "relations_sha256": self.relations_sha256,
+        }
+
+
+def _reflection_publication(entry: InsightMemoryEntry) -> ReflectionPublication:
+    if type(entry) is not InsightMemoryEntry:
+        raise TypeError("reflection publication requires an exact memory entry")
+    InsightMemoryEntry.__post_init__(entry)
+    lineage = entry.evidence_lineage
+    if lineage is None:
+        raise ValueError("reflection publication requires evidence lineage")
+    revisions = tuple(
+        relation.target
+        for relation in entry.relations
+        if relation.kind is InsightRelationKind.REVISES
+    )
+    if len(revisions) > 1:
+        raise ValueError("reflection publication has multiple revision targets")
+    relation_record = [
+        {
+            "kind": relation.kind.value,
+            "target": {
+                "insight_id": relation.target.insight_id.value,
+                "version": relation.target.version,
+            },
+            "note": relation.note,
+        }
+        for relation in entry.relations
+    ]
+    relations_sha256 = hashlib.sha256(
+        _REFLECTION_PUBLICATION_DOMAIN
+        + b"relations\x00"
+        + canonical_typed_json_bytes(freeze_json(relation_record))
+    ).hexdigest()
+    return ReflectionPublication(
+        reference=entry.reference,
+        content_sha256=entry.draft.content_sha256,
+        evidence_lineage_sha256=lineage.identity_sha256,
+        lifecycle_state=entry.lifecycle_state,
+        origin=entry.origin,
+        initial_score=float(entry.initial_score),
+        revision_predecessor=(None if not revisions else revisions[0]),
+        relations_sha256=relations_sha256,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ReflectionCallReceipt:
+    """Engine-issued request/provider/publication evidence for one call."""
+
+    call_id: LLMCallId
+    request: ReflectionCallRequest
+    status: ReflectionCallStatus
+    telemetry: AgenticCallTelemetry | None
+    telemetry_sha256: str | None
+    failure_type: str | None
+    publications: tuple[ReflectionPublication, ...] = ()
+    receipt_sha256: str = ""
+
+    def __post_init__(self) -> None:
+        if type(self.call_id) is not LLMCallId:
+            raise TypeError("reflection receipt call_id must be exact")
+        LLMCallId.__post_init__(self.call_id)
+        if type(self.request) is not ReflectionCallRequest:
+            raise TypeError("reflection receipt request must be exact")
+        ReflectionCallRequest.__post_init__(self.request)
+        if type(self.status) is not ReflectionCallStatus:
+            raise TypeError("reflection receipt status must be exact")
+        if self.telemetry is not None:
+            expected_telemetry_sha256 = _agentic_call_telemetry_sha256(self.telemetry)
+            if self.telemetry_sha256 is None:
+                object.__setattr__(
+                    self,
+                    "telemetry_sha256",
+                    expected_telemetry_sha256,
+                )
+            elif self.telemetry_sha256 != expected_telemetry_sha256:
+                raise ValueError("reflection telemetry hash is not authentic")
+        elif self.telemetry_sha256 is not None:
+            raise ValueError("telemetry_sha256 requires telemetry")
+        if self.status is ReflectionCallStatus.COMPLETED:
+            if self.telemetry is None or self.failure_type is not None:
+                raise ValueError("completed reflection requires telemetry only")
+        elif (
+            type(self.failure_type) is not str
+            or not self.failure_type
+            or self.publications
+        ):
+            raise ValueError("failed reflection has invalid failure/publication data")
+        if type(self.publications) is not tuple or any(
+            type(value) is not ReflectionPublication for value in self.publications
+        ):
+            raise TypeError("publications must contain exact typed values")
+        for value in self.publications:
+            ReflectionPublication.__post_init__(value)
+        references = tuple(value.reference for value in self.publications)
+        if len(set(references)) != len(references):
+            raise ValueError("published reflection references cannot repeat")
+        expected = hashlib.sha256(
+            _REFLECTION_CALL_RECEIPT_DOMAIN
+            + canonical_typed_json_bytes(freeze_json(self.to_record()))
+        ).hexdigest()
+        if self.receipt_sha256:
+            require_sha256(self.receipt_sha256, "reflection receipt_sha256")
+            if self.receipt_sha256 != expected:
+                raise ValueError("reflection receipt hash does not authenticate data")
+        else:
+            object.__setattr__(self, "receipt_sha256", expected)
+
+    def to_record(self) -> dict[str, object]:
+        telemetry = self.telemetry
+        return {
+            "schema_version": 2,
+            "call_id": self.call_id.value,
+            "request": {
+                **self.request.to_record(),
+                "request_sha256": self.request.request_sha256,
+            },
+            "status": self.status.value,
+            "telemetry": (
+                None if telemetry is None else _agentic_call_telemetry_record(telemetry)
+            ),
+            "telemetry_sha256": self.telemetry_sha256,
+            "failure_type": self.failure_type,
+            "publications": [
+                {
+                    **value.to_record(),
+                    "publication_sha256": value.publication_sha256,
+                }
+                for value in self.publications
+            ],
+        }
+
+    @property
+    def published_references(self) -> tuple[InsightRef, ...]:
+        return tuple(value.reference for value in self.publications)
+
+    @property
+    def published_content_sha256s(self) -> tuple[str, ...]:
+        return tuple(value.content_sha256 for value in self.publications)
+
+    @property
+    def published_lineage_sha256s(self) -> tuple[str, ...]:
+        return tuple(value.evidence_lineage_sha256 for value in self.publications)
+
+
+@dataclass(frozen=True, slots=True)
+class ReflectionPublicationResult:
+    """Typed success value returned by the receipt-bearing reflection API."""
+
+    entries: tuple[InsightMemoryEntry, ...]
+    receipt: ReflectionCallReceipt
+
+    def __post_init__(self) -> None:
+        if type(self.entries) is not tuple or any(
+            type(value) is not InsightMemoryEntry for value in self.entries
+        ):
+            raise TypeError("reflection result entries must be exact")
+        if type(self.receipt) is not ReflectionCallReceipt:
+            raise TypeError("reflection result receipt must be exact")
+        ReflectionCallReceipt.__post_init__(self.receipt)
+        if self.receipt.status is not ReflectionCallStatus.COMPLETED:
+            raise ValueError("reflection publication result requires completion")
+        expected_publications = tuple(
+            _reflection_publication(entry) for entry in self.entries
+        )
+        if self.receipt.publications != expected_publications:
+            raise ValueError("reflection result entries differ from its receipt")
+        for entry in self.entries:
+            InsightMemoryEntry.__post_init__(entry)
+            lineage = entry.evidence_lineage
+            if lineage is None or lineage.reflection_call_id != self.receipt.call_id:
+                raise ValueError("reflection result has foreign call lineage")
+
+
+class ReflectionCallExecutionError(RuntimeError):
+    """A single logical reflection call failed after provider admission.
+
+    The error carries exact accounting so a post-generation curation policy can
+    mark itself incomplete without erasing already sealed optimization
+    endpoints or pretending that the attempted logical call was free.
+    """
+
+    logical_llm_calls_used = 1
+
+    def __init__(
+        self,
+        call_id: LLMCallId,
+        cause: Exception,
+        receipt: ReflectionCallReceipt,
+    ) -> None:
+        if type(call_id) is not LLMCallId:
+            raise TypeError("call_id must be an exact LLMCallId")
+        if not isinstance(cause, Exception):
+            raise TypeError("cause must be an Exception")
+        if type(receipt) is not ReflectionCallReceipt:
+            raise TypeError("receipt must be an exact ReflectionCallReceipt")
+        ReflectionCallReceipt.__post_init__(receipt)
+        if (
+            receipt.call_id != call_id
+            or receipt.status is not ReflectionCallStatus.FAILED
+            or receipt.failure_type != type(cause).__name__
+        ):
+            raise ValueError("failure receipt differs from reflection cause")
+        self.call_id = call_id
+        self.failure_type = type(cause).__name__
+        self.receipt = receipt
+        super().__init__(
+            f"reflection call {call_id.value} failed with {self.failure_type}: {cause}"
+        )
+
+
 class AgenticEvolutionEngine:
     """Reusable application service for explicit concurrent variation batches."""
 
@@ -1590,6 +2683,7 @@ class AgenticEvolutionEngine:
         trace_sink: TraceSink | None = None,
         reward_policy: RewardPolicy = default_parent_relative_reward,
         reward_definition_hash: str = REWARD_DEFINITION_HASH,
+        failure_score: float = -1.0,
         prompt_builder: PromptBuilder = default_evidence_prompt,
         prompt_shape_commitment_policy: PromptShapeCommitmentPolicy | None = None,
         reflection_row_projection: ReflectionRowProjectionBinding | None = None,
@@ -1601,6 +2695,7 @@ class AgenticEvolutionEngine:
         detailed_evaluator: DetailedEvaluationAdapter | None = None,
         outcome_relation_binding: OutcomeRelationPolicyBinding | None = None,
         optimization_semantics: OptimizationSemantics | None = None,
+        objective_resolution: ObjectiveResolutionPort | None = None,
         treatment_compliance_policy: TreatmentCompliancePolicy | None = None,
     ) -> None:
         objectives = tuple(problem.objectives)
@@ -1614,6 +2709,8 @@ class AgenticEvolutionEngine:
         if not callable(reward_policy):
             raise TypeError("reward_policy must be callable")
         require_sha256(reward_definition_hash, "reward_definition_hash")
+        if type(failure_score) is not float or not math.isfinite(failure_score):
+            raise TypeError("failure_score must be a finite canonical float")
         if (reward_policy is default_parent_relative_reward) != (
             reward_definition_hash == REWARD_DEFINITION_HASH
         ):
@@ -1651,9 +2748,7 @@ class AgenticEvolutionEngine:
         else:
             detailed_evaluate = getattr(detailed_evaluator, "evaluate_evidence", None)
             if not callable(detailed_evaluate):
-                raise TypeError(
-                    "detailed_evaluator must implement evaluate_evidence"
-                )
+                raise TypeError("detailed_evaluator must implement evaluate_evidence")
             evaluator_identity = getattr(
                 detailed_evaluator,
                 "evaluator_identity",
@@ -1673,18 +2768,22 @@ class AgenticEvolutionEngine:
         if optimization_semantics is not None:
             if type(optimization_semantics) is not OptimizationSemantics:
                 raise TypeError(
-                    "optimization_semantics must be an exact "
-                    "OptimizationSemantics"
+                    "optimization_semantics must be an exact OptimizationSemantics"
                 )
             OptimizationSemantics.__post_init__(optimization_semantics)
             optimization_semantics.validate_binding(
                 objectives,
                 active_outcome_relation.identity,
             )
+        objective_resolution_metadata = (
+            None
+            if objective_resolution is None
+            else objective_resolution_policy_metadata(objective_resolution)
+        )
         shape_policy = prompt_shape_commitment_policy
         using_default_renderer = prompt_builder is default_evidence_prompt
         if shape_policy is None and using_default_renderer:
-            shape_policy = DefaultEvidencePromptShapePolicyV1()
+            shape_policy = DefaultEvidencePromptShapePolicyV3()
         if shape_policy is not None:
             if not callable(getattr(shape_policy, "commit", None)):
                 raise TypeError("prompt_shape_commitment_policy must implement commit")
@@ -1702,11 +2801,14 @@ class AgenticEvolutionEngine:
                 value = shape_metadata[index]
                 if type(value) is not int or value <= 0:
                     raise ValueError(f"prompt-shape {name} must be positive")
-            claims_default_renderer = shape_metadata[2:] == (
+            claims_default_renderer = shape_metadata[2] == "default_evidence_prompt"
+            current_default_pairing = shape_metadata[2:] == (
                 "default_evidence_prompt",
-                1,
+                3,
             )
-            if using_default_renderer != claims_default_renderer:
+            if (using_default_renderer and not current_default_pairing) or (
+                not using_default_renderer and claims_default_renderer
+            ):
                 raise ValueError(
                     "prompt builder and prompt-shape renderer identity do not match"
                 )
@@ -1718,9 +2820,7 @@ class AgenticEvolutionEngine:
                     "reflection_row_projection must be an exact "
                     "ReflectionRowProjectionBinding"
                 )
-            ReflectionRowProjectionBinding.__post_init__(
-                reflection_row_projection
-            )
+            ReflectionRowProjectionBinding.__post_init__(reflection_row_projection)
         if reflection_workflow is not None and not isinstance(
             reflection_workflow, ReflectionWorkflow
         ):
@@ -1769,12 +2869,21 @@ class AgenticEvolutionEngine:
         self.reward_binding = RewardPolicyBinding(
             reward_policy,
             reward_definition_hash,
+            failure_score,
         )
         self._prompt_builder = prompt_builder
         self._prompt_shape_commitment_policy = shape_policy
         self._prompt_shape_policy_metadata = shape_metadata
         self._reflection_row_projection = reflection_row_projection
         self._reflection_workflow = reflection_workflow
+        self._reflection_call_receipts: dict[
+            LLMCallId,
+            ReflectionCallReceipt,
+        ] = {}
+        # Reflection publication mutates versioned memory.  Serializing the
+        # whole request/publication transaction makes receipt attribution exact
+        # even when independent callers concurrently request curation.
+        self._reflection_publication_lock = asyncio.Lock()
         self._using_default_prompt_builder = using_default_renderer
         self.structured_output_budget_policy = output_budget_policy
         self._structured_output_budget_policy_metadata = output_budget_metadata
@@ -1787,6 +2896,8 @@ class AgenticEvolutionEngine:
         self._evaluator_identity = evaluator_identity
         self.outcome_relation_binding = active_outcome_relation
         self.optimization_semantics = optimization_semantics
+        self.objective_resolution = objective_resolution
+        self._objective_resolution_metadata = objective_resolution_metadata
         self.treatment_compliance_policy = treatment_policy
         self._treatment_compliance_policy_metadata = (
             treatment_policy_id,
@@ -1813,8 +2924,7 @@ class AgenticEvolutionEngine:
         self._trace_sequence = 0
         self._trace_origin_ns = time.monotonic_ns()
         self._evaluation_cache: AsyncEvaluationCache[
-            DetailedEvaluation
-            | tuple[bool, tuple[tuple[str, float], ...], str | None]
+            DetailedEvaluation | tuple[bool, tuple[tuple[str, float], ...], str | None]
         ] = AsyncEvaluationCache(trace_callback=self._record_evaluation_cache_event)
         self._phenotype_identities_by_cache_key: dict[str, PhenotypeIdentity] = {}
         self.problem_id = f"{type(problem).__module__}.{type(problem).__qualname__}"
@@ -1930,8 +3040,12 @@ class AgenticEvolutionEngine:
         ):
             raise ValueError("phenotype identity policy metadata changed after binding")
 
-        first = policy.identify(frozen)
-        second = policy.identify(frozen)
+        # Phenotype policies are benchmark-facing ports: give each invocation a
+        # fresh detached candidate value, not AgentEvolve's private immutable
+        # typed-JSON container.  Independent copies retain the hostile-policy
+        # determinism check even if an implementation mutates its argument.
+        first = policy.identify(thaw_json(frozen))
+        second = policy.identify(thaw_json(frozen))
         for identity in (first, second):
             if type(identity) is not PhenotypeIdentity:
                 raise TypeError(
@@ -2061,7 +3175,7 @@ class AgenticEvolutionEngine:
                 else _canonical_json_sha256(_candidate_evidence(plan.common_ancestor))
             ),
             operator_kind=plan.operator_kind.value,
-            operator_version=_operator_version(plan.mutation_response_mode),
+            operator_version=_plan_operator_version(plan),
             phase=plan.phase,
             allowed_top_level=plan.allowed_top_level,
             mutation_contract_sha256=(
@@ -2085,6 +3199,20 @@ class AgenticEvolutionEngine:
                 None
                 if plan.finite_variation_contract is None
                 else plan.finite_variation_contract.identity_sha256
+            ),
+            crossover_response_mode=plan.crossover_response_mode.value,
+            exact_parent_crossover_contract_sha256=(
+                None
+                if plan.exact_parent_crossover_contract is None
+                else plan.exact_parent_crossover_contract.contract_sha256
+            ),
+            exact_parent_import_exclusions_sha256=(
+                None
+                if plan.exact_parent_crossover_contract is None
+                else exact_parent_import_exclusions_sha256(
+                    plan.exact_parent_crossover_contract,
+                    plan.forbidden_exact_parent_import_sets,
+                )
             ),
         )
         first = policy.commit(inputs)
@@ -2126,19 +3254,69 @@ class AgenticEvolutionEngine:
             raise ValueError(
                 "resolved memory assignment context differs from the invocation"
             )
-        structurally_eligible = set(
-            self.memory.eligible_references(
-                operator_kind=plan.operator_kind.value,
-                editable_paths=editable_paths,
+        compiled_matrix = plan.compiled_hypothesis_eligibility
+        if compiled_matrix:
+            entries = self.memory.entries_for(resolved.selection_decision.eligible)
+            if any(
+                entry.lifecycle_state is InsightLifecycleState.DEPRECATED
+                for entry in entries
+            ):
+                raise ValueError(
+                    "compiled controlled-test eligibility contains a deprecated insight"
+                )
+            if editable_paths is None:
+                raise ValueError(
+                    "compiled eligibility requires an editable mutation scope"
+                )
+            for entry, compiled in zip(entries, compiled_matrix, strict=True):
+                if (
+                    entry.reference,
+                    entry.draft.content_sha256,
+                    entry.applicable_operator_kinds,
+                    registered_source_evidence_sha256(entry),
+                ) != (
+                    compiled.request.reference,
+                    compiled.request.insight.content_sha256,
+                    compiled.request.source_operator_kinds,
+                    compiled.request.source_evidence_sha256,
+                ):
+                    raise ValueError(
+                        "compiled eligibility differs from registered memory source"
+                    )
+                if compiled.request.requested_operator_kind != plan.operator_kind.value:
+                    raise ValueError(
+                        "compiled eligibility differs from invocation operator"
+                    )
+                if (
+                    compiled.request.endpoint_definition_sha256
+                    != reward_definition_hash
+                ):
+                    raise ValueError(
+                        "compiled eligibility is bound to a different reward/Q endpoint"
+                    )
+                if not any(
+                    _claim_covers_path(claim, editable)
+                    or _claim_covers_path(editable, claim)
+                    for claim in compiled.receipt.spec.affected_paths
+                    for editable in editable_paths
+                ):
+                    raise ValueError(
+                        "compiled eligibility is disjoint from editable paths"
+                    )
+        else:
+            structurally_eligible = set(
+                self.memory.eligible_references(
+                    operator_kind=plan.operator_kind.value,
+                    editable_paths=editable_paths,
+                )
             )
-        )
-        if not set(resolved.selection_decision.eligible).issubset(
-            structurally_eligible
-        ):
-            raise ValueError(
-                "resolved memory assignment contains an unavailable or "
-                "structurally inapplicable insight"
-            )
+            if not set(resolved.selection_decision.eligible).issubset(
+                structurally_eligible
+            ):
+                raise ValueError(
+                    "resolved memory assignment contains an unavailable or "
+                    "structurally inapplicable insight"
+                )
         selection = resolved.selection_decision
         selected = selection.selected
         selected_records = self.memory.selected_prompt_records(selection)
@@ -2279,6 +3457,7 @@ class AgenticEvolutionEngine:
         tuple[tuple[str, float], ...],
         str | None,
         DetailedEvaluation | None,
+        ObjectiveResolutionReceipt | None,
     ]:
         config = thaw_json(configuration)
         if type(config) is not dict:
@@ -2322,7 +3501,12 @@ class AgenticEvolutionEngine:
             if type(legacy) is not tuple or len(legacy) != 3:
                 raise RuntimeError("legacy evaluation cache returned invalid evidence")
             valid, objectives, failure = legacy
-            return valid, objectives, failure, None
+            resolved, receipt = self._resolve_evaluated_objectives(
+                configuration,
+                valid=valid,
+                raw_objectives=objectives,
+            )
+            return valid, resolved, failure, None, receipt
 
         adapter = self._detailed_evaluator
         evaluate_detailed = self._detailed_evaluate
@@ -2344,9 +3528,7 @@ class AgenticEvolutionEngine:
                 before_configuration = freeze_json(config)
                 started_ns = time.monotonic_ns()
                 payload = evaluate_detailed(config)
-                elapsed = float(
-                    (time.monotonic_ns() - started_ns) / 1_000_000_000
-                )
+                elapsed = float((time.monotonic_ns() - started_ns) / 1_000_000_000)
                 if not typed_json_equal(before_configuration, freeze_json(config)):
                     raise ValueError(
                         "detailed evaluator mutated its configuration input"
@@ -2400,12 +3582,54 @@ class AgenticEvolutionEngine:
         if detailed.payload.evaluator != evaluator_identity:
             raise RuntimeError("cached detailed evaluation has the wrong context")
         failure_record = detailed.failure
+        resolved, receipt = self._resolve_evaluated_objectives(
+            configuration,
+            valid=detailed.success,
+            raw_objectives=detailed.objectives,
+        )
         return (
             detailed.success,
-            detailed.objectives,
+            resolved,
             None if failure_record is None else failure_record.message,
             detailed,
+            receipt,
         )
+
+    def _resolve_evaluated_objectives(
+        self,
+        configuration: FrozenJsonValue,
+        *,
+        valid: bool,
+        raw_objectives: tuple[tuple[str, float], ...],
+    ) -> tuple[
+        tuple[tuple[str, float], ...],
+        ObjectiveResolutionReceipt | None,
+    ]:
+        """Project physical evidence without changing the evaluation cache."""
+
+        policy = self.objective_resolution
+        if not valid or policy is None:
+            return raw_objectives, None
+        if type(configuration) is not FrozenJsonObject:
+            raise TypeError("objective resolution requires an object configuration")
+        metadata = objective_resolution_policy_metadata(policy)
+        if metadata != self._objective_resolution_metadata:
+            raise ValueError(
+                "objective-resolution policy metadata changed after binding"
+            )
+        receipt = resolve_objectives(
+            policy,
+            ObjectiveResolutionRequest(
+                configuration=configuration,
+                objectives=self.objectives,
+                raw_objectives=raw_objectives,
+            ),
+        )
+        if objective_resolution_policy_metadata(policy) != metadata:
+            raise ValueError(
+                "objective-resolution policy metadata changed during resolution"
+            )
+        return receipt.decision_objectives, receipt
 
     async def evaluation_cache_snapshot(self) -> dict[str, int | None]:
         """Return run-local cache evidence without exposing mutable cache state."""
@@ -2421,6 +3645,36 @@ class AgenticEvolutionEngine:
             "evictions": snapshot.evictions,
         }
 
+    def reflection_call_receipt(
+        self,
+        call_id: LLMCallId,
+    ) -> ReflectionCallReceipt:
+        """Return immutable provider/publication evidence for one reflection."""
+
+        if type(call_id) is not LLMCallId:
+            raise TypeError("call_id must be an exact LLMCallId")
+        try:
+            return self._reflection_call_receipts[call_id]
+        except KeyError as exc:
+            raise KeyError("unknown reflection call receipt") from exc
+
+    @property
+    def reflection_call_receipts(self) -> tuple[ReflectionCallReceipt, ...]:
+        """Insertion-ordered immutable view of engine-issued call receipts."""
+
+        return tuple(self._reflection_call_receipts.values())
+
+    def _record_reflection_call_receipt(
+        self,
+        receipt: ReflectionCallReceipt,
+    ) -> None:
+        if type(receipt) is not ReflectionCallReceipt:
+            raise TypeError("reflection receipt must be exact")
+        ReflectionCallReceipt.__post_init__(receipt)
+        if receipt.call_id in self._reflection_call_receipts:
+            raise RuntimeError("reflection call receipt was already published")
+        self._reflection_call_receipts[receipt.call_id] = receipt
+
     def compare_candidates(
         self,
         left: EvolutionCandidate,
@@ -2428,13 +3682,18 @@ class AgenticEvolutionEngine:
     ) -> OutcomeRelation:
         """Apply the engine-bound outcome relation to two evaluated occurrences."""
 
-        if type(left) is not EvolutionCandidate or type(right) is not EvolutionCandidate:
-            raise TypeError("candidate comparison requires exact EvolutionCandidate values")
+        if (
+            type(left) is not EvolutionCandidate
+            or type(right) is not EvolutionCandidate
+        ):
+            raise TypeError(
+                "candidate comparison requires exact EvolutionCandidate values"
+            )
         EvolutionCandidate.__post_init__(left)
         EvolutionCandidate.__post_init__(right)
         if not left.valid or not right.valid:
             raise ValueError("candidate comparison requires valid evaluations")
-        if self._detailed_evaluation_enabled:
+        if self._detailed_evaluation_enabled and not self._objective_pareto_relation:
             if left.detailed_evaluation is None or right.detailed_evaluation is None:
                 raise ValueError(
                     "the bound detailed outcome policy requires detailed evidence"
@@ -2461,7 +3720,7 @@ class AgenticEvolutionEngine:
         occurrence, frozen = self._new_occurrence(
             configuration, operator_invocation_id=None
         )
-        valid, objectives, failure, detailed = await self._evaluate(frozen)
+        valid, objectives, failure, detailed, resolution = await self._evaluate(frozen)
         candidate = EvolutionCandidate(
             occurrence=occurrence,
             configuration=frozen,
@@ -2471,6 +3730,7 @@ class AgenticEvolutionEngine:
             label=label,
             failure_message=failure,
             detailed_evaluation=detailed,
+            objective_resolution_receipt=resolution,
         )
         self._emit(
             "seed_registered",
@@ -2484,6 +3744,11 @@ class AgenticEvolutionEngine:
                 {}
                 if detailed is None
                 else {"detailed_evaluation": detailed.to_record()}
+            ),
+            **(
+                {}
+                if resolution is None
+                else {"objective_resolution": resolution.to_record()}
             ),
         )
         return candidate
@@ -2540,7 +3805,12 @@ class AgenticEvolutionEngine:
                     option_identity_sha256=option.identity_sha256,
                     family=option.family,
                     changed_paths=tuple(
-                        sorted({_path_text(operation.path) for operation in patch.operations})
+                        sorted(
+                            {
+                                _path_text(operation.path)
+                                for operation in patch.operations
+                            }
+                        )
                     ),
                 )
             )
@@ -2558,21 +3828,52 @@ class AgenticEvolutionEngine:
         if editable_paths is None:
             raise ValueError("treatment administration requires editable paths")
         entries = self.memory.entries_for(selected)
-        insights = tuple(
-            TreatmentInsightEvidence(
-                reference=entry.reference,
-                insight_content_sha256=entry.draft.content_sha256,
-                applicable_operator_kinds=entry.applicable_operator_kinds,
-                affected_paths=tuple(sorted(entry.draft.affected_paths)),
-                recommended_option_families=tuple(
-                    sorted(entry.draft.recommended_option_families)
-                ),
-                recommended_option_ids=tuple(
-                    sorted(entry.draft.recommended_option_ids)
-                ),
+        compiled = plan.compiled_hypothesis_treatment
+        if compiled is None:
+            insights = tuple(
+                TreatmentInsightEvidence(
+                    reference=entry.reference,
+                    insight_content_sha256=entry.draft.content_sha256,
+                    applicable_operator_kinds=entry.applicable_operator_kinds,
+                    affected_paths=tuple(sorted(entry.draft.affected_paths)),
+                    recommended_option_families=tuple(
+                        sorted(entry.draft.recommended_option_families)
+                    ),
+                    recommended_option_ids=tuple(
+                        sorted(entry.draft.recommended_option_ids)
+                    ),
+                )
+                for entry in entries
             )
-            for entry in entries
-        )
+        else:
+            CompiledHypothesisTreatment.__post_init__(compiled)
+            if len(entries) != 1:
+                raise ValueError(
+                    "compiled hypothesis treatment requires one exact memory entry"
+                )
+            entry = entries[0]
+            expected_source = registered_source_evidence_sha256(entry)
+            if expected_source != compiled.request.source_evidence_sha256:
+                raise ValueError(
+                    "compiled treatment source evidence changed before preflight"
+                )
+            if (
+                entry.reference,
+                entry.draft.content_sha256,
+                entry.applicable_operator_kinds,
+            ) != (
+                compiled.request.reference,
+                compiled.request.insight.content_sha256,
+                compiled.request.source_operator_kinds,
+            ):
+                raise ValueError(
+                    "compiled treatment differs from selected memory entry"
+                )
+            if requirement != compiled.requirement:
+                raise ValueError(
+                    "compiled treatment requirement changed before preflight"
+                )
+            insights = (compiled.treatment_evidence,)
         finite_contract = plan.finite_variation_contract
         if finite_contract is None:  # pragma: no cover - plan validation.
             raise ValueError("treatment administration requires a finite contract")
@@ -2608,6 +3909,8 @@ class AgenticEvolutionEngine:
         materialization_policy_version: int | None = None,
         materialization_receipt_hash: str | None = None,
         materialized_candidate_id: CandidateId | None = None,
+        materialized_finite_action_authority: FiniteActionSetAuthority | None = None,
+        materialized_finite_action_decision: FiniteActionDecision | None = None,
         reward_definition_hash: str | None = None,
     ) -> PreparedInvocation:
         authority = proposal_authority
@@ -2636,6 +3939,8 @@ class AgenticEvolutionEngine:
             materialization_policy_version,
             materialization_receipt_hash,
             materialized_candidate_id,
+            materialized_finite_action_authority,
+            materialized_finite_action_decision,
         )
         if authority is ProposalAuthority.ENGINE:
             if (
@@ -2654,6 +3959,75 @@ class AgenticEvolutionEngine:
                 "materialization_receipt_hash",
             )
             CandidateId.__post_init__(materialized_candidate_id)
+            if (materialized_finite_action_authority is None) != (
+                materialized_finite_action_decision is None
+            ):
+                raise ValueError(
+                    "materialized finite action authority and decision must be paired"
+                )
+            if materialized_finite_action_authority is not None:
+                if (
+                    type(materialized_finite_action_authority)
+                    is not FiniteActionSetAuthority
+                ):
+                    raise TypeError(
+                        "materialized_finite_action_authority must be exact"
+                    )
+                FiniteActionSetAuthority.__post_init__(
+                    materialized_finite_action_authority
+                )
+                if (
+                    type(materialized_finite_action_decision)
+                    is not FiniteActionDecision
+                ):
+                    raise TypeError("materialized_finite_action_decision must be exact")
+                validate_finite_action_decision(
+                    materialized_finite_action_authority,
+                    materialized_finite_action_decision,
+                )
+                if (
+                    materialized_finite_action_decision.selector_kind
+                    is not FiniteActionSelectorKind.ENGINE
+                ):
+                    raise ValueError(
+                        "materialized finite action provenance requires an "
+                        "engine selector"
+                    )
+                if (
+                    plan.operator_kind is not OperatorKind.TYPED_MUTATION
+                    or len(plan.parents) != 1
+                ):
+                    raise ValueError(
+                        "materialized finite action provenance requires one "
+                        "typed-mutation parent"
+                    )
+                parent = plan.parents[0]
+                support = materialized_finite_action_authority.support
+                if (
+                    support.parent_candidate_id != parent.candidate_id
+                    or support.parent_configuration_sha256
+                    != parent.occurrence.configuration_hash
+                    or not typed_json_equal(
+                        support.support_contract.parent_configuration,
+                        parent.configuration,
+                    )
+                ):
+                    raise ValueError(
+                        "materialized finite action authority is bound to a "
+                        "different parent"
+                    )
+                if (
+                    materialization_policy_id
+                    != materialized_finite_action_decision.selector_policy_id
+                    or materialization_policy_version
+                    != materialized_finite_action_decision.selector_policy_version
+                    or materialization_receipt_hash
+                    != materialized_finite_action_decision.decision_sha256
+                ):
+                    raise ValueError(
+                        "materialization identity differs from its finite action "
+                        "decision"
+                    )
         elif any(value is not None for value in materialization_values):
             raise ValueError("only engine authority accepts materialization identity")
         active_reward_definition_hash = (
@@ -2752,7 +4126,29 @@ class AgenticEvolutionEngine:
                 reward_definition_hash=active_reward_definition_hash,
                 editable_paths=editable_paths,
             )
-        if assignment_kind is InsightAssignmentKind.QUARANTINE_TEST:
+        finite_authority = plan.finite_action_set_authority
+        if finite_authority is not None:
+            if selected != (finite_authority.card.reference,):
+                raise ValueError(
+                    "finite action authority changed its selected card at preparation"
+                )
+            entry = self.memory.entries_for(selected)[0]
+            if entry.draft.content_sha256 != finite_authority.card.card_content_sha256:
+                raise ValueError(
+                    "finite action authority card content differs from memory"
+                )
+            registered_sha256 = finite_authority.card.registered_source_evidence_sha256
+            if (
+                registered_sha256 is not None
+                and registered_source_evidence_sha256(entry) != registered_sha256
+            ):
+                raise ValueError(
+                    "finite action authority source evidence differs from memory"
+                )
+        if (
+            assignment_kind is InsightAssignmentKind.QUARANTINE_TEST
+            and plan.insight_treatment_requirement is None
+        ):
             selected_records = tuple(
                 {
                     **record,
@@ -2836,7 +4232,7 @@ class AgenticEvolutionEngine:
             operator_invocation_id=invocation_id,
             variation_kind=plan.operator_kind.variation_kind,
             operator_id=plan.operator_kind.value,
-            operator_version=_operator_version(plan.mutation_response_mode),
+            operator_version=_plan_operator_version(plan),
             parents=parents,
             requested_child_count=1,
             context_stratum_hash=context_hash,
@@ -2862,6 +4258,8 @@ class AgenticEvolutionEngine:
             materialization_receipt_hash=materialization_receipt_hash,
             materialized_candidate_id=materialized_candidate_id,
             treatment_preflight_receipt=treatment_preflight,
+            materialized_finite_action_authority=(materialized_finite_action_authority),
+            materialized_finite_action_decision=materialized_finite_action_decision,
         )
         prompt = self._validate_optimization_semantics_prompt(
             self._prompt_builder(
@@ -2887,6 +4285,8 @@ class AgenticEvolutionEngine:
             materialization_receipt_hash=materialization_receipt_hash,
             materialized_candidate_id=materialized_candidate_id,
             treatment_preflight_receipt=treatment_preflight,
+            materialized_finite_action_authority=(materialized_finite_action_authority),
+            materialized_finite_action_decision=materialized_finite_action_decision,
         )
         if treatment_preflight is not None:
             self._emit(
@@ -2898,6 +4298,16 @@ class AgenticEvolutionEngine:
                     **plan.insight_treatment_requirement.to_record(),
                     "requirement_sha256": (
                         plan.insight_treatment_requirement.requirement_sha256
+                    ),
+                    "compiled_hypothesis_treatment": (
+                        None
+                        if plan.compiled_hypothesis_treatment is None
+                        else {
+                            **plan.compiled_hypothesis_treatment.to_record(),
+                            "binding_sha256": (
+                                plan.compiled_hypothesis_treatment.binding_sha256
+                            ),
+                        }
                     ),
                 },
                 preflight={
@@ -2926,7 +4336,8 @@ class AgenticEvolutionEngine:
             allowed_top_level=list(plan.allowed_top_level),
             mutation_contract=_mutation_contract_record(plan.mutation_contract),
             mutation_response_mode=plan.mutation_response_mode.value,
-            proposal_representation=plan.mutation_response_mode.value,
+            crossover_response_mode=plan.crossover_response_mode.value,
+            proposal_representation=_proposal_representation(plan),
             atomic_editable_path=(
                 _path_text(plan.mutation_contract.editable_paths[0])
                 if plan.mutation_response_mode
@@ -2961,6 +4372,59 @@ class AgenticEvolutionEngine:
                     ),
                     "finite_variation_contract_sha256": (
                         plan.finite_variation_contract.identity_sha256
+                    ),
+                }
+            ),
+            **(
+                {}
+                if plan.exact_parent_crossover_contract is None
+                else {
+                    "exact_parent_crossover_contract": (
+                        plan.exact_parent_crossover_contract.to_record()
+                    ),
+                    "exact_parent_crossover_contract_sha256": (
+                        plan.exact_parent_crossover_contract.contract_sha256
+                    ),
+                    "forbidden_exact_parent_import_sets": [
+                        list(value) for value in plan.forbidden_exact_parent_import_sets
+                    ],
+                    "exact_parent_import_exclusions_sha256": (
+                        exact_parent_import_exclusions_sha256(
+                            plan.exact_parent_crossover_contract,
+                            plan.forbidden_exact_parent_import_sets,
+                        )
+                    ),
+                }
+            ),
+            **(
+                {}
+                if plan.finite_action_set_authority is None
+                else {
+                    "finite_action_set_authority": {
+                        **plan.finite_action_set_authority.to_record(),
+                        "authority_sha256": (
+                            plan.finite_action_set_authority.authority_sha256
+                        ),
+                    }
+                }
+            ),
+            materialized_finite_action_authority=(
+                None
+                if materialized_finite_action_authority is None
+                else {
+                    **materialized_finite_action_authority.to_record(),
+                    "authority_sha256": (
+                        materialized_finite_action_authority.authority_sha256
+                    ),
+                }
+            ),
+            materialized_finite_action_decision=(
+                None
+                if materialized_finite_action_decision is None
+                else {
+                    **materialized_finite_action_decision.to_record(),
+                    "decision_sha256": (
+                        materialized_finite_action_decision.decision_sha256
                     ),
                 }
             ),
@@ -3211,6 +4675,22 @@ class AgenticEvolutionEngine:
                     )
             return True, None, (patch.patch_hash,), None
         if plan.operator_kind is OperatorKind.TWO_PARENT_CROSSOVER:
+            if (
+                plan.crossover_response_mode
+                is CrossoverResponseMode.EXACT_PARENT_IMPORT_V1
+            ):
+                distinct_from_both = all(
+                    not typed_json_equal(parent.configuration, child)
+                    for parent in plan.parents
+                )
+                return (
+                    distinct_from_both,
+                    None
+                    if distinct_from_both
+                    else "exact parent import did not discriminate both parents",
+                    tuple(patch_hashes),
+                    None,
+                )
             used_left_paths, used_right_paths = self._crossover_contribution_paths(
                 prepared, occurrence, child
             )
@@ -3323,6 +4803,35 @@ class AgenticEvolutionEngine:
                 },
             )
         if plan.operator_kind is OperatorKind.TWO_PARENT_CROSSOVER:
+            if (
+                plan.crossover_response_mode
+                is CrossoverResponseMode.EXACT_PARENT_IMPORT_V1
+            ):
+                contract = plan.exact_parent_crossover_contract
+                if type(contract) is not ExactParentCrossoverContract:
+                    return False, "exact crossover contract is absent"
+                expected_paths = {locus.path_text for locus in contract.loci}
+                by_path = {
+                    attribution.path: attribution.source
+                    for attribution in draft.source_attribution
+                }
+                if (
+                    len(by_path) != len(draft.source_attribution)
+                    or set(by_path) != expected_paths
+                    or set(by_path.values()) != {"left", "right"}
+                ):
+                    return (
+                        False,
+                        "exact crossover attribution is not exhaustive and two-sided",
+                    )
+                right_paths = tuple(
+                    sorted(
+                        path for path, source in by_path.items() if source == "right"
+                    )
+                )
+                if draft.intended_changes != right_paths:
+                    return False, "exact crossover donor-locus record is inconsistent"
+                return True, None
             left_paths, right_paths = self._crossover_contribution_paths(
                 prepared, occurrence, child
             )
@@ -3383,6 +4892,217 @@ class AgenticEvolutionEngine:
                     for obligation in obligations
                     if obligation.source is PreservationSource.RIGHT_BRANCH
                 },
+            },
+        )
+
+    def _materialize_two_parent_crossover(
+        self,
+        prepared: PreparedInvocation,
+        draft: CandidateDraft,
+        *,
+        candidate_id: CandidateId,
+        proposal_sequence: int,
+    ) -> tuple[CandidateOccurrence, FrozenJsonValue, dict[str, object]]:
+        """Execute model source claims as exact named-parent subtree copies."""
+
+        if prepared.plan.operator_kind is not OperatorKind.TWO_PARENT_CROSSOVER:
+            raise ValueError("crossover materialization requires a crossover plan")
+        left, right = prepared.plan.parents
+        claims: list[CrossoverInheritanceClaim] = []
+        for attribution in draft.source_attribution:
+            try:
+                source = CrossoverInheritanceSource(attribution.source)
+            except ValueError as exc:
+                raise ValueError(
+                    "two-parent crossover attribution uses an unsupported source"
+                ) from exc
+            claims.append(
+                CrossoverInheritanceClaim(path=attribution.path, source=source)
+            )
+        materialization = materialize_crossover_inheritance(
+            left=left.configuration,
+            right=right.configuration,
+            draft=draft.configuration,
+            claims=tuple(claims),
+        )
+        occurrence, frozen = self._new_occurrence(
+            materialization.configuration,
+            operator_invocation_id=prepared.operator_invocation_id,
+            candidate_id=candidate_id,
+            proposal_sequence=proposal_sequence,
+        )
+        if (
+            occurrence.configuration_hash
+            != materialization.materialized_configuration_sha256
+        ):
+            raise RuntimeError("crossover materialization hash differs from occurrence")
+        return (
+            occurrence,
+            frozen,
+            {
+                "crossover_materialization": materialization.to_record(),
+                "crossover_materialization_receipt_sha256": (
+                    materialization.receipt_sha256
+                ),
+                "crossover_draft_configuration_hash": (
+                    materialization.draft_configuration_sha256
+                ),
+                "crossover_materialized_configuration_hash": (
+                    materialization.materialized_configuration_sha256
+                ),
+                "crossover_adjusted_float_leaf_count": sum(
+                    item.adjusted_float_leaf_count
+                    for item in materialization.inherited_paths
+                ),
+                "source_attribution_provenance": (
+                    "engine_materialized_from_model_inheritance_plan"
+                ),
+                "target_configuration_hash": occurrence.configuration_hash,
+            },
+        )
+
+    def _materialize_exact_parent_crossover(
+        self,
+        prepared: PreparedInvocation,
+        draft: ExactParentCrossoverDraft,
+        *,
+        candidate_id: CandidateId,
+        proposal_sequence: int,
+    ) -> tuple[
+        CandidateDraft,
+        CandidateOccurrence,
+        FrozenJsonValue,
+        dict[str, object],
+    ]:
+        """Materialize a bounded donor-locus choice with engine-owned evidence."""
+
+        plan = prepared.plan
+        if (
+            plan.operator_kind is not OperatorKind.TWO_PARENT_CROSSOVER
+            or plan.crossover_response_mode
+            is not CrossoverResponseMode.EXACT_PARENT_IMPORT_V1
+        ):
+            raise ValueError(
+                "exact parent crossover draft requires exact crossover mode"
+            )
+        if type(draft) is not ExactParentCrossoverDraft:
+            raise TypeError(
+                "exact crossover mode requires an ExactParentCrossoverDraft"
+            )
+        ExactParentCrossoverDraft.__post_init__(draft)
+        contract = plan.exact_parent_crossover_contract
+        if type(contract) is not ExactParentCrossoverContract:
+            raise ValueError("exact crossover mode lost its sealed contract")
+        if draft.contract_identity_sha256 != contract.contract_sha256:
+            raise ValueError("crossover draft is bound to a different contract")
+        if draft.import_locus_ids in plan.forbidden_exact_parent_import_sets:
+            raise ValueError("crossover draft materializes a forbidden known child")
+        left, right = plan.parents
+        materialization = materialize_exact_parent_crossover(
+            base=left.configuration,
+            donor=right.configuration,
+            contract=contract,
+            import_locus_ids=draft.import_locus_ids,
+        )
+
+        candidate_model = self.problem.candidate_model
+        if not isinstance(candidate_model, type) or not issubclass(
+            candidate_model, BaseModel
+        ):
+            raise TypeError("exact crossover mode requires a Pydantic candidate model")
+        validated = candidate_model.model_validate(
+            thaw_json(materialization.configuration),
+            strict=True,
+            by_alias=False,
+            by_name=True,
+        )
+        validated_dict = BaseModel.model_dump(
+            validated,
+            mode="python",
+            by_alias=False,
+            exclude_unset=False,
+            exclude_defaults=False,
+            exclude_none=False,
+            exclude_computed_fields=True,
+            round_trip=True,
+            warnings="error",
+            fallback=None,
+            serialize_as_any=False,
+            polymorphic_serialization=False,
+        )
+        if type(validated_dict) is not dict:
+            raise TypeError("candidate model must serialize to an exact object")
+        if not typed_json_equal(
+            freeze_json(validated_dict),
+            materialization.configuration,
+        ):
+            raise ValueError("candidate validation changed the exact crossover child")
+
+        occurrence, frozen = self._new_occurrence(
+            materialization.configuration,
+            operator_invocation_id=prepared.operator_invocation_id,
+            candidate_id=candidate_id,
+            proposal_sequence=proposal_sequence,
+        )
+        left_paths = tuple(
+            attribution.path_text
+            for attribution in materialization.attributions
+            if attribution.source is ExactParentSource.BASE
+        )
+        right_paths = tuple(
+            attribution.path_text
+            for attribution in materialization.attributions
+            if attribution.source is ExactParentSource.DONOR
+        )
+        if not left_paths or not right_paths:  # pragma: no cover - core receipt.
+            raise RuntimeError("exact crossover receipt lost a parent contribution")
+        system_draft = CandidateDraft(
+            configuration=thaw_json(frozen),
+            design_rationale=(
+                "Engine materialized the selected exact donor-locus subset."
+            ),
+            intended_changes=tuple(sorted(right_paths)),
+            source_attribution=tuple(
+                SourceAttribution(
+                    attribution.path_text,
+                    "left" if attribution.source is ExactParentSource.BASE else "right",
+                )
+                for attribution in materialization.attributions
+            ),
+            claimed_insight_ids=draft.claimed_insight_ids,
+        )
+        receipt = materialization.receipt
+        return (
+            system_draft,
+            occurrence,
+            frozen,
+            {
+                "crossover_contract": contract.to_record(),
+                "crossover_contract_sha256": contract.contract_sha256,
+                "crossover_import_locus_ids": list(draft.import_locus_ids),
+                "crossover_forbidden_import_locus_sets": [
+                    list(value) for value in plan.forbidden_exact_parent_import_sets
+                ],
+                "crossover_import_exclusions_sha256": (
+                    exact_parent_import_exclusions_sha256(
+                        contract,
+                        plan.forbidden_exact_parent_import_sets,
+                    )
+                ),
+                "crossover_plan_sha256": materialization.plan.plan_sha256,
+                "crossover_materialization": materialization.to_record(),
+                "crossover_materialization_sha256": (
+                    materialization.materialization_sha256
+                ),
+                "crossover_materialization_receipt": receipt.to_record(),
+                "crossover_materialization_receipt_sha256": receipt.receipt_sha256,
+                "crossover_materialized_configuration_hash": (
+                    materialization.materialized_configuration_sha256
+                ),
+                "crossover_base_parent_candidate_id": left.candidate_id.value,
+                "crossover_donor_parent_candidate_id": right.candidate_id.value,
+                "source_attribution_provenance": "engine_derived_exact_parent_import",
+                "target_configuration_hash": occurrence.configuration_hash,
             },
         )
 
@@ -3637,9 +5357,7 @@ class AgenticEvolutionEngine:
             "finite_parent_configuration_sha256": (
                 finite_contract.parent_configuration_sha256
             ),
-            "finite_child_configuration_sha256": (
-                option.child_configuration_sha256
-            ),
+            "finite_child_configuration_sha256": (option.child_configuration_sha256),
             "materialized_patch_hash": materialized_patch.patch_hash,
             "parent_configuration_hash": parent.occurrence.configuration_hash,
             "target_configuration_hash": occurrence.configuration_hash,
@@ -3722,6 +5440,7 @@ class AgenticEvolutionEngine:
             CandidateDraft
             | AtomicMutationDraft
             | FiniteVariationSelectionDraft
+            | ExactParentCrossoverDraft
         ),
         telemetry: AgenticCallTelemetry | None,
     ) -> tuple[EvolutionCandidate, TreatmentAdmissionReceipt | None]:
@@ -3756,17 +5475,44 @@ class AgenticEvolutionEngine:
                     proposal_sequence=prepared.proposal_sequence,
                 )
             )
+        elif (
+            prepared.plan.operator_kind is OperatorKind.TWO_PARENT_CROSSOVER
+            and prepared.plan.crossover_response_mode
+            is CrossoverResponseMode.EXACT_PARENT_IMPORT_V1
+        ):
+            if type(draft) is not ExactParentCrossoverDraft:
+                raise TypeError(
+                    "exact crossover mode requires an ExactParentCrossoverDraft"
+                )
+            draft, occurrence, frozen, materialization_evidence = (
+                self._materialize_exact_parent_crossover(
+                    prepared,
+                    draft,
+                    candidate_id=prepared.candidate_id,
+                    proposal_sequence=prepared.proposal_sequence,
+                )
+            )
         else:
             if type(draft) is not CandidateDraft:
                 raise TypeError(
                     "full-configuration response mode requires a CandidateDraft"
                 )
-            occurrence, frozen = self._new_occurrence(
-                draft.configuration,
-                operator_invocation_id=prepared.operator_invocation_id,
-                candidate_id=prepared.candidate_id,
-                proposal_sequence=prepared.proposal_sequence,
-            )
+            if prepared.plan.operator_kind is OperatorKind.TWO_PARENT_CROSSOVER:
+                occurrence, frozen, materialization_evidence = (
+                    self._materialize_two_parent_crossover(
+                        prepared,
+                        draft,
+                        candidate_id=prepared.candidate_id,
+                        proposal_sequence=prepared.proposal_sequence,
+                    )
+                )
+            else:
+                occurrence, frozen = self._new_occurrence(
+                    draft.configuration,
+                    operator_invocation_id=prepared.operator_invocation_id,
+                    candidate_id=prepared.candidate_id,
+                    proposal_sequence=prepared.proposal_sequence,
+                )
         compliant, operator_failure, patch_hashes, preservation = (
             self._operator_compliance(prepared, draft, occurrence, frozen)
         )
@@ -3779,7 +5525,15 @@ class AgenticEvolutionEngine:
         evidence_compliant, evidence_failure = self._evidence_compliance(
             prepared, draft, occurrence, frozen
         )
-        valid, objectives, failure, detailed = await self._evaluate(frozen)
+        if (
+            prepared.plan.operator_kind is OperatorKind.TWO_PARENT_CROSSOVER
+            and not evidence_compliant
+        ):
+            raise ValueError(
+                evidence_failure
+                or "two-parent crossover source attribution was not verified"
+            )
+        valid, objectives, failure, detailed, resolution = await self._evaluate(frozen)
         selected = prepared.variation_case.selected_insights
         candidate = EvolutionCandidate(
             occurrence=occurrence,
@@ -3811,6 +5565,7 @@ class AgenticEvolutionEngine:
             conflict_resolutions=draft.conflict_resolutions,
             call_telemetry=telemetry,
             detailed_evaluation=detailed,
+            objective_resolution_receipt=resolution,
         )
         self._emit(
             "candidate_evaluated",
@@ -3866,16 +5621,11 @@ class AgenticEvolutionEngine:
                 for item in draft.conflict_resolutions
             ],
             mutation_response_mode=(prepared.plan.mutation_response_mode.value),
-            proposal_representation=(prepared.plan.mutation_response_mode.value),
-            atomic_submitted_path=materialization_evidence.get(
-                "atomic_submitted_path"
-            ),
-            atomic_old_value_hash=materialization_evidence.get(
-                "atomic_old_value_hash"
-            ),
-            atomic_new_value_hash=materialization_evidence.get(
-                "atomic_new_value_hash"
-            ),
+            crossover_response_mode=(prepared.plan.crossover_response_mode.value),
+            proposal_representation=_proposal_representation(prepared.plan),
+            atomic_submitted_path=materialization_evidence.get("atomic_submitted_path"),
+            atomic_old_value_hash=materialization_evidence.get("atomic_old_value_hash"),
+            atomic_new_value_hash=materialization_evidence.get("atomic_new_value_hash"),
             materialized_patch_hash=materialization_evidence.get(
                 "materialized_patch_hash"
             ),
@@ -3902,10 +5652,20 @@ class AgenticEvolutionEngine:
                 for key, value in materialization_evidence.items()
                 if key.startswith("finite_")
             },
+            **{
+                key: value
+                for key, value in materialization_evidence.items()
+                if key.startswith("crossover_")
+            },
             **(
                 {}
                 if detailed is None
                 else {"detailed_evaluation": detailed.to_record()}
+            ),
+            **(
+                {}
+                if resolution is None
+                else {"objective_resolution": resolution.to_record()}
             ),
         )
         return candidate, treatment_admission
@@ -3914,7 +5674,10 @@ class AgenticEvolutionEngine:
         self,
         prepared: PreparedInvocation,
     ) -> tuple[
-        CandidateDraft | AtomicMutationDraft | FiniteVariationSelectionDraft,
+        CandidateDraft
+        | AtomicMutationDraft
+        | FiniteVariationSelectionDraft
+        | ExactParentCrossoverDraft,
         AgenticCallTelemetry | None,
     ]:
         plan = prepared.plan
@@ -3934,6 +5697,7 @@ class AgenticEvolutionEngine:
         assert prepared.call_id is not None
         atomic_contract = None
         finite_contract = None
+        exact_crossover_output_contract = None
         if (
             plan.mutation_response_mode
             is MutationResponseMode.ATOMIC_SCALAR_REPLACEMENT_V1
@@ -3956,6 +5720,25 @@ class AgenticEvolutionEngine:
             finite_contract = plan.finite_variation_contract
             if finite_contract is None:  # pragma: no cover - plan admission.
                 raise ValueError("finite option mode requires a sealed contract")
+        if (
+            plan.operator_kind is OperatorKind.TWO_PARENT_CROSSOVER
+            and plan.crossover_response_mode
+            is CrossoverResponseMode.EXACT_PARENT_IMPORT_V1
+        ):
+            crossover_contract = plan.exact_parent_crossover_contract
+            if type(crossover_contract) is not ExactParentCrossoverContract:
+                raise ValueError("exact crossover mode requires a sealed contract")
+            exact_crossover_output_contract = ExactParentCrossoverOutputContract(
+                contract_identity_sha256=(crossover_contract.contract_sha256),
+                locus_ids=tuple(locus.locus_id for locus in crossover_contract.loci),
+                claimable_insight_ids=tuple(
+                    sorted(
+                        reference.insight_id.value
+                        for reference in prepared.variation_case.selected_insights
+                    )
+                ),
+                forbidden_import_locus_sets=(plan.forbidden_exact_parent_import_sets),
+            )
         max_output_tokens = self._max_output_tokens_for(
             StructuredOutputRequestKind.PROPOSAL,
             plan.operator_kind.value,
@@ -3970,6 +5753,7 @@ class AgenticEvolutionEngine:
                 temperature=self._temperature,
                 atomic_mutation_contract=atomic_contract,
                 finite_variation_contract=finite_contract,
+                exact_parent_crossover_contract=(exact_crossover_output_contract),
             )
         )
         self._emit(
@@ -3992,7 +5776,8 @@ class AgenticEvolutionEngine:
             provider_latency_ns=result.telemetry.latency_ns,
             attempt_count=result.telemetry.attempt_count,
             mutation_response_mode=plan.mutation_response_mode.value,
-            proposal_representation=plan.mutation_response_mode.value,
+            crossover_response_mode=plan.crossover_response_mode.value,
+            proposal_representation=_proposal_representation(plan),
         )
         return result.draft, result.telemetry
 
@@ -4102,6 +5887,12 @@ class AgenticEvolutionEngine:
                 materialization_policy_version=item.materialization_policy_version,
                 materialization_receipt_hash=item.materialization_receipt_hash,
                 materialized_candidate_id=item.candidate_id,
+                materialized_finite_action_authority=(
+                    item.materialized_finite_action_authority
+                ),
+                materialized_finite_action_decision=(
+                    item.materialized_finite_action_decision
+                ),
                 reward_definition_hash=active_reward.definition_hash,
             )
             for item in materialized
@@ -4142,6 +5933,14 @@ class AgenticEvolutionEngine:
         proposal_failure_stage: str,
         reward_binding: RewardPolicyBinding,
     ) -> tuple[InvocationOutcome, ...]:
+        self._emit(
+            "reward_binding_committed",
+            reward_binding=reward_binding.to_record(),
+            reward_binding_sha256=reward_binding.binding_sha256,
+            operator_invocation_ids=[
+                item.operator_invocation_id.value for item in prepared
+            ],
+        )
         # Execution commitment is distinct from readiness-only preparation.  Seal
         # every resolved unit in deterministic plan order before scheduling even
         # one provider call, so a crash log cannot contain a partially committed
@@ -4177,6 +5976,8 @@ class AgenticEvolutionEngine:
                 },
                 credit_mode=resolved.credit_mode.value,
                 reward_definition_hash=item.variation_case.reward_definition_hash,
+                reward_binding_sha256=reward_binding.binding_sha256,
+                reward_failure_score=reward_binding.failure_score,
                 prepared_prompt_sha256=hashlib.sha256(
                     item.prompt.encode("utf-8")
                 ).hexdigest(),
@@ -4190,6 +5991,7 @@ class AgenticEvolutionEngine:
             str | None,
             DetailedEvaluation | None,
             TreatmentAdmissionReceipt | None,
+            FiniteActionDecision | None,
         ]:
             # Keep the whole proposal-to-evaluation pipeline concurrent.  In the
             # target regime both provider calls and candidate evaluations can
@@ -4211,7 +6013,58 @@ class AgenticEvolutionEngine:
                         else "infrastructure"
                     )
                 )
-                return None, exc, failure_stage, None, None
+                return None, exc, failure_stage, None, None, None
+            finite_action_decision: FiniteActionDecision | None = None
+            finite_authority = item.plan.finite_action_set_authority
+            if finite_authority is not None:
+                try:
+                    if type(draft) is not FiniteVariationSelectionDraft:
+                        raise TypeError(
+                            "finite action authority requires an exact selection draft"
+                        )
+                    if type(telemetry) is not AgenticCallTelemetry:
+                        raise TypeError(
+                            "finite action authority requires exact model telemetry"
+                        )
+                    if item.call_id is None:
+                        raise ValueError(
+                            "finite action authority lost its logical model call"
+                        )
+                    finite_action_decision = seal_model_finite_action_decision(
+                        authority=finite_authority,
+                        call_id=item.call_id,
+                        prompt_sha256=hashlib.sha256(
+                            item.prompt.encode("utf-8", errors="strict")
+                        ).hexdigest(),
+                        draft=draft,
+                        telemetry=telemetry,
+                    )
+                    required_claim = (finite_authority.card.reference.insight_id.value,)
+                    if draft.claimed_insight_ids != required_claim:
+                        raise ValueError(
+                            "finite action choice did not claim its exact assigned card"
+                        )
+                    self._emit(
+                        "finite_action_decision_sealed",
+                        operator_invocation_id=item.operator_invocation_id.value,
+                        call_id=item.call_id.value,
+                        candidate_id=item.candidate_id.value,
+                        authority_sha256=finite_authority.authority_sha256,
+                        decision={
+                            **finite_action_decision.to_record(),
+                            "decision_sha256": (finite_action_decision.decision_sha256),
+                        },
+                        evaluator_entered=False,
+                    )
+                except (TypeError, ValueError) as exc:
+                    return (
+                        None,
+                        exc,
+                        "candidate",
+                        None,
+                        None,
+                        finite_action_decision,
+                    )
             try:
                 candidate, treatment_admission = await self._candidate_from_draft(
                     item, draft, telemetry
@@ -4219,14 +6072,42 @@ class AgenticEvolutionEngine:
             except asyncio.CancelledError:
                 raise
             except TreatmentComplianceRejected as exc:
-                return None, exc, "treatment_noncompliance", None, exc.receipt
+                return (
+                    None,
+                    exc,
+                    "treatment_noncompliance",
+                    None,
+                    exc.receipt,
+                    finite_action_decision,
+                )
             except _TerminalDetailedEvaluationError as exc:
-                return None, exc, "infrastructure", exc.evaluation, None
+                return (
+                    None,
+                    exc,
+                    "infrastructure",
+                    exc.evaluation,
+                    None,
+                    finite_action_decision,
+                )
             except (TypeError, ValueError) as exc:
-                return None, exc, "candidate", None, None
+                return None, exc, "candidate", None, None, finite_action_decision
             except Exception as exc:
-                return None, exc, "infrastructure", None, None
-            return candidate, None, None, None, treatment_admission
+                return (
+                    None,
+                    exc,
+                    "infrastructure",
+                    None,
+                    None,
+                    finite_action_decision,
+                )
+            return (
+                candidate,
+                None,
+                None,
+                None,
+                treatment_admission,
+                finite_action_decision,
+            )
 
         raw = await asyncio.gather(*(execute_and_evaluate(item) for item in prepared))
         outcomes: list[InvocationOutcome] = []
@@ -4237,13 +6118,14 @@ class AgenticEvolutionEngine:
                 failure_stage,
                 terminal_evaluation,
                 treatment_admission,
+                finite_action_decision,
             ) = result
             terminal_candidate_ids = (
                 [] if candidate is None else [candidate.candidate_id.value]
             )
             failure_type = None if failure is None else type(failure).__name__
             if failure_stage in {"llm", "materialization"}:
-                reward = -1.0
+                reward = reward_binding.failure_score
                 if failure_stage == "llm":
                     self._emit(
                         "llm_call_failed",
@@ -4265,14 +6147,14 @@ class AgenticEvolutionEngine:
                         failure_type=failure_type,
                     )
             elif failure_stage == "candidate":
-                reward = -1.0
+                reward = reward_binding.failure_score
                 self._emit(
                     "candidate_boundary_failed",
                     operator_invocation_id=item.operator_invocation_id.value,
                     failure_type=failure_type,
                 )
             elif failure_stage == "treatment_noncompliance":
-                reward = -1.0
+                reward = reward_binding.failure_score
                 assert treatment_admission is not None
                 self._emit(
                     "treatment_compliance_rejected",
@@ -4287,7 +6169,7 @@ class AgenticEvolutionEngine:
                     evaluator_entered=treatment_admission.evaluator_entered,
                 )
             elif failure_stage == "infrastructure":
-                reward = -1.0
+                reward = reward_binding.failure_score
                 self._emit(
                     "infrastructure_boundary_failed",
                     operator_invocation_id=item.operator_invocation_id.value,
@@ -4314,7 +6196,7 @@ class AgenticEvolutionEngine:
                     failure = exc
                     failure_stage = "infrastructure"
                     failure_type = type(exc).__name__
-                    reward = -1.0
+                    reward = reward_binding.failure_score
                     self._emit(
                         "infrastructure_boundary_failed",
                         operator_invocation_id=item.operator_invocation_id.value,
@@ -4351,7 +6233,7 @@ class AgenticEvolutionEngine:
                 failure = exc
                 failure_stage = "infrastructure"
                 failure_type = type(exc).__name__
-                reward = -1.0
+                reward = reward_binding.failure_score
                 dominates = False
                 parent_relations = ()
                 candidate = None
@@ -4445,6 +6327,7 @@ class AgenticEvolutionEngine:
                 terminal_evaluation=terminal_evaluation,
                 parent_relations=parent_relations,
                 treatment_admission_receipt=treatment_admission,
+                finite_action_decision=finite_action_decision,
             )
             outcomes.append(outcome)
             resolved = item.plan.resolved_insight_assignment
@@ -4515,6 +6398,8 @@ class AgenticEvolutionEngine:
                 scalar_reward_definition_sha256=(
                     item.variation_case.reward_definition_hash
                 ),
+                scalar_reward_binding_sha256=reward_binding.binding_sha256,
+                scalar_reward_failure_score=reward_binding.failure_score,
                 dominates_any_parent=dominates,
                 positive_scalar_reward=better,
                 selected_insight_ids=[
@@ -4540,6 +6425,34 @@ class AgenticEvolutionEngine:
                         "receipt_sha256": treatment_admission.receipt_sha256,
                     }
                 ),
+                finite_action_decision=(
+                    None
+                    if finite_action_decision is None
+                    else {
+                        **finite_action_decision.to_record(),
+                        "decision_sha256": finite_action_decision.decision_sha256,
+                    }
+                ),
+                materialized_finite_action_authority=(
+                    None
+                    if item.materialized_finite_action_authority is None
+                    else {
+                        **item.materialized_finite_action_authority.to_record(),
+                        "authority_sha256": (
+                            item.materialized_finite_action_authority.authority_sha256
+                        ),
+                    }
+                ),
+                materialized_finite_action_decision=(
+                    None
+                    if item.materialized_finite_action_decision is None
+                    else {
+                        **item.materialized_finite_action_decision.to_record(),
+                        "decision_sha256": (
+                            item.materialized_finite_action_decision.decision_sha256
+                        ),
+                    }
+                ),
                 **(
                     {}
                     if not self._detailed_evaluation_enabled
@@ -4553,11 +6466,7 @@ class AgenticEvolutionEngine:
                                 "candidate_relation": relation.value,
                             }
                             for parent, relation in zip(
-                                (
-                                    item.plan.parents
-                                    if parent_relations
-                                    else ()
-                                ),
+                                (item.plan.parents if parent_relations else ()),
                                 parent_relations,
                                 strict=True,
                             )
@@ -4583,7 +6492,10 @@ class AgenticEvolutionEngine:
             str,
             tuple[OperatorInvocationId, tuple[CandidateId, CandidateId]],
         ],
-        contrast_option_ids: Mapping[str, str],
+        contrast_action_bindings: Mapping[
+            str,
+            FiniteActionEvidenceBinding,
+        ],
         outcomes: Sequence[InvocationOutcome],
         label: str,
         insight_contract: ReflectionInsightContract | None,
@@ -4591,9 +6503,7 @@ class AgenticEvolutionEngine:
         """Atomically admit one already-complete contrast-sharded batch."""
 
         if type(workflow_result) is not ReflectionWorkflowResult:
-            raise TypeError(
-                "workflow_result must be an exact ReflectionWorkflowResult"
-            )
+            raise TypeError("workflow_result must be an exact ReflectionWorkflowResult")
         ReflectionWorkflowResult.__post_init__(workflow_result)
         expected_contrasts = tuple(sorted(contrast_lineage))
         returned_contrasts = tuple(
@@ -4604,12 +6514,7 @@ class AgenticEvolutionEngine:
                 "reflection workflow result differs from the engine contrast boundary"
             )
         evidence_operator_kinds = tuple(
-            sorted(
-                {
-                    outcome.prepared.plan.operator_kind.value
-                    for outcome in outcomes
-                }
-            )
+            sorted({outcome.prepared.plan.operator_kind.value for outcome in outcomes})
         )
         staged_items: list[ReflectedInsightBatchItem] = []
         for shard in workflow_result.shards:
@@ -4620,7 +6525,7 @@ class AgenticEvolutionEngine:
                 draft,
                 insight_contract,
                 (shard.contrast_id,),
-                contrast_option_ids,
+                contrast_action_bindings,
             )
             operator_id, candidate_ids = contrast_lineage[shard.contrast_id]
             staged_items.append(
@@ -4632,6 +6537,12 @@ class AgenticEvolutionEngine:
                         source_candidate_ids=tuple(sorted(candidate_ids)),
                         available_contrast_ids=(shard.contrast_id,),
                         cited_contrast_ids=(shard.contrast_id,),
+                        finite_action_bindings=(
+                            _finite_action_evidence_for_citations(
+                                (shard.contrast_id,),
+                                contrast_action_bindings,
+                            )
+                        ),
                     ),
                 )
             )
@@ -4666,9 +6577,7 @@ class AgenticEvolutionEngine:
                 output_tokens=telemetry.output_tokens,
                 reasoning_tokens=telemetry.reasoning_tokens,
                 cost_usd=(
-                    None
-                    if telemetry.cost_usd is None
-                    else str(telemetry.cost_usd)
+                    None if telemetry.cost_usd is None else str(telemetry.cost_usd)
                 ),
                 provider_latency_ns=telemetry.latency_ns,
                 attempt_count=telemetry.attempt_count,
@@ -4697,19 +6606,7 @@ class AgenticEvolutionEngine:
                             entry.applicable_operator_kinds
                         ),
                         **(entry.draft.intervention_record() or {}),
-                        "evidence_lineage": {
-                            "reflection_call_id": shard.call_id.value,
-                            "source_operator_invocation_ids": [
-                                value.value
-                                for value in entry.evidence_lineage.source_operator_invocation_ids
-                            ],
-                            "source_candidate_ids": [
-                                value.value
-                                for value in entry.evidence_lineage.source_candidate_ids
-                            ],
-                            "available_contrast_ids": [shard.contrast_id],
-                            "cited_contrast_ids": [shard.contrast_id],
-                        },
+                        "evidence_lineage": entry.evidence_lineage.to_record(),
                     }
                 ],
             )
@@ -4722,13 +6619,13 @@ class AgenticEvolutionEngine:
                 type(self._reflection_workflow).__name__,
             ),
             logical_llm_calls_used=workflow_result.logical_llm_calls_used,
-            call_ids=[shard.call_id.value for shard in workflow_result.shards],
+            call_ids=[call_id.value for call_id in workflow_result.call_ids],
             contrast_ids=list(returned_contrasts),
             insight_count=len(added),
         )
         return added
 
-    async def reflect(
+    async def _reflect_entries(
         self,
         outcomes: Sequence[InvocationOutcome],
         *,
@@ -4736,11 +6633,39 @@ class AgenticEvolutionEngine:
         max_insights: int = 4,
         min_insights: int = 0,
         insight_contract: ReflectionInsightContract | None = None,
+        revision_predecessors: tuple[InsightRef, ...] = (),
+        source_receipt_sha256s: tuple[str, ...] = (),
     ) -> tuple[InsightMemoryEntry, ...]:
         if type(max_insights) is not int or not 1 <= max_insights <= 16:
             raise ValueError("max_insights must lie in [1,16]")
         if type(min_insights) is not int or not 0 <= min_insights <= max_insights:
             raise ValueError("min_insights must lie in [0,max_insights]")
+        if type(revision_predecessors) is not tuple or any(
+            type(value) is not InsightRef for value in revision_predecessors
+        ):
+            raise TypeError(
+                "revision_predecessors must be an exact tuple of InsightRef values"
+            )
+        if len(set(revision_predecessors)) != len(revision_predecessors):
+            raise ValueError("revision_predecessors cannot repeat")
+        if type(source_receipt_sha256s) is not tuple:
+            raise TypeError("source_receipt_sha256s must be an exact tuple")
+        for value in source_receipt_sha256s:
+            require_sha256(value, "reflection source receipt SHA-256")
+        revision_predecessor_entries: tuple[InsightMemoryEntry, ...] = ()
+        if revision_predecessors:
+            if len(revision_predecessors) != 1 or max_insights != 1:
+                raise ValueError(
+                    "the atomic revision path supports exactly one frozen target"
+                )
+            if self._reflection_workflow is not None:
+                raise ValueError(
+                    "revision publication currently requires one batched reflection"
+                )
+            # Resolve exact owned versions before allocating a provider call.
+            revision_predecessor_entries = self.memory.entries_for(
+                revision_predecessors
+            )
         if insight_contract is not None:
             if type(insight_contract) is not ReflectionInsightContract:
                 raise TypeError(
@@ -4754,7 +6679,10 @@ class AgenticEvolutionEngine:
             str,
             tuple[OperatorInvocationId, tuple[CandidateId, CandidateId]],
         ] = {}
-        contrast_option_ids: dict[str, str] = {}
+        contrast_action_bindings: dict[
+            str,
+            FiniteActionEvidenceBinding,
+        ] = {}
         for outcome in outcomes:
             if type(outcome) is not InvocationOutcome:
                 raise TypeError("reflection requires exact InvocationOutcome values")
@@ -4780,83 +6708,126 @@ class AgenticEvolutionEngine:
                         (parent.candidate_id, candidate.candidate_id),
                     )
                     contrast_record: dict[str, object] = {
-                            "contrast_id": contrast_id,
-                            "parent_candidate_id": parent.candidate_id.value,
-                            "child_candidate_id": candidate.candidate_id.value,
-                            "parent_configuration_hash": (
-                                parent.occurrence.configuration_hash
-                            ),
-                            "child_configuration_hash": (
-                                candidate.occurrence.configuration_hash
-                            ),
-                            "derived_patch_hash": patch.patch_hash,
-                            "changed_paths": [
-                                _path_text(operation.path)
-                                for operation in patch.operations
-                            ],
-                            "system_derived_operations": [
-                                _reflection_operation_projection(operation)
-                                for operation in patch.operations
-                            ],
-                            "patch_operation_count": len(patch.operations),
-                            "contrast_scope": (
-                                "no_change"
-                                if not patch.operations
-                                else (
-                                    "single_operation"
-                                    if len(patch.operations) == 1
-                                    else "joint_intervention"
-                                )
-                            ),
-                            "objective_deltas_child_minus_parent": {
-                                spec.name: (
+                        "contrast_id": contrast_id,
+                        "parent_candidate_id": parent.candidate_id.value,
+                        "child_candidate_id": candidate.candidate_id.value,
+                        "parent_configuration_hash": (
+                            parent.occurrence.configuration_hash
+                        ),
+                        "child_configuration_hash": (
+                            candidate.occurrence.configuration_hash
+                        ),
+                        "derived_patch_hash": patch.patch_hash,
+                        "changed_paths": [
+                            _path_text(operation.path) for operation in patch.operations
+                        ],
+                        "system_derived_operations": [
+                            _reflection_operation_projection(operation)
+                            for operation in patch.operations
+                        ],
+                        "patch_operation_count": len(patch.operations),
+                        "contrast_scope": (
+                            "no_change"
+                            if not patch.operations
+                            else (
+                                "single_operation"
+                                if len(patch.operations) == 1
+                                else "joint_intervention"
+                            )
+                        ),
+                        "objective_deltas_child_minus_parent": {
+                            spec.name: (
+                                candidate.objective_map[spec.name]
+                                - parent.objective_map[spec.name]
+                            )
+                            for spec in self.objectives
+                            if candidate.valid and parent.valid
+                        },
+                        "directional_improvements": {
+                            spec.name: (
+                                (
                                     candidate.objective_map[spec.name]
                                     - parent.objective_map[spec.name]
                                 )
-                                for spec in self.objectives
-                                if candidate.valid and parent.valid
-                            },
-                            "directional_improvements": {
-                                spec.name: (
-                                    (
-                                        candidate.objective_map[spec.name]
-                                        - parent.objective_map[spec.name]
-                                    )
-                                    * (1.0 if spec.goal == "max" else -1.0)
-                                )
-                                for spec in self.objectives
-                                if candidate.valid and parent.valid
-                            },
-                        }
-                    finite_contract = (
-                        outcome.prepared.plan.finite_variation_contract
-                    )
-                    if finite_contract is not None:
-                        matching_options = tuple(
-                            option
-                            for option in finite_contract.options
-                            if typed_json_equal(
-                                option.child_configuration,
-                                candidate.configuration,
+                                * (1.0 if spec.goal == "max" else -1.0)
                             )
+                            for spec in self.objectives
+                            if candidate.valid and parent.valid
+                        },
+                    }
+                    finite_contract = outcome.prepared.plan.finite_variation_contract
+                    materialized_option_id: str | None = None
+                    if finite_contract is None:
+                        materialized_authority = (
+                            outcome.prepared.materialized_finite_action_authority
                         )
-                        if len(matching_options) != 1:
+                        materialized_decision = (
+                            outcome.prepared.materialized_finite_action_decision
+                        )
+                        if (materialized_authority is None) != (
+                            materialized_decision is None
+                        ):
                             raise RuntimeError(
-                                "finite-plan reflection could not attribute the "
-                                "child to exactly one sealed option"
+                                "prepared materialized finite action provenance "
+                                "was split"
                             )
-                        matched_option = matching_options[0]
-                        contrast_option_ids[contrast_id] = matched_option.option_id
-                        contrast_record["finite_variation_option"] = {
-                            "option_id": matched_option.option_id,
-                            "family": matched_option.family,
-                            "option_identity_sha256": (
-                                matched_option.identity_sha256
-                            ),
-                            "contract_identity_sha256": (
-                                finite_contract.identity_sha256
-                            ),
-                        }
+                        if materialized_authority is not None:
+                            assert materialized_decision is not None
+                            validate_finite_action_decision(
+                                materialized_authority,
+                                materialized_decision,
+                            )
+                            if (
+                                materialized_decision.selector_kind
+                                is not FiniteActionSelectorKind.ENGINE
+                                or materialized_decision.child_configuration_sha256
+                                != candidate.occurrence.configuration_hash
+                            ):
+                                raise RuntimeError(
+                                    "materialized finite action reflection provenance "
+                                    "differs from the evaluated child"
+                                )
+                            finite_contract = (
+                                materialized_authority.support.support_contract
+                            )
+                            materialized_option_id = materialized_decision.option_id
+                    if finite_contract is not None:
+                        if materialized_option_id is None:
+                            matching_options = tuple(
+                                option
+                                for option in finite_contract.options
+                                if typed_json_equal(
+                                    option.child_configuration,
+                                    candidate.configuration,
+                                )
+                            )
+                            if len(matching_options) != 1:
+                                raise RuntimeError(
+                                    "finite-plan reflection could not attribute the "
+                                    "child to exactly one sealed option"
+                                )
+                            matched_option = matching_options[0]
+                        else:
+                            matched_option = finite_contract.resolve(
+                                materialized_option_id
+                            )
+                            if not typed_json_equal(
+                                matched_option.child_configuration,
+                                candidate.configuration,
+                            ):
+                                raise RuntimeError(
+                                    "materialized finite action option differs from "
+                                    "the evaluated child"
+                                )
+                        action_binding = bind_finite_action_evidence(
+                            contrast_id=contrast_id,
+                            contract=finite_contract,
+                            option_id=matched_option.option_id,
+                        )
+                        contrast_action_bindings[contrast_id] = action_binding
+                        contrast_record["finite_variation_option"] = (
+                            action_binding.finite_option_record()
+                        )
                     relation = (
                         None
                         if not outcome.parent_relations
@@ -4877,35 +6848,33 @@ class AgenticEvolutionEngine:
                         )
                     contrasts.append(contrast_record)
             row: dict[str, object] = {
-                    "operator_invocation_id": (
-                        outcome.prepared.operator_invocation_id.value
-                    ),
-                    "operator": outcome.prepared.plan.operator_kind.value,
-                    "parents": [
-                        _candidate_evidence(parent)
-                        for parent in outcome.prepared.plan.parents
-                    ],
-                    "candidate": (
-                        None
-                        if candidate is None
-                        else {
-                            **_candidate_evidence(candidate),
-                            "operator_failure": candidate.operator_failure,
-                            "design_rationale": candidate.design_rationale,
-                            "selected_insight_ids": list(
-                                candidate.selected_insight_ids
-                            ),
-                            "claimed_insight_ids": list(candidate.claimed_insight_ids),
-                        }
-                    ),
-                    "scalar_reward": outcome.reward,
-                    "scalar_reward_definition_sha256": (
-                        outcome.prepared.variation_case.reward_definition_hash
-                    ),
-                    "positive_scalar_reward": outcome.better_than_any_parent,
-                    "call_failure_type": outcome.call_failure_type,
-                    "machine_derived_contrasts": contrasts,
-                }
+                "operator_invocation_id": (
+                    outcome.prepared.operator_invocation_id.value
+                ),
+                "operator": outcome.prepared.plan.operator_kind.value,
+                "parents": [
+                    _candidate_evidence(parent)
+                    for parent in outcome.prepared.plan.parents
+                ],
+                "candidate": (
+                    None
+                    if candidate is None
+                    else {
+                        **_candidate_evidence(candidate),
+                        "operator_failure": candidate.operator_failure,
+                        "design_rationale": candidate.design_rationale,
+                        "selected_insight_ids": list(candidate.selected_insight_ids),
+                        "claimed_insight_ids": list(candidate.claimed_insight_ids),
+                    }
+                ),
+                "scalar_reward": outcome.reward,
+                "scalar_reward_definition_sha256": (
+                    outcome.prepared.variation_case.reward_definition_hash
+                ),
+                "positive_scalar_reward": outcome.better_than_any_parent,
+                "call_failure_type": outcome.call_failure_type,
+                "machine_derived_contrasts": contrasts,
+            }
             if self._objective_pareto_relation:
                 row["dominates_any_parent"] = outcome.dominates_any_parent
             else:
@@ -4967,16 +6936,14 @@ class AgenticEvolutionEngine:
                 shard_row = thaw_json(frozen_shard)
                 shard_row["machine_derived_contrasts"] = [projected_contrast]
                 projected_parents = shard_row.get("parents")
-                if (
-                    type(projected_parents) is list
-                    and len(projected_parents) == len(projected_contrasts)
+                if type(projected_parents) is list and len(projected_parents) == len(
+                    projected_contrasts
                 ):
                     shard_row["parents"] = [projected_parents[contrast_index]]
                 projected_relations = shard_row.get("parent_outcome_relations")
-                if (
-                    type(projected_relations) is list
-                    and len(projected_relations) == len(projected_contrasts)
-                ):
+                if type(projected_relations) is list and len(
+                    projected_relations
+                ) == len(projected_contrasts):
                     relation = projected_relations[contrast_index]
                     shard_row["parent_outcome_relations"] = [relation]
                     shard_row["better_relation_any_parent"] = relation == "better"
@@ -5004,6 +6971,19 @@ class AgenticEvolutionEngine:
             "Put every supporting full 64-character contrast_id in evidence_contrast_ids; use evidence_summary only for a human-readable account of that evidence. Every affected path must be canonical and begin with $., and duplicated claims should be consolidated instead of re-added. "
             "For a multi-operation association, state a concrete one-coordinate falsification/ablation in the trigger or evidence summary.",
         ]
+        if revision_predecessors:
+            prompt_sections.extend(
+                [
+                    "",
+                    "FROZEN REVISION TARGETS",
+                    _json(self.memory.prompt_records(revision_predecessors)),
+                    "Every returned card is a quarantined semantic revision of "
+                    "the target at the same array position. Preserve useful "
+                    "scope, correct the mechanism/action using only the sealed "
+                    "trace, and do not claim inherited support or score. The "
+                    "system binds the revises relation and a fresh zero prior.",
+                ]
+            )
         if self._reflection_row_projection is not None:
             prompt_sections.extend(
                 [
@@ -5030,6 +7010,7 @@ class AgenticEvolutionEngine:
                     _json(insight_contract.to_record()),
                 ]
             )
+
         def render_reflection_prompt(
             evidence_rows: Sequence[Mapping[str, object]],
             *,
@@ -5040,8 +7021,7 @@ class AgenticEvolutionEngine:
                 f"Return at most {upper} insights."
                 if lower == 0
                 else (
-                    f"Return exactly {upper} "
-                    f"{'insight' if upper == 1 else 'insights'}."
+                    f"Return exactly {upper} {'insight' if upper == 1 else 'insights'}."
                     if lower == upper
                     else f"Return between {lower} and {upper} insights."
                 )
@@ -5072,12 +7052,36 @@ class AgenticEvolutionEngine:
             StructuredOutputRequestKind.REFLECTION,
             reflection_operation,
         )
+        reflection_request = ReflectionCallRequest(
+            label=label,
+            operation=reflection_operation,
+            prompt_sha256=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            min_insights=min_insights,
+            max_insights=max_insights,
+            max_output_tokens=max_output_tokens,
+            temperature=self._temperature,
+            insight_contract_sha256=(
+                None if insight_contract is None else insight_contract.identity_sha256
+            ),
+            revision_predecessors=revision_predecessors,
+            revision_predecessor_content_sha256s=tuple(
+                entry.draft.content_sha256 for entry in revision_predecessor_entries
+            ),
+            source_receipt_sha256s=source_receipt_sha256s,
+            source_operator_invocation_ids=tuple(
+                outcome.prepared.operator_invocation_id for outcome in outcomes
+            ),
+            source_outcome_sha256s=tuple(
+                hashlib.sha256(
+                    _REFLECTION_SOURCE_OUTCOME_DOMAIN
+                    + canonical_typed_json_bytes(freeze_json(row))
+                ).hexdigest()
+                for row in rows
+            ),
+            available_contrast_ids=canonical_contrast_ids,
+        )
         if self._reflection_workflow is not None:
-            if not (
-                min_insights
-                <= len(canonical_contrast_ids)
-                <= max_insights
-            ):
+            if not (min_insights <= len(canonical_contrast_ids) <= max_insights):
                 raise ValueError(
                     "contrast-sharded cardinality falls outside the requested "
                     "insight interval"
@@ -5103,9 +7107,12 @@ class AgenticEvolutionEngine:
                 max_output_tokens=max_output_tokens,
                 temperature=self._temperature,
                 insight_contract=insight_contract,
+                batch_prompt=prompt,
             )
 
-            def reflection_call_planned(call: PlannedReflectionCall) -> None:
+            def reflection_call_planned(
+                call: PlannedReflectionCall | PlannedReflectionBatchCall,
+            ) -> None:
                 request = call.request
                 self._emit(
                     "reflection_requested",
@@ -5173,7 +7180,7 @@ class AgenticEvolutionEngine:
             return self._publish_sharded_reflection(
                 workflow_result=workflow_result,
                 contrast_lineage=contrast_lineage,
-                contrast_option_ids=contrast_option_ids,
+                contrast_action_bindings=contrast_action_bindings,
                 outcomes=outcomes,
                 label=label,
                 insight_contract=insight_contract,
@@ -5185,7 +7192,9 @@ class AgenticEvolutionEngine:
             call_id=call_id.value,
             label=label,
             prompt=prompt,
-            prompt_sha256=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            prompt_sha256=reflection_request.prompt_sha256,
+            reflection_request_sha256=reflection_request.request_sha256,
+            source_receipt_sha256s=list(source_receipt_sha256s),
             available_contrast_ids=list(canonical_contrast_ids),
             **(
                 {}
@@ -5207,6 +7216,7 @@ class AgenticEvolutionEngine:
                 else {"insight_contract": insight_contract.to_record()}
             ),
         )
+        observed_telemetry: AgenticCallTelemetry | None = None
         try:
             result = await self.generator.reflect(
                 ReflectionGenerationRequest(
@@ -5221,17 +7231,55 @@ class AgenticEvolutionEngine:
                     insight_contract=insight_contract,
                 )
             )
+            if type(result) is not ReflectionGenerationResult:
+                raise TypeError(
+                    "reflection generator must return an exact "
+                    "ReflectionGenerationResult"
+                )
+            if type(result.insights) is not tuple or any(
+                type(value) is not InsightDraft for value in result.insights
+            ):
+                raise TypeError(
+                    "reflection result insights must be an exact tuple of "
+                    "InsightDraft values"
+                )
+            for draft in result.insights:
+                InsightDraft.__post_init__(draft)
+            if type(result.telemetry) is not AgenticCallTelemetry:
+                raise TypeError(
+                    "reflection result telemetry must be exact AgenticCallTelemetry"
+                )
+            AgenticCallTelemetry.__post_init__(result.telemetry)
+            observed_telemetry = result.telemetry
+            if not min_insights <= len(result.insights) <= max_insights:
+                raise ReflectionCardContractError(
+                    "reflection result violates its requested cardinality"
+                )
         except Exception as exc:
+            failure_receipt = ReflectionCallReceipt(
+                call_id=call_id,
+                request=reflection_request,
+                status=ReflectionCallStatus.FAILED,
+                telemetry=observed_telemetry,
+                telemetry_sha256=None,
+                failure_type=type(exc).__name__,
+            )
+            self._record_reflection_call_receipt(failure_receipt)
             self._emit(
                 "reflection_failed",
                 call_id=call_id.value,
                 failure_type=type(exc).__name__,
+                reflection_call_receipt_sha256=(failure_receipt.receipt_sha256),
             )
-            # Queue-owned retries are already exhausted at this boundary.  A
-            # workflow that wants degraded continuation can catch explicitly;
-            # silently treating a missing reflection as an empty success makes
-            # memory-policy experiments uninterpretable.
-            raise
+            # Queue-owned retries are already exhausted at this boundary.  The
+            # typed wrapper preserves that one logical call was consumed while
+            # allowing a postseal curation policy to isolate this failure from
+            # already-valid optimization endpoints.
+            raise ReflectionCallExecutionError(
+                call_id,
+                exc,
+                failure_receipt,
+            ) from exc
         # Model confidence is an annotation, not evidence of downstream utility.
         # Reflected hypotheses enter quarantine neutrally and cannot be retrieved
         # until a separate validation step records an explicit promotion.
@@ -5239,7 +7287,8 @@ class AgenticEvolutionEngine:
             sorted({outcome.prepared.plan.operator_kind.value for outcome in outcomes})
         )
         added_entries: list[InsightMemoryEntry] = []
-        for draft in result.insights:
+        rejected_insight_count = 0
+        for draft_index, draft in enumerate(result.insights):
             if insight_contract is not None:
                 try:
                     validate_reflection_insight_draft(
@@ -5256,6 +7305,7 @@ class AgenticEvolutionEngine:
                         reason="advanced_insight_contract_violation",
                         contract_error=type(exc).__name__,
                     )
+                    rejected_insight_count += 1
                     continue
             submitted_contrast_ids = draft.evidence_contrast_ids
             cited_contrast_ids = tuple(
@@ -5294,13 +7344,14 @@ class AgenticEvolutionEngine:
                     submitted_contrast_ids=list(submitted_contrast_ids),
                     available_contrast_ids=list(canonical_contrast_ids),
                 )
+                rejected_insight_count += 1
                 continue
             try:
                 _validate_reflected_action_origin(
                     draft,
                     insight_contract,
                     cited_contrast_ids,
-                    contrast_option_ids,
+                    contrast_action_bindings,
                 )
             except ReflectionCardContractError as exc:
                 self._emit(
@@ -5312,6 +7363,7 @@ class AgenticEvolutionEngine:
                     reason="origin_action_binding_mismatch",
                     contract_error=type(exc).__name__,
                 )
+                rejected_insight_count += 1
                 continue
             cited_operator_ids = tuple(
                 sorted(
@@ -5336,17 +7388,105 @@ class AgenticEvolutionEngine:
                 source_candidate_ids=cited_candidate_ids,
                 available_contrast_ids=canonical_contrast_ids,
                 cited_contrast_ids=cited_contrast_ids,
+                finite_action_bindings=(
+                    _finite_action_evidence_for_citations(
+                        cited_contrast_ids,
+                        contrast_action_bindings,
+                    )
+                ),
             )
-            entry, is_new = self.memory.add(
-                draft,
-                initial_score=0.0,
-                applicable_operator_kinds=evidence_operator_kinds,
-                origin=InsightOrigin.REFLECTION,
-                evidence_lineage=evidence_lineage,
-            )
-            if is_new:
+            if revision_predecessors:
+                try:
+                    entry = self.memory.add_revision(
+                        revision_predecessors[draft_index],
+                        draft,
+                        initial_score=0.0,
+                        applicable_operator_kinds=evidence_operator_kinds,
+                        origin=InsightOrigin.REFLECTION,
+                        evidence_lineage=evidence_lineage,
+                        revision_note="postseal evidence-guided revision",
+                    )
+                except Exception as exc:
+                    failure_receipt = ReflectionCallReceipt(
+                        call_id=call_id,
+                        request=reflection_request,
+                        status=ReflectionCallStatus.FAILED,
+                        telemetry=result.telemetry,
+                        telemetry_sha256=None,
+                        failure_type=type(exc).__name__,
+                    )
+                    self._record_reflection_call_receipt(failure_receipt)
+                    self._emit(
+                        "reflection_failed",
+                        call_id=call_id.value,
+                        failure_type=type(exc).__name__,
+                        reflection_call_receipt_sha256=(failure_receipt.receipt_sha256),
+                    )
+                    raise ReflectionCallExecutionError(
+                        call_id,
+                        exc,
+                        failure_receipt,
+                    ) from exc
                 added_entries.append(entry)
+            else:
+                entry, is_new = self.memory.add(
+                    draft,
+                    initial_score=0.0,
+                    applicable_operator_kinds=evidence_operator_kinds,
+                    origin=InsightOrigin.REFLECTION,
+                    evidence_lineage=evidence_lineage,
+                )
+                if is_new:
+                    added_entries.append(entry)
         added = tuple(added_entries)
+        # A true model abstention is an empty submitted tuple.  A non-empty
+        # response whose every draft fails the engine's evidence/action
+        # boundary is a typed call failure, not an abstention.  Keeping these
+        # outcomes distinct is essential for causal-memory diagnostics and for
+        # postseal policies that isolate a failed reflection from already valid
+        # optimization endpoints.
+        if (
+            result.insights
+            and not added
+            and rejected_insight_count == len(result.insights)
+        ):
+            cause = ReflectionCardContractError(
+                "all submitted reflection insights were rejected by the "
+                "engine evidence/action contract"
+            )
+            failure_receipt = ReflectionCallReceipt(
+                call_id=call_id,
+                request=reflection_request,
+                status=ReflectionCallStatus.FAILED,
+                telemetry=result.telemetry,
+                telemetry_sha256=None,
+                failure_type=type(cause).__name__,
+            )
+            self._record_reflection_call_receipt(failure_receipt)
+            self._emit(
+                "reflection_failed",
+                call_id=call_id.value,
+                failure_type=type(cause).__name__,
+                submitted_insight_count=len(result.insights),
+                rejected_insight_count=rejected_insight_count,
+                reason="all_submitted_insights_rejected",
+                reflection_call_receipt_sha256=(failure_receipt.receipt_sha256),
+            )
+            raise ReflectionCallExecutionError(
+                call_id,
+                cause,
+                failure_receipt,
+            ) from cause
+        completion_receipt = ReflectionCallReceipt(
+            call_id=call_id,
+            request=reflection_request,
+            status=ReflectionCallStatus.COMPLETED,
+            telemetry=result.telemetry,
+            telemetry_sha256=None,
+            failure_type=None,
+            publications=tuple(_reflection_publication(entry) for entry in added),
+        )
+        self._record_reflection_call_receipt(completion_receipt)
         self._emit(
             "reflection_completed",
             call_id=call_id.value,
@@ -5366,6 +7506,7 @@ class AgenticEvolutionEngine:
             ),
             provider_latency_ns=result.telemetry.latency_ns,
             attempt_count=result.telemetry.attempt_count,
+            reflection_call_receipt_sha256=(completion_receipt.receipt_sha256),
             **(
                 {}
                 if insight_contract is None
@@ -5387,34 +7528,92 @@ class AgenticEvolutionEngine:
                     "origin": entry.origin.value,
                     "applicable_operator_kinds": list(entry.applicable_operator_kinds),
                     **(entry.draft.intervention_record() or {}),
-                    "evidence_lineage": {
-                        "reflection_call_id": (
-                            entry.evidence_lineage.reflection_call_id.value
-                        ),
-                        "source_operator_invocation_ids": [
-                            value.value
-                            for value in entry.evidence_lineage.source_operator_invocation_ids
-                        ],
-                        "source_candidate_ids": [
-                            value.value
-                            for value in entry.evidence_lineage.source_candidate_ids
-                        ],
-                        "available_contrast_ids": list(
-                            entry.evidence_lineage.available_contrast_ids
-                        ),
-                        "cited_contrast_ids": list(
-                            entry.evidence_lineage.cited_contrast_ids
-                        ),
-                    },
+                    "evidence_lineage": entry.evidence_lineage.to_record(),
                 }
                 for entry in added
             ],
         )
         return added
 
+    async def reflect(
+        self,
+        outcomes: Sequence[InvocationOutcome],
+        *,
+        label: str,
+        max_insights: int = 4,
+        min_insights: int = 0,
+        insight_contract: ReflectionInsightContract | None = None,
+        revision_predecessors: tuple[InsightRef, ...] = (),
+        source_receipt_sha256s: tuple[str, ...] = (),
+    ) -> tuple[InsightMemoryEntry, ...]:
+        """Compatibility API returning only published memory entries."""
+
+        async with self._reflection_publication_lock:
+            return await self._reflect_entries(
+                outcomes,
+                label=label,
+                max_insights=max_insights,
+                min_insights=min_insights,
+                insight_contract=insight_contract,
+                revision_predecessors=revision_predecessors,
+                source_receipt_sha256s=source_receipt_sha256s,
+            )
+
+    async def reflect_with_receipt(
+        self,
+        outcomes: Sequence[InvocationOutcome],
+        *,
+        label: str,
+        max_insights: int = 4,
+        min_insights: int = 0,
+        insight_contract: ReflectionInsightContract | None = None,
+        revision_predecessors: tuple[InsightRef, ...] = (),
+        source_receipt_sha256s: tuple[str, ...] = (),
+    ) -> ReflectionPublicationResult:
+        """Run one batched reflection and return engine-issued call evidence.
+
+        ``reflect`` remains the compatibility surface for workflows that only
+        consume memory entries.  Causal curation policies should use this
+        receipt-bearing API and validate the returned request/publication
+        binding against their precommitted authority.
+        """
+
+        if self._reflection_workflow is not None:
+            raise ValueError(
+                "reflect_with_receipt currently requires one batched provider call"
+            )
+        async with self._reflection_publication_lock:
+            before = set(self._reflection_call_receipts)
+            entries = await self._reflect_entries(
+                outcomes,
+                label=label,
+                max_insights=max_insights,
+                min_insights=min_insights,
+                insight_contract=insight_contract,
+                revision_predecessors=revision_predecessors,
+                source_receipt_sha256s=source_receipt_sha256s,
+            )
+            added_call_ids = tuple(
+                call_id
+                for call_id in self._reflection_call_receipts
+                if call_id not in before
+            )
+            if len(added_call_ids) != 1:
+                raise RuntimeError(
+                    "receipt-bearing reflection did not publish exactly one "
+                    "call receipt"
+                )
+            result = ReflectionPublicationResult(
+                entries=entries,
+                receipt=self._reflection_call_receipts[added_call_ids[0]],
+            )
+        ReflectionPublicationResult.__post_init__(result)
+        return result
+
 
 __all__ = [
     "AgenticEvolutionEngine",
+    "CrossoverResponseMode",
     "EvolutionCandidate",
     "InsightAssignmentKind",
     "InvocationOutcome",
@@ -5426,6 +7625,12 @@ __all__ = [
     "PreparedInvocation",
     "ProposalAuthority",
     "REWARD_DEFINITION_HASH",
+    "ReflectionCallReceipt",
+    "ReflectionCallRequest",
+    "ReflectionCallExecutionError",
+    "ReflectionCallStatus",
+    "ReflectionPublication",
+    "ReflectionPublicationResult",
     "ReflectionRowProjectionBinding",
     "RewardPolicyBinding",
     "default_evidence_prompt",

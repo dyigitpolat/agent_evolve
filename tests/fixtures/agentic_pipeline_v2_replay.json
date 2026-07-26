@@ -1,0 +1,351 @@
+{
+  "schema_version": 1,
+  "notice": "Sanitized development-only replay derived from a live workflow probe. Provider metadata, prompts, identifiers, costs, and verbose rationales are intentionally omitted. This is not benchmark evidence.",
+  "configurations": {
+    "crossover_tradeoff": {
+      "passes": ["simplify", "licm", "vectorize", "dce"],
+      "frontend": {
+        "inline_threshold": 20,
+        "unroll_factor": 2,
+        "vector_width": 4
+      },
+      "backend": {
+        "register_budget": 32,
+        "scheduler": "balanced"
+      },
+      "runtime": {
+        "threads": 4,
+        "prefetch_distance": 4,
+        "data_layout": "blocked"
+      }
+    },
+    "known_recombination_target": {
+      "passes": ["simplify", "licm", "unroll", "vectorize", "dce"],
+      "frontend": {
+        "inline_threshold": 20,
+        "unroll_factor": 2,
+        "vector_width": 4
+      },
+      "backend": {
+        "register_budget": 40,
+        "scheduler": "aggressive"
+      },
+      "runtime": {
+        "threads": 4,
+        "prefetch_distance": 4,
+        "data_layout": "blocked"
+      }
+    },
+    "soa_threads_4_prefetch_4": {
+      "passes": ["simplify", "licm", "unroll", "vectorize", "dce"],
+      "frontend": {
+        "inline_threshold": 20,
+        "unroll_factor": 2,
+        "vector_width": 4
+      },
+      "backend": {
+        "register_budget": 40,
+        "scheduler": "aggressive"
+      },
+      "runtime": {
+        "threads": 4,
+        "prefetch_distance": 4,
+        "data_layout": "soa"
+      }
+    },
+    "soa_threads_2_prefetch_8": {
+      "passes": ["simplify", "licm", "unroll", "vectorize", "dce"],
+      "frontend": {
+        "inline_threshold": 20,
+        "unroll_factor": 2,
+        "vector_width": 4
+      },
+      "backend": {
+        "register_budget": 40,
+        "scheduler": "aggressive"
+      },
+      "runtime": {
+        "threads": 2,
+        "prefetch_distance": 8,
+        "data_layout": "soa"
+      }
+    },
+    "soa_threads_8_prefetch_16": {
+      "passes": ["simplify", "licm", "unroll", "vectorize", "dce"],
+      "frontend": {
+        "inline_threshold": 20,
+        "unroll_factor": 2,
+        "vector_width": 4
+      },
+      "backend": {
+        "register_budget": 40,
+        "scheduler": "aggressive"
+      },
+      "runtime": {
+        "threads": 8,
+        "prefetch_distance": 16,
+        "data_layout": "soa"
+      }
+    }
+  },
+  "candidates": [
+    {
+      "label": "g1_crossover_no_memory",
+      "generation": 1,
+      "operator": "two_parent_crossover",
+      "configuration": "crossover_tradeoff",
+      "source_attribution": [
+        {"path": "passes", "source": "synthesized"},
+        {"path": "frontend.inline_threshold", "source": "left"},
+        {"path": "frontend.unroll_factor", "source": "left"},
+        {"path": "frontend.vector_width", "source": "left"},
+        {"path": "backend.register_budget", "source": "synthesized"},
+        {"path": "backend.scheduler", "source": "right"},
+        {"path": "runtime.threads", "source": "right"},
+        {"path": "runtime.prefetch_distance", "source": "right"},
+        {"path": "runtime.data_layout", "source": "right"}
+      ],
+      "expected": {
+        "valid": true,
+        "operator_compliant": true,
+        "operator_failure": null,
+        "evidence_compliant": false,
+        "evidence_failure": "left attribution names no verified contribution",
+        "dominates_any_parent": true,
+        "known_target_match": false,
+        "reward": 0.09412918469278413,
+        "objectives": {"speedup": 2.77, "code_size": 110.4, "compile_time": 14.64}
+      }
+    },
+    {
+      "label": "g1_recombine_no_memory",
+      "generation": 1,
+      "operator": "three_way_recombination",
+      "configuration": "known_recombination_target",
+      "claim_prepared_obligations": true,
+      "source_attribution": [
+        {"path": "$.passes", "source": "left"},
+        {"path": "$.backend.register_budget", "source": "left"},
+        {"path": "$.backend.scheduler", "source": "left"},
+        {"path": "$.frontend.inline_threshold", "source": "ancestor"},
+        {"path": "$.frontend.unroll_factor", "source": "left"},
+        {"path": "$.frontend.vector_width", "source": "left"},
+        {"path": "$.runtime.threads", "source": "right"},
+        {"path": "$.runtime.prefetch_distance", "source": "right"},
+        {"path": "$.runtime.data_layout", "source": "right"}
+      ],
+      "expected": {
+        "valid": true,
+        "operator_compliant": true,
+        "operator_failure": null,
+        "evidence_compliant": true,
+        "evidence_failure": null,
+        "dominates_any_parent": true,
+        "known_target_match": true,
+        "reward": 0.08095238095238096,
+        "objectives": {"speedup": 3.35, "code_size": 116.4, "compile_time": 17.49}
+      }
+    },
+    {
+      "label": "g1_recombine_random_memory",
+      "generation": 1,
+      "operator": "three_way_recombination",
+      "configuration": "soa_threads_4_prefetch_4",
+      "claim_prepared_obligations": true,
+      "source_attribution": [
+        {"path": "$.passes", "source": "left"},
+        {"path": "$.frontend.inline_threshold", "source": "ancestor"},
+        {"path": "$.frontend.unroll_factor", "source": "left"},
+        {"path": "$.frontend.vector_width", "source": "left"},
+        {"path": "$.backend.register_budget", "source": "left"},
+        {"path": "$.backend.scheduler", "source": "left"},
+        {"path": "$.runtime.threads", "source": "right"},
+        {"path": "$.runtime.prefetch_distance", "source": "right"},
+        {"path": "$.runtime.data_layout", "source": "synthesized"}
+      ],
+      "conflict_resolutions": [
+        {
+          "relation_id": "0000000000000000000000000000000000000000000000000000000000000000",
+          "choice": "synthesize",
+          "explanation": "The draft treated a disjoint inherited value as a semantic override."
+        }
+      ],
+      "expected": {
+        "valid": true,
+        "operator_compliant": false,
+        "operator_failure": "child failed exact two-branch preservation verification",
+        "evidence_compliant": false,
+        "evidence_failure": "conflict resolution annotations were invalid or extraneous",
+        "dominates_any_parent": true,
+        "known_target_match": false,
+        "reward": -1.0,
+        "objectives": {"speedup": 3.42, "code_size": 116.4, "compile_time": 17.49}
+      }
+    },
+    {
+      "label": "g1_scoped_mutation_random_memory",
+      "generation": 1,
+      "operator": "typed_mutation",
+      "configuration": "soa_threads_4_prefetch_4",
+      "source_attribution": [
+        {"path": "$.passes", "source": "left"},
+        {"path": "$.frontend", "source": "left"},
+        {"path": "$.backend", "source": "left"},
+        {"path": "$.runtime.threads", "source": "synthesized"},
+        {"path": "$.runtime.prefetch_distance", "source": "synthesized"},
+        {"path": "$.runtime.data_layout", "source": "synthesized"}
+      ],
+      "expected": {
+        "valid": true,
+        "operator_compliant": true,
+        "operator_failure": null,
+        "evidence_compliant": false,
+        "evidence_failure": "missing verified mutation source attribution",
+        "dominates_any_parent": true,
+        "known_target_match": false,
+        "reward": 0.08761904761904761,
+        "objectives": {"speedup": 3.42, "code_size": 116.4, "compile_time": 17.49}
+      }
+    },
+    {
+      "label": "g1_reproduction_control",
+      "generation": 1,
+      "operator": "reproduction",
+      "configuration": null,
+      "expected": {
+        "valid": true,
+        "operator_compliant": true,
+        "operator_failure": null,
+        "evidence_compliant": true,
+        "evidence_failure": null,
+        "dominates_any_parent": false,
+        "known_target_match": false,
+        "reward": 0.0,
+        "objectives": {"speedup": 2.5, "code_size": 116.4, "compile_time": 17.49}
+      }
+    },
+    {
+      "label": "g2_mutation_no_memory",
+      "generation": 2,
+      "operator": "typed_mutation",
+      "configuration": "soa_threads_2_prefetch_8",
+      "source_attribution": [
+        {"path": "passes", "source": "ancestor"},
+        {"path": "frontend", "source": "ancestor"},
+        {"path": "backend", "source": "ancestor"},
+        {"path": "runtime", "source": "mutation"}
+      ],
+      "expected": {
+        "valid": true,
+        "operator_compliant": true,
+        "operator_failure": null,
+        "evidence_compliant": false,
+        "evidence_failure": "mutation attribution names no verified contribution",
+        "dominates_any_parent": false,
+        "known_target_match": false,
+        "reward": -0.02758620689655172,
+        "objectives": {"speedup": 2.99, "code_size": 116.4, "compile_time": 17.49}
+      }
+    },
+    {
+      "label": "g2_mutation_random_memory_1",
+      "generation": 2,
+      "operator": "typed_mutation",
+      "configuration": "soa_threads_4_prefetch_4",
+      "source_attribution": [
+        {"path": "$.passes", "source": "ancestor"},
+        {"path": "$.frontend", "source": "ancestor"},
+        {"path": "$.backend", "source": "ancestor"},
+        {"path": "$.runtime.threads", "source": "ancestor"},
+        {"path": "$.runtime.prefetch_distance", "source": "ancestor"},
+        {"path": "$.runtime.data_layout", "source": "synthesized"}
+      ],
+      "expected": {
+        "valid": true,
+        "operator_compliant": true,
+        "operator_failure": null,
+        "evidence_compliant": false,
+        "evidence_failure": "missing verified mutation source attribution",
+        "dominates_any_parent": true,
+        "known_target_match": false,
+        "reward": 0.00536398467432949,
+        "objectives": {"speedup": 3.42, "code_size": 116.4, "compile_time": 17.49}
+      }
+    },
+    {
+      "label": "g2_mutation_random_memory_2",
+      "generation": 2,
+      "operator": "typed_mutation",
+      "configuration": "soa_threads_8_prefetch_16",
+      "source_attribution": [
+        {"path": "$.passes", "source": "left"},
+        {"path": "$.frontend", "source": "left"},
+        {"path": "$.backend", "source": "left"},
+        {"path": "$.runtime.threads", "source": "synthesized"},
+        {"path": "$.runtime.prefetch_distance", "source": "synthesized"},
+        {"path": "$.runtime.data_layout", "source": "synthesized"}
+      ],
+      "expected": {
+        "valid": true,
+        "operator_compliant": true,
+        "operator_failure": null,
+        "evidence_compliant": false,
+        "evidence_failure": "missing verified mutation source attribution",
+        "dominates_any_parent": true,
+        "known_target_match": false,
+        "reward": 0.022988505747126426,
+        "objectives": {"speedup": 3.65, "code_size": 116.4, "compile_time": 17.49}
+      }
+    },
+    {
+      "label": "g2_mutation_random_memory_3",
+      "generation": 2,
+      "operator": "typed_mutation",
+      "configuration": "soa_threads_4_prefetch_4",
+      "source_attribution": [
+        {"path": "$.passes", "source": "ancestor"},
+        {"path": "$.frontend", "source": "ancestor"},
+        {"path": "$.backend", "source": "ancestor"},
+        {"path": "$.runtime.threads", "source": "ancestor"},
+        {"path": "$.runtime.prefetch_distance", "source": "ancestor"},
+        {"path": "$.runtime.data_layout", "source": "synthesized"}
+      ],
+      "expected": {
+        "valid": true,
+        "operator_compliant": true,
+        "operator_failure": null,
+        "evidence_compliant": false,
+        "evidence_failure": "missing verified mutation source attribution",
+        "dominates_any_parent": true,
+        "known_target_match": false,
+        "reward": 0.00536398467432949,
+        "objectives": {"speedup": 3.42, "code_size": 116.4, "compile_time": 17.49}
+      }
+    },
+    {
+      "label": "g2_mutation_random_memory_4",
+      "generation": 2,
+      "operator": "typed_mutation",
+      "configuration": "soa_threads_2_prefetch_8",
+      "source_attribution": [
+        {"path": "$.passes", "source": "ancestor"},
+        {"path": "$.frontend", "source": "ancestor"},
+        {"path": "$.backend", "source": "ancestor"},
+        {"path": "$.runtime.threads", "source": "mutation"},
+        {"path": "$.runtime.prefetch_distance", "source": "mutation"},
+        {"path": "$.runtime.data_layout", "source": "mutation"}
+      ],
+      "expected": {
+        "valid": true,
+        "operator_compliant": true,
+        "operator_failure": null,
+        "evidence_compliant": true,
+        "evidence_failure": null,
+        "dominates_any_parent": false,
+        "known_target_match": false,
+        "reward": -0.02758620689655172,
+        "objectives": {"speedup": 2.99, "code_size": 116.4, "compile_time": 17.49}
+      }
+    }
+  ]
+}

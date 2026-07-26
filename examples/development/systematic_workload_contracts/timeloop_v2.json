@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "workload_id": "timeloop_v2",
+  "runtime": {
+    "kind": "current_python"
+  },
+  "arms": {
+    "control": {
+      "runner": "agent_evolve/examples/development/run_timeloop_v2_uniform_control.py",
+      "artifact_root": "papers/agent_evolve_aaai_2027/research_artifacts/experiment_logs/benchmark_q1/timeloop_codesign/full_support_g6/matched_uniform_control",
+      "prepare_arguments": [
+        "prepare",
+        "--run-id",
+        "{prepare_run_id}",
+        "--replicate-seed",
+        "{replicate_seed}"
+      ],
+      "live_arguments": [
+        "run",
+        "--run-id",
+        "{live_run_id}",
+        "--replicate-seed",
+        "{replicate_seed}",
+        "--prereg",
+        "{preregistration_path}"
+      ],
+      "preregistration_relative_path": "preregistration_template.json"
+    },
+    "treatment": {
+      "runner": "agent_evolve/examples/development/run_timeloop_v2_frontier_probe_live.py",
+      "artifact_root": "papers/agent_evolve_aaai_2027/research_artifacts/experiment_logs/benchmark_q1/timeloop_codesign/full_support_g6",
+      "prepare_arguments": [
+        "prepare",
+        "--run-id",
+        "{prepare_run_id}",
+        "--replicate-seed",
+        "{replicate_seed}"
+      ],
+      "live_arguments": [
+        "live",
+        "--run-id",
+        "{live_run_id}",
+        "--replicate-seed",
+        "{replicate_seed}",
+        "--prereg",
+        "{preregistration_path}"
+      ],
+      "preregistration_relative_path": "preregistration_template.json"
+    }
+  }
+}

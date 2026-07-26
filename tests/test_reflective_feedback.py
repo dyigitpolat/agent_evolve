@@ -17,6 +17,7 @@ from agent_evolve.application.agentic_evolution import (
     MutationContract,
     MutationResponseMode,
     OperatorKind,
+    ReflectionCallExecutionError,
 )
 from agent_evolve.application.budgeted_optimizer import (
     GenerationReceipt,
@@ -567,9 +568,11 @@ def test_reflected_exact_option_must_equal_its_cited_executed_action() -> None:
         allowed_option_ids=exact_ids,
     )
 
-    result = asyncio.run(interceptor.after_generation(context))
+    with pytest.raises(ReflectionCallExecutionError) as caught:
+        asyncio.run(interceptor.after_generation(context))
 
-    assert dict(result.metadata)["status"] == "reflection_rejected"
+    assert caught.value.failure_type == "ReflectionCardContractError"
+    assert caught.value.logical_llm_calls_used == 1
     assert not mailbox._batches
 
 
@@ -827,23 +830,46 @@ def test_g1_advanced_contract_rejects_legacy_free_form_cards() -> None:
         allowed_option_families=("control_only", "joint_edit"),
     )
 
-    result = asyncio.run(interceptor.after_generation(context))
+    with pytest.raises(ReflectionCallExecutionError) as caught:
+        asyncio.run(interceptor.after_generation(context))
+
     assert reflector.calls == 1
-    assert result.logical_llm_calls_used == 1
-    assert dict(result.metadata)["status"] == "reflection_rejected"
+    assert caught.value.failure_type == "ReflectionCardContractError"
+    assert caught.value.logical_llm_calls_used == 1
     assert not mailbox._batches
 
 
 def test_reflection_contrast_attributes_exact_finite_option_and_family() -> None:
+    class _GroundedFiniteReflectionCapture(_EmptyReflectionCapture):
+        async def reflect(self, request):
+            self.requests.append(request)
+            (contrast_id,) = request.available_contrast_ids
+            return ReflectionGenerationResult(
+                insights=(
+                    InsightDraft(
+                        claim="The executed bounded action may transfer.",
+                        trigger="A compatible parent exposes the bounded coordinate.",
+                        mechanism="Replay the exact finite intervention under test.",
+                        affected_paths=("$.x",),
+                        evidence_summary="Supported by the cited finite outcome.",
+                        confidence=0.5,
+                        evidence_contrast_ids=(contrast_id,),
+                    ),
+                ),
+                telemetry=_telemetry(),
+            )
+
     ids = DeterministicIdFactory("finite_reflection_attribution")
     memory = InsightMemoryBank(id_factory=ids)
-    generator = _EmptyReflectionCapture()
+    generator = _GroundedFiniteReflectionCapture()
+    traces: list[dict[str, object]] = []
     engine = AgenticEvolutionEngine(
         problem=_NoEvaluationProblem(),
         generator=generator,
         id_factory=ids,
         memory=memory,
         seed=7,
+        trace_sink=traces.append,
     )
     parent = _candidate(ids, sequence=0, generation=0, x=5, y=5)
     child = _candidate(ids, sequence=1, generation=1, x=4, y=5)
@@ -876,13 +902,27 @@ def test_reflection_contrast_attributes_exact_finite_option_and_family() -> None
     prepared, _ = engine.prepare_invocations((plan,))
     outcome = InvocationOutcome(prepared[0], child, 1.0)
 
-    asyncio.run(engine.reflect((outcome,), label="finite_attribution"))
+    added = asyncio.run(engine.reflect((outcome,), label="finite_attribution"))
 
     prompt = generator.requests[0].prompt
     assert '"option_id":"bounded.decrease_x"' in prompt
     assert '"family":"bounded_coordinate"' in prompt
     assert option.identity_sha256 in prompt
     assert contract.identity_sha256 in prompt
+    assert len(added) == 1
+    lineage = added[0].evidence_lineage
+    assert lineage is not None
+    (binding,) = lineage.finite_action_bindings
+    assert binding.contrast_id == lineage.cited_contrast_ids[0]
+    assert binding.option_id == option.option_id
+    assert binding.family == option.family
+    assert binding.option_identity_sha256 == option.identity_sha256
+    assert binding.contract_identity_sha256 == contract.identity_sha256
+    assert lineage.portfolio_action_evidence == (binding,)
+    completed = next(
+        event for event in traces if event["event_type"] == "reflection_completed"
+    )
+    assert completed["insights"][0]["evidence_lineage"] == lineage.to_record()
 
 
 def test_inactive_intervention_contract_preserves_legacy_reflection_prompt_bytes() -> (

@@ -17,9 +17,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 dotenv.load_dotenv(_REPO_ROOT / ".env", override=True)
 dotenv.load_dotenv(_REPO_ROOT / "examples" / "knapsack_dag" / ".env", override=True)
 
-sys.path.insert(0, str(_REPO_ROOT / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from agent_evolve import AgentEvolver
+from agent_evolve import optimize
 from problem_def import DagSynergyKnapsackProblem
 
 
@@ -27,20 +27,26 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="agent_evolve DAG synergy knapsack example"
     )
-    parser.add_argument("--model", default="openai:gpt-4o", help="LLM model string")
+    parser.add_argument("--model", default=None, help="LLM model string")
+    parser.add_argument(
+        "--harness",
+        default="pydantic_ai",
+        help="registered harness id (default: pydantic_ai)",
+    )
     parser.add_argument("--generations", type=int, default=4)
     parser.add_argument("--pop-size", type=int, default=8)
     args = parser.parse_args()
 
-    evolver = AgentEvolver(
+    result = optimize(
+        DagSynergyKnapsackProblem(),
+        harness=args.harness,
         model=args.model,
         pop_size=args.pop_size,
         generations=args.generations,
         candidates_per_batch=4,
         max_regen_rounds=5,
+        log=lambda m: print(m, flush=True),
     )
-
-    result = evolver.optimize(DagSynergyKnapsackProblem())
 
     print("\n" + "=" * 60)
     print("RESULTS")

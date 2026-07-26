@@ -3,13 +3,8 @@
 
 Usage
 -----
-    python run.py                              # uses default model
-    python run.py --model anthropic:claude-haiku-4-5
-
-For CLI usage with the same problem, place ``problem_def.py`` in the working
-directory and run::
-
-    kedi path/to/agent_evolve/src/agent_evolve/evolve.kedi --adapter-model openai:gpt-4o
+    python run.py                                   # default model + harness
+    python run.py --harness pydantic_ai --model openai:gpt-4o
 """
 
 import argparse
@@ -23,28 +18,34 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 dotenv.load_dotenv(_REPO_ROOT / ".env", override=True)
 dotenv.load_dotenv(_REPO_ROOT / "examples" / "knapsack" / ".env", override=True)
 
-sys.path.insert(0, str(_REPO_ROOT / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from agent_evolve import AgentEvolver
+from agent_evolve import optimize
 from problem_def import KnapsackProblem
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="agent_evolve knapsack example")
-    parser.add_argument("--model", default="openai:gpt-4o", help="LLM model string")
+    parser.add_argument("--model", default=None, help="LLM model string")
+    parser.add_argument(
+        "--harness",
+        default="pydantic_ai",
+        help="registered harness id (default: pydantic_ai)",
+    )
     parser.add_argument("--generations", type=int, default=3)
     parser.add_argument("--pop-size", type=int, default=6)
     args = parser.parse_args()
 
-    evolver = AgentEvolver(
+    result = optimize(
+        KnapsackProblem(),
+        harness=args.harness,
         model=args.model,
         pop_size=args.pop_size,
         generations=args.generations,
         candidates_per_batch=4,
         max_regen_rounds=5,
+        log=lambda m: print(m, flush=True),
     )
-
-    result = evolver.optimize(KnapsackProblem())
 
     print("\n" + "=" * 60)
     print("RESULTS")

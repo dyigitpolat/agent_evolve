@@ -1,215 +1,121 @@
 # agent_evolve
 
-LLM-driven multi-objective optimisation via Pareto-guided evolution.
+Plug-and-play, LLM-driven **multi-objective optimization** via Pareto-guided
+evolution. A tiny problem-agnostic core and a harness-agnostic evolutionary loop,
+with a typed **pydantic-ai** integration behind a single `optimize()` API.
 
-An LLM acts as an intelligent search operator: it generates candidate
-configurations, learns from failures via consolidated constraint instructions,
-analyses performance patterns, and produces offspring inspired by the Pareto
-front — all through structured prompts with typed outputs.
+The loop generates candidates, evaluates them against your black-box objective,
+learns textual *constraint* and *performance* memory from failures and the Pareto
+front, and breeds offspring from the front. Switching the harness changes **zero**
+lines of the loop.
 
-The core algorithm is a [Kedi](./kedi/) program (`evolve.kedi`).  Python
-modules supply the problem protocol, result types, and Pareto utilities.  The
-same `.kedi` program runs from the Python API **or** the kedi CLI.
-
-## Installation
-
-`kedi` is included as a Git submodule at `./kedi`.  Clone with submodules, or
-after cloning run `git submodule update --init --recursive`.
+## Install
 
 ```bash
-# From the agent_evolve directory
-pip install -e .
-
-# With DSPy adapter support
-pip install -e ".[dspy]"
+# core + the in-tree pydantic-ai harness
+pip install -e ".[pydantic_ai]"
 ```
 
-The editable install pulls `kedi` from the submodule (`file:./kedi` in
-`pyproject.toml`).
+Set provider keys in `.env` (`OPENAI_API_KEY`, `GROQ_API_KEY`, `GOOGLE_API_KEY`, ...)
+and optionally `AGENTEVOLVE_MODEL` / `AGENTEVOLVE_HARNESS`.
 
-## Quick Start — Python API
+## Quickstart
 
 ```python
-from agent_evolve import AgentEvolver, ObjectiveSpec
+from agent_evolve import optimize, ObjectiveSpec, ValidationOutcome
 
-class MyProblem:
+class Knapsack:
+    candidate_model = None  # optional pydantic schema for the LLM
+
     @property
     def objectives(self):
-        return [
-            ObjectiveSpec("cost", "min"),
-            ObjectiveSpec("quality", "max"),
-        ]
+        return [ObjectiveSpec("total_value", "max"), ObjectiveSpec("total_weight", "min")]
 
-    def evaluate(self, config):
-        x, y = config["x"], config["y"]
-        return {"cost": x + y, "quality": (x * y) ** 0.5}
+    def validate_detailed(self, config) -> ValidationOutcome:
+        if not config.get("selection"):
+            return ValidationOutcome(False, "structural", "selection must be non-empty")
+        return ValidationOutcome(True)
 
-    def validate(self, config):
-        if config.get("x", -1) < 0 or config.get("y", -1) < 0:
-            raise ValueError("x and y must be non-negative")
-        return True
+    def evaluate(self, config) -> dict:
+        ...  # return {"total_value": ..., "total_weight": ...}
 
-    def search_space_description(self):
-        return "Config: {'x': float, 'y': float}. Both non-negative, range 0–100."
+    def search_space_description(self) -> str:
+        return "Pick a subset of item indices ..."
 
-evolver = AgentEvolver(model="openai:gpt-4o", pop_size=8, generations=3)
-result = evolver.optimize(MyProblem())
-
-print(result.best.configuration)
-print(result.best.objectives)
+result = optimize(Knapsack(), harness="pydantic_ai", model="openai:gpt-4o",
+                  pop_size=8, generations=5, seed=0)
+print(result.best.configuration, result.best.objectives)
+print("Pareto:", len(result.pareto_front), "evaluations:", result.evaluations)
 ```
 
-## Quick Start — CLI
+The loop depends on the `Harness` port rather than pydantic-ai directly. Custom
+integrations can therefore be registered without changing optimization logic.
 
-Create a `problem_def.py` in your working directory that exposes two names:
+## Implementing your own `Problem`
+
+Implement the `Problem` protocol (`agent_evolve.core.problem`):
+
+- **Required:** `objectives` (a `Sequence[ObjectiveSpec]`) and
+  `evaluate(config) -> dict[str, float]`. Raise `ValueError(msg)` from `evaluate`
+  for infeasible configs — the message becomes LLM feedback.
+- **Optional:** `validate_detailed(config) -> ValidationOutcome` (a fast pre-check
+  with a `failure_phase` label), `search_space_description() -> str`,
+  `render_candidate(config) -> str` (compact view used in failure/Pareto lists),
+  `candidate_key(config) -> str` (de-dup key), and the attributes
+  `candidate_model` (pydantic schema), `constraints_description`, `example_config`,
+  and `directives` (see below).
+
+That is the entire integration surface; everything else is provided. See
+[`docs/integration_guide.md`](docs/integration_guide.md) for a worked walkthrough.
+
+### Owning your prompts: the `Directives` port
+
+Prompt wording is supplied by a `Directives` provider rather than hard-coded in
+the adapter. The backbone ships `DefaultDirectives`, used automatically when a
+problem does not set one. A problem owns its prompts by exposing a `directives`
+attribute:
 
 ```python
-# problem_def.py
-from agent_evolve import ObjectiveSpec
+from agent_evolve import DefaultDirectives
+
+class MyDirectives(DefaultDirectives):
+    def compose_initial(self, context: str, n_candidates: int) -> str:
+        return f"{context}\nPropose exactly {n_candidates} valid candidates."
 
 class MyProblem:
-    # ... same as above ...
-    pass
-
-problem = MyProblem()
-
-config = {
-    "pop_size": 8,
-    "generations": 3,
-    "candidates_per_batch": 5,
-    "max_regen_rounds": 10,
-    "verbose": True,
-}
+    directives = MyDirectives()
+    ...
 ```
 
-Then run:
+The pydantic-ai harness reads `ctx.directives`. Problem-specific *content*
+(architecture, constraints, examples) should flow through
+`search_space_description()` / `constraints_description`, keeping directives
+reusable.
+
+## Architecture (ports & adapters)
+
+```
+core/      problem + ObjectiveSpec + ValidationOutcome; Pareto + minimax; formatting; stats  (no LLM, no I/O)
+session/   run_evolution_loop + evaluate_batch          (depends only on core + the Harness port)
+harness/   Harness protocol + registry + Directives port + DefaultDirectives
+integrations/pydantic_ai                                 (adapter; never imported by core)
+api.py     optimize()  — the composition root
+```
+
+Design rules: dependencies point inward only; orchestration/state/seeding/logging
+live in Python (`session/`), adapters do exactly one thing (turn a composed
+instruction into a parsed result), and prompt text is supplied through the
+`Directives` port (`harness/directives.py`) — generic by default, owned by the
+problem when it wants to. The pydantic-ai adapter requests typed structured
+outputs: candidate operations return `list[CandidateConfig]`, while insight
+operations return `list[str]` or `str`, without a JSON-string round trip.
+
+## Tests
 
 ```bash
-kedi path/to/agent_evolve/src/agent_evolve/evolve.kedi --adapter-model openai:gpt-4o
+python -m pytest tests/
 ```
 
-Both paths execute the identical `evolve.kedi` program.
-
-## Defining a Problem
-
-A problem is any Python object with two required attributes:
-
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| `objectives` | `Sequence[ObjectiveSpec]` | At least one objective to optimise. |
-| `evaluate(config)` | `-> Dict[str, float]` | Return objective values for a configuration. |
-
-Optional (detected via `hasattr`):
-
-| Method | Type | Description |
-|--------|------|-------------|
-| `validate(config)` | `-> bool` | Fast feasibility pre-check.  Raise `ValueError` for feedback. |
-| `search_space_description()` | `-> str` | Free-text description of config format, ranges, and constraints. |
-
-**Feedback:** Raise `ValueError("descriptive message")` from `validate` or
-`evaluate` to provide textual feedback to the LLM.  These messages are
-included in failure-analysis prompts so the agent can learn from mistakes.
-
-## Configuration
-
-`AgentEvolver` accepts these parameters:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `model` | `"openai:gpt-4o"` | LLM model string (pydantic-ai format). |
-| `adapter_type` | `"pydantic"` | `"pydantic"` or `"dspy"`. |
-| `pop_size` | 8 | Valid candidates per generation. |
-| `generations` | 5 | Number of evolutionary generations. |
-| `candidates_per_batch` | 5 | Candidates requested per LLM call. |
-| `max_regen_rounds` | 10 | Max regeneration attempts when too few valid. |
-| `config_schema` | `None` | Optional dict describing config structure. |
-| `example_config` | `None` | Optional example configuration. |
-| `constraints_description` | `None` | Optional constraint text for LLM. |
-
-For CLI usage these go in the `config` dict inside `problem_def.py`.
-
-## Algorithm Overview
-
-```
-Generation 1 — Initial Sampling
-  LLM generates diverse candidates
-  Evaluate → valid / failed
-  Failed → LLM failure insights → constraint instructions → regenerate
-  Repeat until pop_size valid
-  Compute Pareto front
-  LLM generates performance insights
-
-Generation 2..N — Evolution
-  LLM generates offspring from Pareto front
-  Evaluate → valid / failed
-  Failed → regenerate with Pareto reference + failure insights
-  Update Pareto front
-  LLM updates performance insights
-
-Return SearchResult (best, pareto_front, all_candidates, history)
-```
-
-The full loop lives in `evolve.kedi`.  LLM interactions are Kedi DSL
-procedures; evaluation, Pareto computation, and statistics are Python
-utilities imported from `agent_evolve._support` and `agent_evolve.results`.
-
-## API Reference
-
-### `agent_evolve.ObjectiveSpec`
-
-```python
-@dataclass(frozen=True)
-class ObjectiveSpec:
-    name: str                    # e.g. "cost", "accuracy"
-    goal: Literal["min", "max"]  # optimisation direction
-```
-
-### `agent_evolve.Candidate`
-
-```python
-@dataclass(frozen=True)
-class Candidate(Generic[ConfigT]):
-    configuration: ConfigT
-    objectives: Dict[str, float]
-    metadata: Dict[str, Any]
-```
-
-### `agent_evolve.SearchResult`
-
-```python
-@dataclass(frozen=True)
-class SearchResult(Generic[ConfigT]):
-    objectives: Sequence[ObjectiveSpec]
-    best: Candidate[ConfigT]
-    pareto_front: List[Candidate[ConfigT]]
-    all_candidates: List[Candidate[ConfigT]]
-    history: List[Dict[str, Any]]
-```
-
-### Selection Utilities
-
-- `compute_pareto_front(candidates, objectives)` — non-dominated subset
-- `select_best_candidate(pareto, objectives)` — lexicographic pick (optional; not used for `SearchResult.best`)
-- `select_minimax_rank(candidates, objectives)` — **default “best”** for multi-objective runs: per-objective dense ranks, minimise the **worst** rank (minimax), tie-break by **smallest sum of ranks**
-
-## Project Structure
-
-```
-agent_evolve/
-├── kedi/                 # Git submodule (kedi-lang/kedi)
-├── src/agent_evolve/
-│   ├── __init__.py       # Public API
-│   ├── problem.py        # Problem protocol + ObjectiveSpec
-│   ├── results.py        # Candidate, SearchResult, Pareto utilities
-│   ├── optimizer.py      # AgentEvolver (thin wrapper)
-│   ├── _support.py       # Internal: evaluation, formatting, stats
-│   └── evolve.kedi       # The algorithm
-├── examples/knapsack/    # Worked example
-├── tests/                # Unit tests
-├── pyproject.toml
-└── README.md
-```
-
-## License
-
-MIT
+The suite covers Pareto/minimax, evaluation routing, event-store contracts, the
+full loop with a deterministic fake harness, and offline equivalence between the
+pydantic-ai typed-output path and the fake harness.

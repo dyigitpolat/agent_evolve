@@ -1,20 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
+import re
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, computed_field
+from pydantic_ai.profiles.openai import OpenAIJsonSchemaTransformer
 
 from agent_evolve.domain.ids import LLMCallId
 from agent_evolve.integrations.pydantic_ai import agentic_generator as adapter_module
+from agent_evolve.integrations.pydantic_ai import (
+    REFLECTION_OUTPUT_CONTRACT_NOTE,
+    REFLECTION_OUTPUT_CONTRACT_NOTE_SHA256,
+    REFLECTION_WIRE_CONTRACT_REVISION,
+    render_reflection_prompt,
+)
 from agent_evolve.integrations.pydantic_ai.agentic_generator import (
     AttemptedStructuredGenerationResponse,
     CANDIDATE_PROPOSAL_TOOL_NAME,
+    EXACT_PARENT_CROSSOVER_TOOL_NAME,
     MAX_AFFECTED_PATHS,
     MAX_INTENDED_CHANGES,
     MAX_REFLECTION_TEXT_CHARS,
@@ -23,18 +33,26 @@ from agent_evolve.integrations.pydantic_ai.agentic_generator import (
 )
 from agent_evolve.ports.agentic_generator import (
     AgenticGenerator,
+    CANDIDATE_COMPONENT_PATH_CONTRACT,
     ConflictResolutionDraft,
+    ExactParentCrossoverDraft,
+    ExactParentCrossoverOutputContract,
     InsightDraft,
     MetricEffectDirection,
     MetricEffectPrediction,
+    ReflectionEvidenceCatalog,
+    ReflectionEvidenceCatalogEntry,
     ReflectionGenerationRequest,
     ReflectionInsightContract,
     SourceAttribution,
+    TWO_PARENT_CROSSOVER_EVIDENCE_CONTRACT,
     VariationGenerationRequest,
+    validate_reflection_evidence_catalog_result,
     validate_reflection_insight_draft,
 )
 from agent_evolve.ports.structured_generator import (
     GenerationFailureKind,
+    MAX_PROMPT_UTF8_BYTES,
     StructuredGenerationError,
     StructuredGenerationRequest,
     StructuredGenerationResponse,
@@ -165,7 +183,9 @@ def test_propose_builds_strict_dynamic_schema_and_maps_every_field() -> None:
     assert low_request.output_tool_name == CANDIDATE_PROPOSAL_TOOL_NAME
     assert low_request.max_output_tokens == 777
     assert low_request.temperature == 0.25
-    assert low_request.output_type.model_fields["configuration"].annotation is _Candidate
+    assert (
+        low_request.output_type.model_fields["configuration"].annotation is _Candidate
+    )
     wire_schema = low_request.output_type.model_json_schema()
     encoded_wire_schema = json.dumps(wire_schema, sort_keys=True)
     assert "$defs" not in wire_schema
@@ -174,11 +194,31 @@ def test_propose_builds_strict_dynamic_schema_and_maps_every_field() -> None:
     assert wire_schema["properties"]["configuration"] == {
         "type": "object",
         "additionalProperties": True,
+        "description": (
+            "The complete proposed candidate configuration. This field's value, "
+            "rather than the enclosing proposal object, is JSON-path root '$' "
+            "for intended_changes and source_attribution."
+        ),
     }
+    assert wire_schema["properties"]["intended_changes"]["items"] == {
+        "type": "string",
+        "description": CANDIDATE_COMPONENT_PATH_CONTRACT,
+    }
+    assert (
+        CANDIDATE_COMPONENT_PATH_CONTRACT
+        in wire_schema["properties"]["intended_changes"]["description"]
+    )
+    assert (
+        CANDIDATE_COMPONENT_PATH_CONTRACT
+        in wire_schema["properties"]["source_attribution"]["description"]
+    )
     assert wire_schema["properties"]["source_attribution"]["items"] == {
         "type": "object",
         "properties": {
-            "path": {"type": "string"},
+            "path": {
+                "type": "string",
+                "description": CANDIDATE_COMPONENT_PATH_CONTRACT,
+            },
             "source": {
                 "type": "string",
                 "enum": [
@@ -328,10 +368,269 @@ def test_exact_operator_proposal_schemas_expose_only_relevant_evidence_fields(
             )
 
 
-def test_three_way_schema_maps_conflicts_without_requesting_opaque_preservation_ids() -> None:
+def test_two_parent_wire_schema_requires_discriminating_parent_evidence() -> None:
+    crossover_schema = adapter_module._candidate_proposal_type(
+        _Candidate,
+        "two_parent_crossover",
+    ).model_json_schema()
+    mutation_schema = adapter_module._candidate_proposal_type(
+        _Candidate,
+        "typed_mutation",
+    ).model_json_schema()
+
+    intended = crossover_schema["properties"]["intended_changes"]
+    attribution = crossover_schema["properties"]["source_attribution"]
+    assert TWO_PARENT_CROSSOVER_EVIDENCE_CONTRACT in intended["description"]
+    assert TWO_PARENT_CROSSOVER_EVIDENCE_CONTRACT in intended["items"]["description"]
+    assert TWO_PARENT_CROSSOVER_EVIDENCE_CONTRACT in attribution["description"]
+    assert (
+        TWO_PARENT_CROSSOVER_EVIDENCE_CONTRACT
+        in attribution["items"]["properties"]["path"]["description"]
+    )
+    assert (
+        "differs from the other parent at the same path" in (attribution["description"])
+    )
+    assert (
+        "omit the path from both source_attribution and intended_changes"
+        in (intended["description"])
+    )
+    assert (
+        "at least one discriminating left contribution" in (attribution["description"])
+    )
+    assert "executable inheritance instruction" in attribution["description"]
+    assert "copies the exact immutable parent subtree" in attribution["description"]
+    assert "one binary64 ULP" in attribution["description"]
+    assert "Synthesized values remain model-authored" in attribution["description"]
+    assert "smallest retained containing object or array" in attribution["description"]
+    assert (
+        "Any unclaimed value shared by both parents must remain present"
+        in (attribution["description"])
+    )
+    assert attribution["items"]["properties"]["source"]["enum"] == [
+        "left",
+        "right",
+        "synthesized",
+    ]
+    assert mutation_schema["properties"]["source_attribution"]["items"]["properties"][
+        "source"
+    ]["enum"] == [
+        "ancestor",
+        "left",
+        "right",
+        "synthesized",
+        "mutation",
+    ]
+    assert (
+        TWO_PARENT_CROSSOVER_EVIDENCE_CONTRACT
+        not in mutation_schema["properties"]["source_attribution"]["description"]
+    )
+
+    crossover_type = adapter_module._candidate_proposal_type(
+        _Candidate,
+        "two_parent_crossover",
+    )
+    valid = {
+        "configuration": {"width": 3, "wire_name": "child", "note": None},
+        "design_rationale": "Use both parents.",
+    }
+    for rejected_source in ("ancestor", "mutation"):
+        with pytest.raises(ValidationError, match="Input should be"):
+            crossover_type.model_validate(
+                {
+                    **valid,
+                    "source_attribution": [
+                        {"path": "$.width", "source": rejected_source}
+                    ],
+                },
+                strict=True,
+            )
+
+
+def test_exact_parent_crossover_wire_is_finite_minimal_and_bounded() -> None:
+    contract = ExactParentCrossoverOutputContract(
+        contract_identity_sha256="3" * 64,
+        locus_ids=("locus_a", "locus_b", "locus_c", "locus_d"),
+    )
+    output_type = adapter_module._exact_parent_crossover_proposal_type(
+        "two_parent_crossover",
+        contract,
+    )
+
+    schema = output_type.model_json_schema()
+    assert set(output_type.model_fields) == {
+        "import_locus_ids",
+        "claimed_insight_ids",
+    }
+    assert set(schema["properties"]) == {
+        "import_locus_ids",
+        "claimed_insight_ids",
+    }
+    imported = schema["properties"]["import_locus_ids"]
+    assert imported["items"] == {
+        "type": "string",
+        "enum": ["locus_a", "locus_b", "locus_c", "locus_d"],
+    }
+    assert imported["uniqueItems"] is True
+    assert imported["minItems"] == 1
+    assert imported["maxItems"] == len(contract.locus_ids) - 1
+    claimed = schema["properties"]["claimed_insight_ids"]
+    assert claimed["uniqueItems"] is True
+    assert claimed["maxItems"] == 0
+    assert schema["required"] == ["import_locus_ids"]
+    assert schema["additionalProperties"] is False
+    assert not {
+        "configuration",
+        "design_rationale",
+        "intended_changes",
+        "source_attribution",
+    }.intersection(schema["properties"])
+    assert (
+        len(json.dumps(schema, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        < 2_000
+    )
+    wire_schema = OpenAIJsonSchemaTransformer(
+        json.loads(json.dumps(schema)),
+        strict=False,
+    ).walk()
+    assert wire_schema == schema
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"import_locus_ids": []},
+        {"import_locus_ids": ["locus_a", "locus_b", "locus_c", "locus_d"]},
+        {"import_locus_ids": ["locus_a", "locus_a"]},
+        {"import_locus_ids": ["foreign_locus"]},
+        {"import_locus_ids": ["locus_a"], "configuration": {}},
+        {"import_locus_ids": ["locus_a"], "design_rationale": "verbose"},
+        {"import_locus_ids": ["locus_a"], "intended_changes": []},
+        {"import_locus_ids": ["locus_a"], "source_attribution": []},
+        {"import_locus_ids": ["locus_a"], "claimed_insight_ids": ["foreign"]},
+    ],
+)
+def test_exact_parent_crossover_wire_rejects_invalid_or_expansive_payloads(
+    payload: dict[str, Any],
+) -> None:
+    output_type = adapter_module._exact_parent_crossover_proposal_type(
+        "two_parent_crossover",
+        ExactParentCrossoverOutputContract(
+            contract_identity_sha256="4" * 64,
+            locus_ids=("locus_a", "locus_b", "locus_c", "locus_d"),
+        ),
+    )
+
+    with pytest.raises(ValidationError):
+        output_type.model_validate(payload, strict=True)
+
+
+def test_exact_parent_crossover_wire_excludes_known_child_set_without_enumeration() -> (
+    None
+):
+    contract = ExactParentCrossoverOutputContract(
+        contract_identity_sha256="6" * 64,
+        locus_ids=("locus_a", "locus_b", "locus_c", "locus_d"),
+        forbidden_import_locus_sets=(("locus_a", "locus_c"),),
+    )
+    output_type = adapter_module._exact_parent_crossover_proposal_type(
+        "two_parent_crossover",
+        contract,
+    )
+
+    schema = output_type.model_json_schema()
+    imported = schema["properties"]["import_locus_ids"]
+    assert imported["allOf"] == [
+        {
+            "not": {
+                "allOf": [
+                    {"minItems": 2},
+                    {"maxItems": 2},
+                    {"contains": {"const": "locus_a"}},
+                    {"contains": {"const": "locus_c"}},
+                ]
+            }
+        }
+    ]
+    assert (
+        OpenAIJsonSchemaTransformer(
+            json.loads(json.dumps(schema)),
+            strict=False,
+        ).walk()
+        == schema
+    )
+    for ordering in (
+        ["locus_a", "locus_c"],
+        ["locus_c", "locus_a"],
+    ):
+        with pytest.raises(ValidationError, match="forbidden known-child"):
+            output_type.model_validate(
+                {"import_locus_ids": ordering},
+                strict=True,
+            )
+
+    accepted = output_type.model_validate(
+        {"import_locus_ids": ["locus_a", "locus_b"]},
+        strict=True,
+    )
+    assert accepted.import_locus_ids == ["locus_a", "locus_b"]
+
+
+def test_exact_parent_crossover_adapter_sorts_and_binds_the_compact_plan() -> None:
+    contract = ExactParentCrossoverOutputContract(
+        contract_identity_sha256="5" * 64,
+        locus_ids=("locus_a", "locus_b", "locus_c", "locus_d"),
+        claimable_insight_ids=("insight_alpha", "insight_beta"),
+    )
+
+    def handle(request: StructuredGenerationRequest[Any]):
+        assert request.output_tool_name == EXACT_PARENT_CROSSOVER_TOOL_NAME
+        assert request.operation == "two_parent_crossover"
+        schema_bytes = json.dumps(
+            request.output_type.model_json_schema(),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        assert len(schema_bytes) < 2_000
+        claimed = request.output_type.model_json_schema()["properties"][
+            "claimed_insight_ids"
+        ]
+        assert claimed["items"]["enum"] == ["insight_alpha", "insight_beta"]
+        assert claimed["maxItems"] == 2
+        proposal = request.output_type.model_validate(
+            {
+                "import_locus_ids": ["locus_d", "locus_b"],
+                "claimed_insight_ids": ["insight_beta", "insight_alpha"],
+            },
+            strict=True,
+        )
+        return _response(proposal)
+
+    result = asyncio.run(
+        PydanticAIAgenticGenerator(_FakeRunner(handle)).propose(
+            _variation_request(
+                operation="two_parent_crossover",
+                exact_parent_crossover_contract=contract,
+            )
+        )
+    )
+
+    assert type(result.draft) is ExactParentCrossoverDraft
+    assert result.draft == ExactParentCrossoverDraft(
+        contract_identity_sha256=contract.contract_identity_sha256,
+        import_locus_ids=("locus_b", "locus_d"),
+        claimed_insight_ids=("insight_beta", "insight_alpha"),
+    )
+
+
+def test_three_way_schema_maps_conflicts_without_requesting_opaque_preservation_ids() -> (
+    None
+):
     def handle(request: StructuredGenerationRequest[Any]):
         assert request.operation == "three_way_recombination"
-        assert "claimed_preservation_obligation_ids" not in request.output_type.model_fields
+        assert (
+            "claimed_preservation_obligation_ids"
+            not in request.output_type.model_fields
+        )
         proposal = request.output_type.model_validate(
             {
                 "configuration": {
@@ -405,7 +704,12 @@ def test_reflect_builds_bounded_schema_and_maps_insights_and_telemetry() -> None
     low_request = runner.requests[0]
     assert low_request.call_id == LLMCallId("call_agentic_reflect_0001")
     assert low_request.operation == "reflect_evaluation"
-    assert low_request.prompt == "Extract reusable insights."
+    assert low_request.prompt == (
+        "Extract reusable insights.\n\n"
+        f"{adapter_module.REFLECTION_OUTPUT_CONTRACT_NOTE}"
+    )
+    assert "Every path must be rooted at '$'" in low_request.prompt
+    assert adapter_module.REFLECTION_WIRE_CONTRACT_REVISION in low_request.prompt
     assert low_request.output_tool_name == REFLECTION_TOOL_NAME
     assert low_request.max_output_tokens == 888
     assert low_request.temperature == 0.0
@@ -423,26 +727,57 @@ def test_reflect_builds_bounded_schema_and_maps_insights_and_telemetry() -> None
                 "items": {
                     "type": "object",
                     "properties": {
-                        "claim": {"type": "string"},
-                        "trigger": {"type": "string"},
-                        "mechanism": {"type": "string"},
+                        "claim": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_REFLECTION_TEXT_CHARS,
+                        },
+                        "trigger": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_REFLECTION_TEXT_CHARS,
+                        },
+                        "mechanism": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_REFLECTION_TEXT_CHARS,
+                        },
                         "affected_paths": {
                             "type": "array",
-                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": MAX_AFFECTED_PATHS,
+                            "items": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": adapter_module.MAX_PATH_CHARS,
+                                "pattern": adapter_module._JSON_PATH_PATTERN,
+                                "description": (
+                                    "A JSON-style path rooted at '$', such as "
+                                    "'$.field' or '$[0]'."
+                                ),
+                            },
                         },
-                        "evidence_summary": {"type": "string"},
+                        "evidence_summary": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_REFLECTION_TEXT_CHARS,
+                        },
                         "evidence_contrast_ids": {
                             "type": "array",
                             "items": {
                                 "type": "string",
                                 "pattern": "^[0-9a-f]{64}$",
                                 "enum": [_CONTRAST_A, _CONTRAST_B],
-                                },
-                                "uniqueItems": True,
-                                "minItems": 1,
-                                "maxItems": 2,
+                            },
+                            "uniqueItems": True,
+                            "minItems": 1,
+                            "maxItems": 2,
                         },
-                        "confidence": {"type": "number"},
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                        },
                     },
                     "required": [
                         "claim",
@@ -465,7 +800,7 @@ def test_reflect_builds_bounded_schema_and_maps_insights_and_telemetry() -> None
             claim="Cache successful prefixes.",
             trigger="repeated prefix evaluation",
             mechanism="avoid duplicate work",
-            affected_paths=("$.cache.enabled", "$.cache.capacity"),
+            affected_paths=("$.cache.capacity", "$.cache.enabled"),
             evidence_summary="three matching evaluations",
             confidence=0.875,
             evidence_contrast_ids=(_CONTRAST_A,),
@@ -484,6 +819,169 @@ def test_reflect_builds_bounded_schema_and_maps_insights_and_telemetry() -> None
     assert result.telemetry.cost_usd == Decimal("0.00125")
 
 
+def test_render_reflection_prompt_has_exact_utf8_boundaries_and_public_lineage() -> (
+    None
+):
+    assert REFLECTION_WIRE_CONTRACT_REVISION == (
+        "reflection_wire_jsonpath_contract_v3_provider_grammar"
+    )
+    assert adapter_module._JSON_PATH_PATTERN == r"^\$([.\[].*)?$"
+    expected_note = (
+        "REFLECTION OUTPUT CONTRACT\n"
+        "Revision: reflection_wire_jsonpath_contract_v3_provider_grammar. "
+        "For every insight, affected_paths must contain 1 to 256 JSON-style "
+        "paths. Every path must be rooted at '$' (examples: '$', '$.field', "
+        "or '$[0]')."
+    )
+    assert REFLECTION_OUTPUT_CONTRACT_NOTE == expected_note
+    assert REFLECTION_OUTPUT_CONTRACT_NOTE_SHA256 == (
+        "03b92db7cdb9b7c1f92a2508616047c450355f31eb2ff5c660063e1945b48138"
+    )
+    assert (
+        REFLECTION_OUTPUT_CONTRACT_NOTE_SHA256
+        == hashlib.sha256(
+            REFLECTION_OUTPUT_CONTRACT_NOTE.encode("utf-8", errors="strict")
+        ).hexdigest()
+    )
+    suffix = f"\n\n{REFLECTION_OUTPUT_CONTRACT_NOTE}"
+    suffix_bytes = len(suffix.encode("utf-8", errors="strict"))
+    available_bytes = MAX_PROMPT_UTF8_BYTES - suffix_bytes
+
+    exact_ascii = "x" * available_bytes
+    rendered_ascii = render_reflection_prompt(exact_ascii)
+    assert rendered_ascii == f"{exact_ascii}{suffix}"
+    assert len(rendered_ascii.encode("utf-8", errors="strict")) == (
+        MAX_PROMPT_UTF8_BYTES
+    )
+
+    exact_utf8 = "é" * (available_bytes // 2)
+    if available_bytes % 2:
+        exact_utf8 += "x"
+    rendered_utf8 = render_reflection_prompt(exact_utf8)
+    assert rendered_utf8 == f"{exact_utf8}{suffix}"
+    assert len(rendered_utf8.encode("utf-8", errors="strict")) == (
+        MAX_PROMPT_UTF8_BYTES
+    )
+
+    note_would_overflow = f"{exact_ascii}x"
+    assert len(note_would_overflow.encode("utf-8", errors="strict")) < (
+        MAX_PROMPT_UTF8_BYTES
+    )
+    assert render_reflection_prompt(note_would_overflow) == note_would_overflow
+
+    captured: list[StructuredGenerationRequest[Any]] = []
+
+    def handle(request: StructuredGenerationRequest[Any]):
+        captured.append(request)
+        return _response(request.output_type())
+
+    asyncio.run(
+        PydanticAIAgenticGenerator(_FakeRunner(handle)).reflect(
+            _reflection_request(prompt=note_would_overflow)
+        )
+    )
+    assert captured[0].prompt == note_would_overflow
+    path_schema = captured[0].output_type.model_json_schema()["properties"]["insights"][
+        "items"
+    ]["properties"]["affected_paths"]
+    assert path_schema["minItems"] == 1
+    assert path_schema["maxItems"] == MAX_AFFECTED_PATHS
+    assert path_schema["items"]["pattern"] == adapter_module._JSON_PATH_PATTERN
+
+    with pytest.raises(TypeError, match="exact string"):
+        render_reflection_prompt(1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="non-empty"):
+        render_reflection_prompt(" \t ")
+    with pytest.raises(ValueError, match="MAX_PROMPT_UTF8_BYTES"):
+        render_reflection_prompt("x" * (MAX_PROMPT_UTF8_BYTES + 1))
+
+    canonical_render = render_reflection_prompt("Extract reusable insights.")
+    assert canonical_render == (f"Extract reusable insights.\n\n{expected_note}")
+    assert hashlib.sha256(
+        canonical_render.encode("utf-8", errors="strict")
+    ).hexdigest() == (
+        "7913fc2a87f6198347f63f57bc9520d79a6614900c29bb49bdc62436dc833071"
+    )
+
+
+def test_reflection_jsonpath_v3_is_provider_safe_and_runtime_equivalent() -> None:
+    old_prefix_pattern = r"^\$(?:$|[.\[])"
+    provider_safe_pattern = adapter_module._JSON_PATH_PATTERN
+    assert provider_safe_pattern == r"^\$([.\[].*)?$"
+    assert "|" not in provider_safe_pattern
+    assert "(?:" not in provider_safe_pattern
+
+    # The v3 whole-string form preserves the v2 admission decision for every
+    # representative single-line value while avoiding the provider's rejected
+    # alternation production.
+    equivalent_values = (
+        "$",
+        "$.",
+        "$[",
+        "$.field",
+        "$[0]",
+        "$..nested",
+        "$[token].field",
+        "",
+        "field",
+        ".field",
+        "[0]",
+        "$field",
+        "$/field",
+        "$$.field",
+        "prefix$.field",
+        " $.field",
+        "\t$.field",
+    )
+    for value in equivalent_values:
+        assert bool(re.search(old_prefix_pattern, value)) is bool(
+            re.search(provider_safe_pattern, value)
+        )
+
+    output_type = adapter_module._reflection_output_type(1, (_CONTRAST_A,))
+    valid_insight = {
+        "claim": "claim",
+        "trigger": "trigger",
+        "mechanism": "mechanism",
+        "affected_paths": ["$.field"],
+        "evidence_summary": "evidence",
+        "evidence_contrast_ids": [_CONTRAST_A],
+        "confidence": 0.5,
+    }
+    for rooted_path in ("$", "$.field", "$[0]", "$..nested"):
+        validated = output_type.model_validate(
+            {"insights": [{**valid_insight, "affected_paths": [rooted_path]}]},
+            strict=True,
+        )
+        assert validated.insights[0].affected_paths == [rooted_path]
+    # Whitespace normalization predates this wire repair and remains explicit:
+    # StringConstraints strips only the outer whitespace before matching.
+    for padded_path in (" $.field", "\t$.field\n"):
+        validated = output_type.model_validate(
+            {"insights": [{**valid_insight, "affected_paths": [padded_path]}]},
+            strict=True,
+        )
+        assert validated.insights[0].affected_paths == ["$.field"]
+    for hostile_path in (
+        "",
+        "field",
+        ".field",
+        "[0]",
+        "$field",
+        "$$.field",
+        "prefix$.field",
+        "x $.field",
+        "\tX$.field",
+        "$\n.field",
+        "$.field\ntrailing",
+    ):
+        with pytest.raises(ValidationError):
+            output_type.model_validate(
+                {"insights": [{**valid_insight, "affected_paths": [hostile_path]}]},
+                strict=True,
+            )
+
+
 def test_reflection_contrast_ids_are_closed_and_request_scoped() -> None:
     insight = {
         "claim": "claim",
@@ -496,9 +994,12 @@ def test_reflection_contrast_ids_are_closed_and_request_scoped() -> None:
     }
     output_type = adapter_module._reflection_output_type(1, (_CONTRAST_A,))
     assert output_type.model_validate({"insights": [insight]}, strict=True)
-    assert output_type.model_json_schema()["properties"]["insights"]["items"][
-        "properties"
-    ]["evidence_contrast_ids"]["minItems"] == 1
+    assert (
+        output_type.model_json_schema()["properties"]["insights"]["items"][
+            "properties"
+        ]["evidence_contrast_ids"]["minItems"]
+        == 1
+    )
     with pytest.raises(ValidationError):
         output_type.model_validate(
             {"insights": [{**insight, "evidence_contrast_ids": []}]},
@@ -508,11 +1009,7 @@ def test_reflection_contrast_ids_are_closed_and_request_scoped() -> None:
     for bad_id in ("1" * 63, "A" * 64, _CONTRAST_B):
         with pytest.raises(ValidationError):
             output_type.model_validate(
-                {
-                    "insights": [
-                        {**insight, "evidence_contrast_ids": [bad_id]}
-                    ]
-                },
+                {"insights": [{**insight, "evidence_contrast_ids": [bad_id]}]},
                 strict=True,
             )
     duplicate_type = adapter_module._reflection_output_type(
@@ -533,7 +1030,15 @@ def test_reflection_contrast_ids_are_closed_and_request_scoped() -> None:
         )
     with pytest.raises(ValidationError):
         output_type.model_validate(
-            {"insights": [{key: value for key, value in insight.items() if key != "evidence_contrast_ids"}]},
+            {
+                "insights": [
+                    {
+                        key: value
+                        for key, value in insight.items()
+                        if key != "evidence_contrast_ids"
+                    }
+                ]
+            },
             strict=True,
         )
 
@@ -544,6 +1049,185 @@ def test_reflection_contrast_ids_are_closed_and_request_scoped() -> None:
     )
     with pytest.raises(ValidationError):
         no_evidence_type.model_validate({"insights": [insight]}, strict=True)
+
+
+def test_reflection_evidence_catalog_is_canonical_authenticated_and_exact() -> None:
+    catalog = ReflectionEvidenceCatalog.from_contrast_ids((_CONTRAST_A, _CONTRAST_B))
+
+    assert catalog.citation_keys == ("e0001", "e0002")
+    assert catalog.citation_key_for_contrast_id(_CONTRAST_A) == "e0001"
+    assert catalog.citation_key_for_contrast_id(_CONTRAST_B) == "e0002"
+    assert catalog.contrast_ids == (_CONTRAST_A, _CONTRAST_B)
+    assert len(catalog.catalog_identity_sha256) == 64
+    assert (
+        ReflectionEvidenceCatalog.from_contrast_ids(
+            (_CONTRAST_A, _CONTRAST_B)
+        ).catalog_identity_sha256
+        == catalog.catalog_identity_sha256
+    )
+    assert catalog.resolve_citation_keys(("e0002", "e0001")) == (
+        _CONTRAST_A,
+        _CONTRAST_B,
+    )
+
+    with pytest.raises(ValueError, match="unknown or foreign"):
+        catalog.resolve_citation_keys(("e0003",))
+    with pytest.raises(ValueError, match="duplicates"):
+        catalog.resolve_citation_keys(("e0001", "e0001"))
+    with pytest.raises(ValueError, match="not present"):
+        catalog.citation_key_for_contrast_id("f" * 64)
+    with pytest.raises(ValueError, match="contiguous"):
+        ReflectionEvidenceCatalog(
+            (
+                ReflectionEvidenceCatalogEntry("e0002", _CONTRAST_A),
+                ReflectionEvidenceCatalogEntry("e0003", _CONTRAST_B),
+            )
+        )
+    with pytest.raises(ValueError, match="exact available_contrast_ids"):
+        _reflection_request(
+            available_contrast_ids=(_CONTRAST_A,),
+            evidence_catalog=catalog,
+        )
+
+
+def test_catalog_reflection_resolves_short_keys_before_insight_construction() -> None:
+    catalog = ReflectionEvidenceCatalog.from_contrast_ids((_CONTRAST_A, _CONTRAST_B))
+    contract = ReflectionInsightContract(
+        required_metric_ids=("objective:cost", "violation:capacity"),
+        allowed_option_families=("control_only", "joint_edit"),
+    )
+    captured_output: dict[str, object] = {}
+
+    def handle(request: StructuredGenerationRequest[Any]):
+        properties = request.output_type.model_json_schema()["properties"]["insights"][
+            "items"
+        ]["properties"]
+        assert "evidence_contrast_ids" not in properties
+        assert properties["evidence_citation_keys"] == {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "pattern": "^e[0-9]{4}$",
+                "enum": ["e0001", "e0002"],
+            },
+            "uniqueItems": True,
+            "minItems": 1,
+            "maxItems": 2,
+        }
+        invalid = {
+            "claim": "claim",
+            "trigger": "trigger",
+            "mechanism": "mechanism",
+            "affected_paths": ["$.field"],
+            "evidence_summary": "evidence",
+            "evidence_citation_keys": ["e0003"],
+            "confidence": 0.5,
+            "effect_predictions": [
+                {"metric_id": "objective:cost", "direction": "decrease"},
+                {"metric_id": "violation:capacity", "direction": "increase"},
+            ],
+            "recommended_option_families": ["joint_edit"],
+            "action_template": "Apply the sealed joint edit.",
+            "falsification_condition": "The held-out effect reverses.",
+        }
+        with pytest.raises(ValidationError):
+            request.output_type.model_validate(
+                {"insights": [invalid]},
+                strict=True,
+            )
+        with pytest.raises(ValidationError, match="cannot contain duplicates"):
+            request.output_type.model_validate(
+                {
+                    "insights": [
+                        {
+                            **invalid,
+                            "evidence_citation_keys": ["e0001", "e0001"],
+                        }
+                    ]
+                },
+                strict=True,
+            )
+        with pytest.raises(ValidationError):
+            request.output_type.model_validate(
+                {
+                    "insights": [
+                        {
+                            **invalid,
+                            "evidence_citation_keys": [_CONTRAST_A],
+                        }
+                    ]
+                },
+                strict=True,
+            )
+        reflection = request.output_type.model_validate(
+            {
+                "insights": [
+                    {
+                        **invalid,
+                        "evidence_citation_keys": ["e0002", "e0001"],
+                    }
+                ]
+            },
+            strict=True,
+        )
+        captured_output.update(reflection.model_dump(mode="json", by_alias=False))
+        return _response(reflection)
+
+    runner = _FakeRunner(handle)
+    result = asyncio.run(
+        PydanticAIAgenticGenerator(runner).reflect(
+            _reflection_request(
+                max_insights=1,
+                min_insights=1,
+                insight_contract=contract,
+                evidence_catalog=catalog,
+            )
+        )
+    )
+
+    assert captured_output["insights"][0]["evidence_citation_keys"] == [
+        "e0002",
+        "e0001",
+    ]
+    assert result.insights[0].evidence_contrast_ids == (
+        _CONTRAST_A,
+        _CONTRAST_B,
+    )
+    assert result.evidence_catalog_identity_sha256 == catalog.catalog_identity_sha256
+    low_request = runner.requests[0]
+    assert catalog.catalog_identity_sha256 in low_request.prompt
+    assert '"citation_key":"e0001"' in low_request.prompt
+    assert _CONTRAST_A in low_request.prompt
+    assert (
+        low_request.prompt_lineage.renderer_revision
+        == adapter_module.REFLECTION_EVIDENCE_CATALOG_WIRE_CONTRACT_REVISION
+    )
+    assert low_request.prompt_lineage.renderer_definition_sha256 == (
+        adapter_module.REFLECTION_EVIDENCE_CATALOG_PROMPT_RENDERER_DEFINITION_SHA256
+    )
+    validate_reflection_evidence_catalog_result(
+        _reflection_request(
+            max_insights=1,
+            min_insights=1,
+            insight_contract=contract,
+            evidence_catalog=catalog,
+        ),
+        result,
+    )
+    with pytest.raises(ValueError, match="foreign evidence catalog identity"):
+        validate_reflection_evidence_catalog_result(
+            _reflection_request(
+                max_insights=1,
+                min_insights=1,
+                insight_contract=contract,
+                evidence_catalog=catalog,
+            ),
+            type(result)(
+                insights=result.insights,
+                telemetry=result.telemetry,
+                evidence_catalog_identity_sha256="f" * 64,
+            ),
+        )
 
 
 def test_v1_uncited_reflection_payloads_are_all_rejected_by_v2_wire_gate() -> None:
@@ -590,7 +1274,9 @@ def test_v1_uncited_reflection_payloads_are_all_rejected_by_v2_wire_gate() -> No
             )
 
 
-def test_high_level_reflection_contract_keeps_legacy_defaults_but_validates_ids() -> None:
+def test_high_level_reflection_contract_keeps_legacy_defaults_but_validates_ids() -> (
+    None
+):
     legacy = InsightDraft(
         claim="legacy claim",
         trigger="legacy trigger",
@@ -627,9 +1313,9 @@ def test_advanced_reflection_schema_is_request_scoped_exact_and_actionable() -> 
     def handle(request: StructuredGenerationRequest[Any]):
         schema = request.output_type.model_json_schema()
         properties = schema["properties"]["insights"]["items"]["properties"]
-        assert properties["effect_predictions"]["items"]["properties"][
-            "metric_id"
-        ]["enum"] == ["objective:cost", "violation:capacity"]
+        assert properties["effect_predictions"]["items"]["properties"]["metric_id"][
+            "enum"
+        ] == ["objective:cost", "violation:capacity"]
         assert properties["recommended_option_families"]["items"]["enum"] == [
             "control_only",
             "joint_edit",
@@ -652,8 +1338,16 @@ def test_advanced_reflection_schema_is_request_scoped_exact_and_actionable() -> 
                 "Falsify if held-out cost does not decrease or violation increases."
             ),
         }
+        invalid_metric_payload = {
+            **payload,
+            "effect_predictions": [
+                payload["effect_predictions"][0],
+                payload["effect_predictions"][0],
+            ],
+        }
         for invalid in (
             {**payload, "effect_predictions": payload["effect_predictions"][:1]},
+            invalid_metric_payload,
             {
                 **payload,
                 "effect_predictions": [
@@ -675,9 +1369,15 @@ def test_advanced_reflection_schema_is_request_scoped_exact_and_actionable() -> 
             },
         ):
             with pytest.raises(ValidationError):
-                request.output_type.model_validate(
-                    {"insights": [invalid]}, strict=True
-                )
+                request.output_type.model_validate({"insights": [invalid]}, strict=True)
+        with pytest.raises(ValidationError) as exc_info:
+            request.output_type.model_validate(
+                {"insights": [invalid_metric_payload]},
+                strict=True,
+            )
+        assert {
+            error["type"] for error in exc_info.value.errors(include_url=False)
+        } == {"reflection_metric_contract_violation"}
         reflection = request.output_type.model_validate(
             {"insights": [payload]}, strict=True
         )
@@ -689,12 +1389,8 @@ def test_advanced_reflection_schema_is_request_scoped_exact_and_actionable() -> 
         )
     )
     assert result.insights[0].effect_predictions == (
-        MetricEffectPrediction(
-            "objective:cost", MetricEffectDirection.DECREASE
-        ),
-        MetricEffectPrediction(
-            "violation:capacity", MetricEffectDirection.UNCHANGED
-        ),
+        MetricEffectPrediction("objective:cost", MetricEffectDirection.DECREASE),
+        MetricEffectPrediction("violation:capacity", MetricEffectDirection.UNCHANGED),
     )
     assert result.insights[0].recommended_option_families == ("joint_edit",)
     assert result.insights[0].falsification_condition is not None
@@ -708,9 +1404,9 @@ def test_exact_action_reflection_schema_requires_one_allowed_option_id() -> None
     )
 
     def handle(request: StructuredGenerationRequest[Any]):
-        properties = request.output_type.model_json_schema()["properties"][
-            "insights"
-        ]["items"]["properties"]
+        properties = request.output_type.model_json_schema()["properties"]["insights"][
+            "items"
+        ]["properties"]
         assert properties["recommended_option_ids"]["items"]["enum"] == [
             "shape.lower.small",
             "shape.raise.small",
@@ -740,13 +1436,9 @@ def test_exact_action_reflection_schema_requires_one_allowed_option_id() -> None
             {**payload, "recommended_option_ids": ["shape.foreign.small"]},
         ):
             with pytest.raises(ValidationError):
-                request.output_type.model_validate(
-                    {"insights": [invalid]}, strict=True
-                )
+                request.output_type.model_validate({"insights": [invalid]}, strict=True)
         return _response(
-            request.output_type.model_validate(
-                {"insights": [payload]}, strict=True
-            )
+            request.output_type.model_validate({"insights": [payload]}, strict=True)
         )
 
     result = asyncio.run(
@@ -754,9 +1446,7 @@ def test_exact_action_reflection_schema_requires_one_allowed_option_id() -> None
             _reflection_request(insight_contract=contract)
         )
     )
-    assert result.insights[0].recommended_option_ids == (
-        "shape.raise.small",
-    )
+    assert result.insights[0].recommended_option_ids == ("shape.raise.small",)
 
 
 def test_advanced_reflection_contract_identity_and_evidence_gate_are_exact() -> None:
@@ -766,18 +1456,27 @@ def test_advanced_reflection_contract_identity_and_evidence_gate_are_exact() -> 
     )
     record = contract.to_record()
     assert record["contract_identity_sha256"] == contract.identity_sha256
-    assert contract.identity_sha256 == ReflectionInsightContract(
-        required_metric_ids=("objective:cost", "violation:capacity"),
-        allowed_option_families=("control_only", "joint_edit"),
-    ).identity_sha256
-    assert contract.identity_sha256 != ReflectionInsightContract(
-        required_metric_ids=("objective:cost",),
-        allowed_option_families=("control_only", "joint_edit"),
-    ).identity_sha256
-    assert contract.identity_sha256 != ReflectionInsightContract(
-        required_metric_ids=("objective:cost", "violation:capacity"),
-        allowed_option_families=("control_only",),
-    ).identity_sha256
+    assert (
+        contract.identity_sha256
+        == ReflectionInsightContract(
+            required_metric_ids=("objective:cost", "violation:capacity"),
+            allowed_option_families=("control_only", "joint_edit"),
+        ).identity_sha256
+    )
+    assert (
+        contract.identity_sha256
+        != ReflectionInsightContract(
+            required_metric_ids=("objective:cost",),
+            allowed_option_families=("control_only", "joint_edit"),
+        ).identity_sha256
+    )
+    assert (
+        contract.identity_sha256
+        != ReflectionInsightContract(
+            required_metric_ids=("objective:cost", "violation:capacity"),
+            allowed_option_families=("control_only",),
+        ).identity_sha256
+    )
 
     evidence_free = InsightDraft(
         claim="A bounded intervention may lower cost.",
@@ -819,9 +1518,7 @@ def test_explicitly_inactive_advanced_contract_preserves_legacy_wire_schema() ->
     )
     assert json.dumps(
         implicit.model_json_schema(), sort_keys=True, separators=(",", ":")
-    ) == json.dumps(
-        explicit.model_json_schema(), sort_keys=True, separators=(",", ":")
-    )
+    ) == json.dumps(explicit.model_json_schema(), sort_keys=True, separators=(",", ":"))
 
 
 def test_proposal_schema_rejects_extra_coercion_blank_values_and_bounds() -> None:
@@ -836,7 +1533,9 @@ def test_proposal_schema_rejects_extra_coercion_blank_values_and_bounds() -> Non
             )
         )
 
-    asyncio.run(PydanticAIAgenticGenerator(_FakeRunner(handle)).propose(_variation_request()))
+    asyncio.run(
+        PydanticAIAgenticGenerator(_FakeRunner(handle)).propose(_variation_request())
+    )
     output_type = captured[0]
     valid = {
         "configuration": {"width": 1, "wire_name": "ok", "note": None},
@@ -895,9 +1594,12 @@ def test_candidate_payload_allowed_by_compact_shape_still_fails_strict_core() ->
         "source_attribution": [{"path": "width", "source": "mutation"}],
     }
 
-    assert output_type.model_json_schema()["properties"]["configuration"][
-        "additionalProperties"
-    ] is True
+    assert (
+        output_type.model_json_schema()["properties"]["configuration"][
+            "additionalProperties"
+        ]
+        is True
+    )
     with pytest.raises(ValidationError) as caught:
         output_type.model_validate(compact_shape_only_payload, strict=True)
     assert {error["type"] for error in caught.value.errors()} >= {
@@ -914,7 +1616,9 @@ def test_reflection_schema_rejects_invalid_confidence(confidence: object) -> Non
         output_types.append(request.output_type)
         return _response(request.output_type())
 
-    asyncio.run(PydanticAIAgenticGenerator(_FakeRunner(handle)).reflect(_reflection_request()))
+    asyncio.run(
+        PydanticAIAgenticGenerator(_FakeRunner(handle)).reflect(_reflection_request())
+    )
     insight = {
         "claim": "claim",
         "trigger": "trigger",
@@ -954,6 +1658,59 @@ def test_reflection_schema_enforces_request_count_and_string_and_path_bounds() -
     wire_schema = output_type.model_json_schema()["properties"]["insights"]
     assert wire_schema["minItems"] == 0
     assert wire_schema["maxItems"] == 1
+    insight_properties = wire_schema["items"]["properties"]
+    assert insight_properties["affected_paths"] == {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": MAX_AFFECTED_PATHS,
+        "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": adapter_module.MAX_PATH_CHARS,
+            "pattern": adapter_module._JSON_PATH_PATTERN,
+            "description": (
+                "A JSON-style path rooted at '$', such as '$.field' or '$[0]'."
+            ),
+        },
+    }
+    for text_field in (
+        "claim",
+        "trigger",
+        "mechanism",
+        "evidence_summary",
+    ):
+        assert insight_properties[text_field] == {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAX_REFLECTION_TEXT_CHARS,
+        }
+    assert insight_properties["confidence"] == {
+        "type": "number",
+        "minimum": 0.0,
+        "maximum": 1.0,
+    }
+
+    for rooted_path in ("$", "$.field", "$[0]"):
+        assert output_type.model_validate(
+            {"insights": [{**valid_insight, "affected_paths": [rooted_path]}]},
+            strict=True,
+        )
+    for invalid_path in (
+        "field",
+        ".field",
+        "[0]",
+        "$" + "x" * adapter_module.MAX_PATH_CHARS,
+    ):
+        with pytest.raises(ValidationError):
+            output_type.model_validate(
+                {"insights": [{**valid_insight, "affected_paths": [invalid_path]}]},
+                strict=True,
+            )
+    with pytest.raises(ValidationError):
+        output_type.model_validate(
+            {"insights": [{**valid_insight, "affected_paths": []}]},
+            strict=True,
+        )
 
     with pytest.raises(ValidationError):
         output_type.model_validate({"insights": [valid_insight, valid_insight]})
@@ -1006,8 +1763,13 @@ def test_reflection_minimum_cardinality_is_request_scoped_and_on_wire() -> None:
         output_type.model_validate({"insights": []}, strict=True)
     with pytest.raises(ValidationError):
         output_type.model_validate({"insights": [insight]}, strict=True)
+    with pytest.raises(ValidationError, match="distinct normalized claims"):
+        output_type.model_validate(
+            {"insights": [insight, insight]},
+            strict=True,
+        )
     assert output_type.model_validate(
-        {"insights": [insight, insight]},
+        {"insights": [insight, {**insight, "claim": "second claim"}]},
         strict=True,
     )
 
@@ -1015,9 +1777,9 @@ def test_reflection_minimum_cardinality_is_request_scoped_and_on_wire() -> None:
         _reflection_request(max_insights=2, min_insights=3)
 
 
-def test_reflection_payload_allowed_by_compact_shape_still_fails_strict_core() -> None:
+def test_reflection_wire_contract_advertises_every_replayed_runtime_failure() -> None:
     output_type = adapter_module._reflection_output_type(2, (_CONTRAST_A,))
-    compact_shape_only_payload = {
+    replayed_failure = {
         "insights": [
             {
                 "claim": "x" * (MAX_REFLECTION_TEXT_CHARS + 1),
@@ -1031,9 +1793,15 @@ def test_reflection_payload_allowed_by_compact_shape_still_fails_strict_core() -
         ]
     }
 
-    assert "$defs" not in output_type.model_json_schema()
+    schema = output_type.model_json_schema()
+    assert "$defs" not in schema
+    properties = schema["properties"]["insights"]["items"]["properties"]
+    assert properties["claim"]["maxLength"] == MAX_REFLECTION_TEXT_CHARS
+    assert properties["affected_paths"]["items"]["pattern"] == (
+        adapter_module._JSON_PATH_PATTERN
+    )
     with pytest.raises(ValidationError) as caught:
-        output_type.model_validate(compact_shape_only_payload, strict=True)
+        output_type.model_validate(replayed_failure, strict=True)
     assert {error["type"] for error in caught.value.errors()} >= {
         "string_pattern_mismatch",
         "string_too_long",
@@ -1067,15 +1835,23 @@ def test_low_level_errors_propagate_with_identity_untouched(method: str) -> None
 def test_low_level_contract_rejects_wrong_response_and_wrong_value_type() -> None:
     wrong_response = _FakeRunner(lambda _request: object())
     with pytest.raises(TypeError, match="low-level runner must return"):
-        asyncio.run(PydanticAIAgenticGenerator(wrong_response).propose(_variation_request()))
+        asyncio.run(
+            PydanticAIAgenticGenerator(wrong_response).propose(_variation_request())
+        )
 
-    wrong_value = _FakeRunner(lambda _request: _response(_Candidate(
-        width=1,
-        wire_name="wrong-level",
-        note=None,
-    )))
+    wrong_value = _FakeRunner(
+        lambda _request: _response(
+            _Candidate(
+                width=1,
+                wire_name="wrong-level",
+                note=None,
+            )
+        )
+    )
     with pytest.raises(TypeError, match="requested output type"):
-        asyncio.run(PydanticAIAgenticGenerator(wrong_value).propose(_variation_request()))
+        asyncio.run(
+            PydanticAIAgenticGenerator(wrong_value).propose(_variation_request())
+        )
 
 
 @pytest.mark.parametrize("attempt_count", [0, -1, True, 1.5])
@@ -1129,16 +1905,16 @@ def test_each_call_uses_a_fresh_schema_bound_to_its_candidate_model() -> None:
 
     generator = PydanticAIAgenticGenerator(_FakeRunner(handle))
     asyncio.run(generator.propose(_variation_request()))
-    asyncio.run(
-        generator.propose(_variation_request(candidate_model=_OtherCandidate))
-    )
+    asyncio.run(generator.propose(_variation_request(candidate_model=_OtherCandidate)))
 
     assert output_types[0] is not output_types[1]
     assert output_types[0].model_fields["configuration"].annotation is _Candidate
     assert output_types[1].model_fields["configuration"].annotation is _OtherCandidate
 
 
-def test_adapter_implements_protocol_and_has_no_provider_or_environment_boundary() -> None:
+def test_adapter_implements_protocol_and_has_no_provider_or_environment_boundary() -> (
+    None
+):
     async def unused(_request: StructuredGenerationRequest[Any]):
         raise AssertionError
 

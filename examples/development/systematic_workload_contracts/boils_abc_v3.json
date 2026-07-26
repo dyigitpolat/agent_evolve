@@ -1,0 +1,45 @@
+{
+  "schema_version": 2,
+  "workload_id": "boils_abc",
+  "runtime": {
+    "kind": "current_python"
+  },
+  "exclusive_resource": {
+    "resource_key": "boils_abc_cpu120_123_evaluator_lane",
+    "lease_relative_path": "papers/agent_evolve_aaai_2027/research_artifacts/experiment_logs/systematic_resource_leases/boils_abc_cpu120_123_evaluator_lane.lock"
+  },
+  "arms": {
+    "control": {
+      "runner": "agent_evolve/examples/development/run_boils_generic_campaign.py",
+      "artifact_root": "papers/agent_evolve_aaai_2027/research_artifacts/experiment_logs/boils_abc/generic_campaign",
+      "prepare_arguments": [
+        "prepare",
+        "--run-id",
+        "{prepare_run_id}"
+      ],
+      "live_arguments": [
+        "control",
+        "--run-id",
+        "{live_run_id}"
+      ],
+      "preregistration_relative_path": null
+    },
+    "treatment": {
+      "runner": "agent_evolve/examples/development/run_boils_generic_campaign.py",
+      "artifact_root": "papers/agent_evolve_aaai_2027/research_artifacts/experiment_logs/boils_abc/generic_campaign",
+      "prepare_arguments": [
+        "prepare",
+        "--run-id",
+        "{prepare_run_id}"
+      ],
+      "live_arguments": [
+        "live",
+        "--run-id",
+        "{live_run_id}",
+        "--prereg",
+        "{preregistration_path}"
+      ],
+      "preregistration_relative_path": "preregistration_template.json"
+    }
+  }
+}

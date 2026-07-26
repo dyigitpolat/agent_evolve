@@ -4,22 +4,28 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent_evolve"
-version = "0.1.0"
-description = "LLM-driven multi-objective optimization via Pareto-guided evolution"
+version = "0.2.0"
+description = "Plug-and-play LLM-driven multi-objective optimization via Pareto-guided evolution"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = { text = "MIT" }
 
 dependencies = [
-    "kedi @ file:./kedi",
-    "pydantic>=2",
+    "annotated-types==0.7.0",
+    "pydantic==2.13.4",
+    "pydantic-core==2.46.4",
+    "python-dotenv",
 ]
 
 [project.optional-dependencies]
-dspy = ["dspy"]
+pydantic_ai = ["pydantic-ai==1.107.1"]
+dev = ["pytest"]
+all = ["pydantic-ai==1.107.1", "pytest"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-agent_evolve = ["*.kedi"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --import-mode=importlib"
+pythonpath = [".", "tests"]
