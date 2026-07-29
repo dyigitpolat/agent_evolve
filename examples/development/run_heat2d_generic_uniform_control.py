@@ -111,6 +111,10 @@ from examples.benchmarks.heat2d_constructive.problem_def import (  # noqa: E402
     DirectV3Evaluator,
 )
 from examples.development import run_heat2d_generic_campaign as agentic  # noqa: E402
+from examples.development.launch_record import (  # noqa: E402
+    instrument_startup_window,
+    uninstall_launch_recorder,
+)
 from examples.development.durable_run_artifacts import (  # noqa: E402
     DurableJsonlJournal,
     finalize_run_directory,
@@ -123,6 +127,8 @@ from examples.development.uniform_feasible_portfolio_control import (  # noqa: E
     TaskKeyedConditionalUniformPortfolioPolicy,
     analyze_grouped_feasible_slate_space,
 )
+
+instrument_startup_window()
 
 
 ARTIFACT_ROOT = (
@@ -1047,6 +1053,10 @@ async def _live(
     journals: dict[str, DurableJsonlJournal],
     expected_source_aggregate_sha256: str,
 ) -> dict[str, object]:
+    # This control never reads a credential; the launch record proves that
+    # rather than asserting it. Close the window before the clock starts so
+    # the measured phase runs in an unmodified process.
+    uninstall_launch_recorder()
     wave_records: list[dict[str, object]] = []
     reflection_records: list[dict[str, object]] = []
     policy = TaskKeyedConditionalUniformPortfolioPolicy(

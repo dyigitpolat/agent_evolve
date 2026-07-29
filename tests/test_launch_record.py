@@ -318,3 +318,135 @@ def test_recording_never_fails_a_campaign(tmp_path: Path) -> None:
     )
     assert written == run_dir / LAUNCH_RECORD_FILENAME
     assert json.loads(written.read_text(encoding="utf-8"))["mode"] == "prepare"
+
+
+# --- the reversible startup window ------------------------------------------
+#
+# `live` must stay byte-identical to the uninstrumented process while it
+# produces results, but the evidence that a credential was never read is worth
+# having for a live run too. Credentials are read at startup and the timed work
+# happens later, so the window can be opened and closed again. These run in
+# child processes: installing a recorder mutates process-global state, and the
+# invariant under test is about a whole process, not a function call.
+
+_STARTUP_WINDOW_PROBE = """
+import json, os, sys
+sys.path.insert(0, {root!r})
+from examples.development.launch_record import (
+    RecordingEnviron,
+    active_recorder,
+    instrument_startup_window,
+    uninstall_launch_recorder,
+)
+
+recorder = instrument_startup_window(argv={argv!r})
+if recorder is None:
+    print(json.dumps({{"installed": False}}))
+    raise SystemExit(0)
+
+proxied_during_startup = isinstance(os.environ, RecordingEnviron)
+os.environ.get("PROBE_STARTUP_API_KEY")
+
+removed = uninstall_launch_recorder()
+proxied_after = isinstance(os.environ, RecordingEnviron)
+os.environ.get("PROBE_MEASURED_PHASE_ONLY")
+
+reads = recorder.environment_reads.to_record()["names"]
+print(json.dumps({{
+    "installed": True,
+    "proxied_during_startup": proxied_during_startup,
+    "removed": removed,
+    "proxied_after": proxied_after,
+    "audit_hook_installed": recorder.audit_hook_installed,
+    "reversible": recorder.reversible,
+    "phases": list(recorder.instrumented_phases),
+    "saw_startup_read": "PROBE_STARTUP_API_KEY" in reads,
+    "saw_measured_read": "PROBE_MEASURED_PHASE_ONLY" in reads,
+}}))
+"""
+
+
+def _run_probe(argv: list[str]) -> dict:
+    root = str(Path(__file__).resolve().parents[1])
+    source = _STARTUP_WINDOW_PROBE.format(root=root, argv=argv)
+    proc = subprocess.run(
+        [sys.executable, "-c", source],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, f"probe failed:\n{proc.stdout}\n{proc.stderr}"
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_startup_window_closes_before_the_measured_phase() -> None:
+    out = _run_probe(["live", "--run-id", "x"])
+
+    assert out["installed"] is True, "a live campaign must still get the window"
+    assert out["proxied_during_startup"] is True
+    assert out["removed"] is True
+    assert out["proxied_after"] is False, "the measured phase ran under a proxy"
+    assert out["phases"] == ["startup"]
+
+
+def test_the_window_records_startup_reads_and_nothing_after_it() -> None:
+    """The evidence is captured; the measured phase is unobserved."""
+    out = _run_probe(["live", "--run-id", "x"])
+
+    assert out["saw_startup_read"] is True, "credential-read evidence was lost"
+    assert out["saw_measured_read"] is False, "the recorder outlived its window"
+
+
+def test_the_window_installs_nothing_irreversible() -> None:
+    """sys.addaudithook cannot be undone, so the window must never add one."""
+    out = _run_probe(["live", "--run-id", "x"])
+
+    assert out["audit_hook_installed"] is False
+    assert out["reversible"] is True
+
+
+def test_the_window_ignores_an_invocation_that_names_no_campaign_mode() -> None:
+    """Importing a runner under a test harness must instrument nothing."""
+    assert _run_probe(["-q", "tests/"]) == {"installed": False}
+
+
+def test_an_irreversible_recorder_refuses_to_report_a_clean_uninstall(
+    monkeypatch,
+) -> None:
+    """A disarmed hook must never be mistaken for an absent one."""
+    from examples.development import launch_record as module
+
+    recorder = module.LaunchRecorder()
+    recorder.audit_hook_installed = True
+    monkeypatch.setattr(module, "_RECORDER", recorder)
+    monkeypatch.setattr(module.os, "environ", dict(os.environ))
+
+    assert module.uninstall_launch_recorder() is False
+    assert recorder.reversible is False
+    assert recorder.instrumented_phases == ("startup", "measured")
+
+
+def test_the_launch_record_states_which_phases_were_instrumented(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from examples.development import launch_record as module
+
+    recorder = module.LaunchRecorder()
+    recorder.environment_proxy_installed = True
+    monkeypatch.setattr(module, "_RECORDER", recorder)
+
+    still_open = build_launch_record(
+        mode="live", run_id="r", run_dir=tmp_path, workspace_root=tmp_path
+    )["instrumentation"]
+    assert still_open["instrumented_phases"] == ["startup", "measured"]
+    assert still_open["environment_proxy_active"] is True
+
+    recorder.uninstalled_at_utc = "2026-07-29T00:00:00+00:00"
+    closed = build_launch_record(
+        mode="live", run_id="r", run_dir=tmp_path, workspace_root=tmp_path
+    )["instrumentation"]
+    assert closed["instrumented_phases"] == ["startup"]
+    assert closed["environment_proxy_active"] is False
+    assert closed["reversible"] is True
+    assert closed["uninstalled_at_utc"] == "2026-07-29T00:00:00+00:00"

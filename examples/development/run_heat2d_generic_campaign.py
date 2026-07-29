@@ -41,6 +41,8 @@ if str(AGENT_EVOLVE_ROOT) not in sys.path:
 
 from examples.development.launch_record import (  # noqa: E402
     install_launch_recorder,
+    instrument_startup_window,
+    uninstall_launch_recorder,
     record_campaign_launch,
 )
 
@@ -49,6 +51,9 @@ from examples.development.launch_record import (  # noqa: E402
 # has to be installed here to see those reads.  Instrumentation only, and
 # only for the provider-free ``prepare`` mode; ``live`` is untouched.
 install_launch_recorder()
+# `live` gets a reversible environment-only window instead, closed again
+# before any timed work; `prepare` keeps its lifetime instrumentation.
+instrument_startup_window()
 
 from agent_evolve.settings import load_credentials  # noqa: E402
 
@@ -4882,6 +4887,10 @@ async def _live(
 ) -> dict[str, object]:
     load_credentials(WORKSPACE_ROOT / ".env", override=False, optional=True)
     load_credentials(AGENT_EVOLVE_ROOT / ".env", override=False, optional=True)
+    # The credential window is closed. Everything after this line -- all of
+    # the timed work -- runs in an unmodified process, and the launch record
+    # says so with instrumented_phases: ["startup"].
+    uninstall_launch_recorder()
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if type(api_key) is not str or not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is unavailable")

@@ -68,10 +68,21 @@ LAUNCH_RECORD_FILENAME = "launch_record.json"
 LAUNCH_RECORD_SCHEMA_VERSION = 1
 LAUNCH_RECORD_KIND = "agent-evolve:campaign-launch-record"
 
-# Modes whose process is instrumented.  ``live`` is deliberately excluded:
-# it is the phase that produces results, and it must remain byte-identical
-# to the uninstrumented process.
+# Modes whose process is instrumented for its whole lifetime.  ``live`` is
+# deliberately excluded: it is the phase that produces results, and it must
+# remain byte-identical to the uninstrumented process.
 INSTRUMENTED_MODES = ("prepare",)
+
+# Modes that get a *reversible* startup window instead -- see
+# ``instrument_startup_window``.  Credentials are read while the process is
+# starting up, long before any timed work, so the window that proves a key was
+# never read can be closed again before the clock starts.
+CAMPAIGN_MODES = ("prepare", "live")
+
+#: The phase during which a reversible recorder is installed.
+STARTUP_PHASE = "startup"
+#: The phase a reversible recorder must have been removed before.
+MEASURED_PHASE = "measured"
 
 # Bounds.  Every observer is capped so that instrumentation can never grow
 # without limit inside a long campaign.
@@ -254,6 +265,10 @@ class RecordingEnviron(MutableMapping):
         self._log.record_read(key, present=present, operation="contains")
         return present
 
+    def real_environment(self) -> MutableMapping:
+        """The unwrapped mapping, so the proxy can be removed again."""
+        return self._target
+
     def __iter__(self) -> Iterator[str]:
         self._log.record_bulk("iter")
         return iter(self._target)
@@ -372,7 +387,35 @@ class LaunchRecorder:
         self.audit_hook_installed = False
         self.installation_errors: list[str] = []
         self.installed_at_utc = _utc_now()
+        self.uninstalled_at_utc: str | None = None
         self.mode: str | None = None
+
+    @property
+    def reversible(self) -> bool:
+        """Whether every observer this recorder installed can be removed again.
+
+        ``sys.addaudithook`` cannot be undone in CPython, so a recorder that
+        installed the ambient-path hook can never restore an uninstrumented
+        process. Only an environment-proxy-only install is reversible.
+        """
+        return not self.audit_hook_installed
+
+    @property
+    def environment_proxy_active(self) -> bool:
+        """Whether the proxy is intercepting reads *right now*."""
+        return self.environment_proxy_installed and self.uninstalled_at_utc is None
+
+    @property
+    def instrumented_phases(self) -> tuple[str, ...]:
+        """Which phases ran under instrumentation.
+
+        A reader checking that nothing timed was perturbed wants to see
+        ``["startup"]`` alone: the recorder was installed while credentials were
+        read and removed before the clock started.
+        """
+        if self.uninstalled_at_utc is not None and self.reversible:
+            return (STARTUP_PHASE,)
+        return (STARTUP_PHASE, MEASURED_PHASE)
 
 
 _RECORDER: LaunchRecorder | None = None
@@ -389,6 +432,7 @@ def install_launch_recorder(
     argv: Sequence[str] | None = None,
     modes: Sequence[str] = INSTRUMENTED_MODES,
     force: bool = False,
+    ambient_paths: bool = True,
 ) -> LaunchRecorder | None:
     """Observe environment and ambient-file reads for the rest of the process.
 
@@ -396,6 +440,10 @@ def install_launch_recorder(
     module bodies read configuration -- so that import-time reads are seen.
     Returns ``None`` when the invocation is not an instrumented mode, which
     is the normal case for ``live``.
+
+    ``ambient_paths=False`` skips the audit hook. That hook cannot be removed
+    from a CPython process, so omitting it is what makes an install reversible
+    -- see :func:`instrument_startup_window`.
 
     Never raises.  A failure to install any observer is recorded and the
     process continues exactly as it would have without instrumentation.
@@ -425,27 +473,85 @@ def install_launch_recorder(
             f"environment_proxy:{type(error).__qualname__}"
         )
 
-    try:
-        ambient = recorder.ambient_paths
+    if ambient_paths:
+        try:
+            ambient = recorder.ambient_paths
 
-        def _hook(event: str, arguments: tuple) -> None:
-            if event != "open":
-                return
-            try:
-                ambient.record_open(
-                    arguments[0] if len(arguments) > 0 else None,
-                    arguments[1] if len(arguments) > 1 else None,
-                )
-            except BaseException:  # pragma: no cover - must never propagate
-                return
+            def _hook(event: str, arguments: tuple) -> None:
+                if event != "open":
+                    return
+                try:
+                    ambient.record_open(
+                        arguments[0] if len(arguments) > 0 else None,
+                        arguments[1] if len(arguments) > 1 else None,
+                    )
+                except BaseException:  # pragma: no cover - must never propagate
+                    return
 
-        sys.addaudithook(_hook)
-        recorder.audit_hook_installed = True
-    except BaseException as error:  # pragma: no cover - defensive
-        recorder.installation_errors.append(f"audit_hook:{type(error).__qualname__}")
+            sys.addaudithook(_hook)
+            recorder.audit_hook_installed = True
+        except BaseException as error:  # pragma: no cover - defensive
+            recorder.installation_errors.append(
+                f"audit_hook:{type(error).__qualname__}"
+            )
 
     _RECORDER = recorder
     return recorder
+
+
+def instrument_startup_window(
+    *,
+    argv: Sequence[str] | None = None,
+    modes: Sequence[str] = CAMPAIGN_MODES,
+) -> LaunchRecorder | None:
+    """Instrument the startup phase of any campaign mode, reversibly.
+
+    ``live`` must remain byte-identical to the uninstrumented process while it
+    produces results -- but the evidence that a credential was never read is
+    worth having for a live run too, and credentials are read at startup, long
+    before any timed work. So observe only the environment, which is removable,
+    and call :func:`uninstall_launch_recorder` before the clock starts. The
+    audit hook is deliberately not installed: CPython cannot remove it, and a
+    recorder that installed it could never hand back an unmodified process.
+
+    Returns ``None`` unless the invocation names a campaign mode, so importing a
+    runner under a test harness instruments nothing.
+    """
+
+    return install_launch_recorder(argv=argv, modes=modes, ambient_paths=False)
+
+
+def uninstall_launch_recorder() -> bool:
+    """Restore the unmodified process before the measured phase begins.
+
+    Returns True when the environment proxy was removed. The recorder itself
+    survives -- its observations are the evidence -- but it stops observing, and
+    the launch record then reports ``instrumented_phases: ["startup"]``.
+
+    Never raises. Refuses to claim success if an irreversible observer is
+    installed, so a caller cannot mistake a disarmed hook for an absent one.
+    """
+
+    recorder = _RECORDER
+    if recorder is None:
+        return False
+    if not recorder.reversible:
+        # A lifetime-instrumented mode (``prepare``) is *meant* to observe its
+        # whole process, and the audit hook could not be removed anyway. Cutting
+        # its window short would lose evidence and still not restore the process.
+        return False
+
+    restored = False
+    try:
+        current = os.environ
+        if isinstance(current, RecordingEnviron):
+            os.environ = current.real_environment()  # type: ignore[assignment]
+            restored = True
+    except BaseException as error:  # pragma: no cover - defensive
+        recorder.installation_errors.append(f"uninstall:{type(error).__qualname__}")
+
+    recorder.uninstalled_at_utc = _utc_now()
+    return restored
 
 
 # --------------------------------------------------------------------------
@@ -1190,6 +1296,19 @@ def build_launch_record(
                 [] if recorder is None else list(recorder.installation_errors)
             ),
             "instrumented_modes": list(INSTRUMENTED_MODES),
+            # A reader checking that no measured quantity was perturbed wants
+            # these three: the window closed, nothing irreversible was ever
+            # installed, and the measured phase ran unobserved.
+            "uninstalled_at_utc": (
+                None if recorder is None else recorder.uninstalled_at_utc
+            ),
+            "reversible": recorder is not None and recorder.reversible,
+            "environment_proxy_active": (
+                recorder is not None and recorder.environment_proxy_active
+            ),
+            "instrumented_phases": (
+                [] if recorder is None else list(recorder.instrumented_phases)
+            ),
         },
         "invocation": capture_invocation(
             workspace_root=workspace_root,

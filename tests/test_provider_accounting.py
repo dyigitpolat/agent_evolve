@@ -173,6 +173,95 @@ def test_no_runner_certifies_itself_against_its_own_constant():
     )
 
 
+#: Fields whose value is a claim about provider traffic, not configuration.
+_CLAIM_MARKERS = (
+    "provider_call",
+    "llm_call",
+    "provider_free",
+    "no_provider",
+    "credential_read",
+    "credential_access",
+)
+_TELEMETRY_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens", "cost_usd")
+
+
+def _is_claim_field(name: str) -> bool:
+    lowered = name.lower()
+    return any(m in lowered for m in _CLAIM_MARKERS) or lowered in _TELEMETRY_FIELDS
+
+
+def _literal_claim_assertions(repo_root):
+    """Every `"provider_calls": 0`-shaped literal sealed as a receipt field."""
+    import ast
+
+    found = []
+    for base in ("src", "examples"):
+        for path in sorted((repo_root / base).rglob("*.py")):
+            try:
+                tree = ast.parse(path.read_text())
+            except (SyntaxError, UnicodeDecodeError):  # pragma: no cover
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Dict):
+                    continue
+                for key, value in zip(node.keys, node.values):
+                    if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                        continue
+                    if not _is_claim_field(key.value):
+                        continue
+                    if isinstance(value, ast.Constant) and value.value in (0, False, True, "0"):
+                        rel = path.relative_to(repo_root).as_posix()
+                        found.append(f"{rel}::{key.value}")
+    return sorted(found)
+
+
+def test_no_new_provider_claim_is_sealed_as_a_literal():
+    """A ratchet on the backlog: 215 of these exist, and none may be added.
+
+    `"provider_calls": 0` written as a literal is exactly as uninformative as
+    the constant comparison retired alongside it -- it cannot come out any other
+    way, so it evidences nothing. The existing ones cannot be converted without
+    running the campaigns that produce them, but the count must only ever fall.
+    Fix one and delete its line from the baseline; the test enforces both
+    directions so the file cannot drift away from the code.
+    """
+    import json
+    from pathlib import Path
+
+    import agent_evolve
+
+    repo_root = Path(agent_evolve.__file__).parents[2]
+    baseline_path = Path(__file__).parent / "provider_claim_literals_baseline.json"
+    baseline = sorted(json.loads(baseline_path.read_text()))
+    current = _literal_claim_assertions(repo_root)
+
+    added = _multiset_difference(current, baseline)
+    assert added == [], (
+        "new provider claims sealed as literals; make them measure something "
+        "(agent_evolve.provider_accounting.measure_provider_usage):\n  "
+        + "\n  ".join(added)
+    )
+
+    removed = _multiset_difference(baseline, current)
+    assert removed == [], (
+        "these were fixed but are still listed as known-bad; delete them from "
+        f"{baseline_path.name} so the ratchet tightens:\n  " + "\n  ".join(removed)
+    )
+
+
+def _multiset_difference(left, right):
+    from collections import Counter
+
+    remaining = Counter(right)
+    extra = []
+    for item in left:
+        if remaining[item]:
+            remaining[item] -= 1
+        else:
+            extra.append(item)
+    return extra
+
+
 def test_provider_free_cannot_be_satisfied_by_a_constant():
     """A ProviderUsage built with traffic can never report provider_free."""
     usage = ProviderUsage(
