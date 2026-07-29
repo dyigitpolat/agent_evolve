@@ -39,6 +39,17 @@ WORKSPACE_ROOT = AGENT_EVOLVE_ROOT.parent
 if str(AGENT_EVOLVE_ROOT) not in sys.path:
     sys.path.insert(0, str(AGENT_EVOLVE_ROOT))
 
+from examples.development.launch_record import (  # noqa: E402
+    install_launch_recorder,
+    record_campaign_launch,
+)
+
+# Observe the launch environment before any module body below reads it.  This
+# runner resolves most of its configuration at import time, so the observer
+# has to be installed here to see those reads.  Instrumentation only, and
+# only for the provider-free ``prepare`` mode; ``live`` is untouched.
+install_launch_recorder()
+
 from dotenv import load_dotenv  # noqa: E402
 
 from agent_evolve.agentic import (  # noqa: E402
@@ -1359,6 +1370,7 @@ def _source_paths() -> tuple[Path, ...]:
         Path(__file__),
         AGENT_EVOLVE_ROOT / "examples/development/heat2d_campaign_reflection.py",
         AGENT_EVOLVE_ROOT / "examples/development/durable_run_artifacts.py",
+        AGENT_EVOLVE_ROOT / "examples/development/launch_record.py",
         *dependency_locks,
         *core,
         *heat,
@@ -5757,6 +5769,32 @@ def _validate_preregistration(
     }
 
 
+def _record_launch(
+    args: argparse.Namespace,
+    run_dir: Path,
+    source_paths: tuple[Path, ...],
+    source: dict[str, object],
+) -> None:
+    """Publish the complete launch environment beside the source closure.
+
+    Called twice: once as soon as the run directory exists, so that even a
+    failed preparation records how it was launched, and once again just
+    before finalization, when the observed ambient-input set is complete.
+    Never raises; a failure is journaled as ``launch_record_error.json``.
+    """
+
+    record_campaign_launch(
+        mode=args.mode,
+        run_id=args.run_id,
+        run_dir=run_dir,
+        workspace_root=WORKSPACE_ROOT,
+        agent_evolve_root=AGENT_EVOLVE_ROOT,
+        source_paths=source_paths,
+        source_closure=source,
+        dotenv_paths=(WORKSPACE_ROOT / ".env", AGENT_EVOLVE_ROOT / ".env"),
+    )
+
+
 async def _main_async(args: argparse.Namespace) -> int:
     run_dir = (ARTIFACT_ROOT / args.run_id).resolve()
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -5769,6 +5807,7 @@ async def _main_async(args: argparse.Namespace) -> int:
             run_dir / "manifest.json",
             _manifest(args.run_id, args.mode, source, source_snapshot),
         )
+        _record_launch(args, run_dir, source_paths, source)
         preparation = DurableJsonlJournal(run_dir / "preparation.jsonl")
         bundle = _prepare_bundle(
             run_dir=run_dir,
@@ -5838,6 +5877,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                 "source_snapshot": source_snapshot,
             }
             write_json_atomic(run_dir / "summary.json", summary)
+            _record_launch(args, run_dir, source_paths, source)
             preparation.close()
             finalize_run_directory(run_dir, status=summary["status"])
             print(json.dumps(summary, sort_keys=True))
