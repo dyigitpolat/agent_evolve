@@ -90,6 +90,10 @@ from agent_evolve.policies.reward.affine_hypervolume import (  # noqa: E402
 from agent_evolve.ports.parent_measurement import (  # noqa: E402
     ParentMeasurementProjection,
 )
+from agent_evolve.provider_accounting import (  # noqa: E402
+    ensure_declared_journals,
+    measure_provider_usage,
+)
 from examples.benchmarks.heat2d_constructive.artifact_boundary import (  # noqa: E402
     artifact_scripts_dir,
 )
@@ -135,8 +139,13 @@ CONTROL_ID_NAMESPACE = "heat_calibrated_g6_control_r1"
 MINIMUM_ACCEPTANCE_PROBABILITY = Fraction(1, 100)
 TARGET_UNIQUE_EVALUATIONS = agentic.PLANNED_UNIQUE_EVALUATIONS
 SCHEDULER_LOCAL_DECISION_OPERATIONS = agentic.PLANNED_LOGICAL_LLM_CALLS
-ACTUAL_LLM_CALLS = 0
-PROVIDER_CALLS = 0
+# Provider traffic is COUNTED from these journals, never declared. They are
+# created empty at startup so that "no rows" is a measurement and not the
+# absence of instrumentation.
+PROVIDER_JOURNALS = {
+    "outcome": "queue_outcomes.jsonl",
+    "outbound": "outbound_requests.jsonl",
+}
 MAX_PDE_WALL_S = 45.0
 MAX_PDE_PEAK_RSS_BYTES = 3 * 1024**3
 
@@ -1178,6 +1187,10 @@ async def _live(
     source_closure_unchanged = (
         postrun_source["aggregate_sha256"] == expected_source_aggregate_sha256
     )
+    # Read the provider journals this run created at startup. They are empty
+    # because nothing ever wrote to them -- but they exist, so the zero below is
+    # a count rather than a constant this file happens to define as 0.
+    usage = measure_provider_usage(run_dir, PROVIDER_JOURNALS)
     health = {
         "exact_generations": (
             result.counters.generations_completed == agentic.GENERATION_COUNT
@@ -1192,8 +1205,8 @@ async def _live(
         "exact_scheduler_local_decision_operations": (
             result.counters.logical_agent_calls == SCHEDULER_LOCAL_DECISION_OPERATIONS
         ),
-        "zero_actual_llm_calls": ACTUAL_LLM_CALLS == 0,
-        "zero_provider_calls": PROVIDER_CALLS == 0,
+        "zero_actual_llm_calls": usage.outcome_rows == 0,
+        "zero_provider_calls": usage.provider_calls == 0 and usage.outbound_rows == 0,
         "exact_stage_occurrences": stage_counts == _expected_stage_widths(),
         "exact_stage_unique": stage_unique == _expected_stage_widths(),
         "all_candidates_valid": all(value.valid for value in runtime.history),
@@ -1261,13 +1274,8 @@ async def _live(
             ),
             "local_uniform_selection_operations": 6,
             "local_inert_reflection_operations": 1,
-            "actual_llm_calls": 0,
-            "provider_calls": 0,
-            "credential_read": False,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "reasoning_tokens": 0,
-            "cost_usd": "0",
+            # Counted from the journals named in `measured_from`, not declared.
+            **usage.to_record(),
         },
         "wall_s": wall_s,
         "wall_s_to_planned_unique_evaluations": wall_s,
@@ -1413,6 +1421,7 @@ async def _main_async(args: argparse.Namespace) -> int:
             )
             return 0
 
+        ensure_declared_journals(run_dir, PROVIDER_JOURNALS)
         journals = {
             "engine": DurableJsonlJournal(run_dir / "engine_events.jsonl"),
             "campaign": DurableJsonlJournal(run_dir / "campaign_events.jsonl"),
