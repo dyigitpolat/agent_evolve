@@ -854,6 +854,77 @@ def capture_interpreter(*, workspace_root: Path | None) -> dict[str, object]:
     }
 
 
+def _python_environment_identity(path: Path) -> dict[str, object] | None:
+    """Identify the Python environment a recorded path belongs to, if any.
+
+    Campaigns delegate numerical work to *other* interpreters named by
+    environment variables -- the pinned qLogNEHVI scorer is one.  Recording
+    only that path is not enough: the packages inside it decide the numbers
+    it returns, and the campaign's own ``sys.prefix`` says nothing about
+    them.  This reads the environment's identity from disk, listing
+    ``*.dist-info`` directory names, and never executes anything.
+    """
+
+    # Deliberately absolutize without resolving: ``<venv>/bin/python`` is a
+    # symlink to the base interpreter, and resolving it walks straight out of
+    # the environment whose packages are the thing worth recording.
+    current = Path(os.path.abspath(str(path.expanduser())))
+    for candidate in (current, *current.parents):
+        marker = candidate / "pyvenv.cfg"
+        if not marker.is_file():
+            continue
+        distributions: dict[str, str] = {}
+        for site in sorted(candidate.glob("lib/python*/site-packages")):
+            for entry in sorted(site.glob("*.dist-info")):
+                stem = entry.name[: -len(".dist-info")]
+                name, _, version = stem.rpartition("-")
+                if name:
+                    distributions[name] = version
+        try:
+            configuration = marker.read_text(encoding="utf-8", errors="replace")
+        except OSError:  # pragma: no cover - defensive
+            configuration = ""
+        return {
+            "environment_root": str(candidate),
+            "pyvenv_cfg": configuration,
+            "installed_distribution_count": len(distributions),
+            "installed_distributions": distributions,
+            "installed_distributions_sha256": _sha256_text(
+                "\n".join(
+                    f"{name}=={version}"
+                    for name, version in sorted(distributions.items())
+                )
+            ),
+        }
+    return None
+
+
+def capture_referenced_python_environments(
+    environ: Mapping[str, object],
+) -> dict[str, object]:
+    """Record the package identity of every Python environment a value names."""
+
+    found: dict[str, object] = {}
+    for name, entry in sorted(environ.items()):
+        if type(entry) is not dict or entry.get("redacted"):
+            continue
+        value = entry.get("value")
+        if type(value) is not str or not value.startswith("/"):
+            continue
+        if len(found) >= 8:
+            break
+        for part in value.split(os.pathsep):
+            identity = _python_environment_identity(Path(part))
+            if identity is not None:
+                found[str(name)] = identity
+                break
+    return {
+        "schema_version": 1,
+        "count": len(found),
+        "by_environment_variable": found,
+    }
+
+
 def capture_dotenv_files(paths: Sequence[Path]) -> list[dict[str, object]]:
     """Record which ``.env`` files a launch could consult, by name only.
 
@@ -1131,6 +1202,9 @@ def build_launch_record(
         "process_environment": process_environment,
         "declared_environment_surface": declared,
         "observed_environment_reads": observed,
+        "referenced_python_environments": capture_referenced_python_environments(
+            variables
+        ),
         "dotenv_files": capture_dotenv_files(dotenv_paths),
         "ambient_filesystem_inputs": capture_ambient_filesystem_inputs(
             recorder,
@@ -1224,6 +1298,7 @@ __all__ = [
     "capture_interpreter",
     "capture_invocation",
     "capture_process_environment",
+    "capture_referenced_python_environments",
     "install_launch_recorder",
     "record_campaign_launch",
     "scan_declared_environment_surface",

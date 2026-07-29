@@ -30,6 +30,7 @@ from examples.development.launch_record import (
     RecordingEnviron,
     build_launch_record,
     capture_process_environment,
+    capture_referenced_python_environments,
     install_launch_recorder,
     record_campaign_launch,
     scan_declared_environment_surface,
@@ -266,6 +267,39 @@ def test_launch_record_is_complete_and_self_describing(
     assert resolved["resolved_value"] == "regret_bounded_information"
     assert resolved["code_defaults"] == ["full_support"]
     assert resolved["resolved_from"] == "process_environment"
+
+
+def test_python_environments_named_by_variables_are_identified(
+    tmp_path: Path,
+) -> None:
+    """The numbers a campaign gets depend on packages it never imports."""
+
+    environment = tmp_path / "scorer_env"
+    site = environment / "lib" / "python3.12" / "site-packages"
+    site.mkdir(parents=True)
+    (environment / "pyvenv.cfg").write_text("version = 3.12.3\n", encoding="utf-8")
+    (environment / "bin").mkdir()
+    (environment / "bin" / "python").symlink_to("/usr/bin/python3.12")
+    for stem in ("torch-2.13.0", "botorch-0.18.1"):
+        (site / f"{stem}.dist-info").mkdir()
+
+    captured = capture_referenced_python_environments(
+        {
+            "AGENT_EVOLVE_BOTORCH_PYTHON": {
+                "redacted": False,
+                "value": str(environment / "bin" / "python"),
+            },
+            "OPENROUTER_API_KEY": {"redacted": True},
+            "NOT_A_PATH": {"redacted": False, "value": "hierarchical_r2"},
+        }
+    )
+    assert captured["count"] == 1
+    identity = captured["by_environment_variable"]["AGENT_EVOLVE_BOTORCH_PYTHON"]
+    assert identity["installed_distributions"] == {
+        "torch": "2.13.0",
+        "botorch": "0.18.1",
+    }
+    assert len(identity["installed_distributions_sha256"]) == 64
 
 
 def test_recording_never_fails_a_campaign(tmp_path: Path) -> None:
