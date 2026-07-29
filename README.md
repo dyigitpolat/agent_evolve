@@ -16,8 +16,18 @@ lines of the loop.
 pip install -e ".[pydantic_ai]"
 ```
 
-Set provider keys in `.env` (`OPENAI_API_KEY`, `GROQ_API_KEY`, `GOOGLE_API_KEY`, ...)
-and optionally `AGENTEVOLVE_MODEL` / `AGENTEVOLVE_HARNESS`.
+Provider keys (`OPENAI_API_KEY`, `GROQ_API_KEY`, `GOOGLE_API_KEY`, ...) and the
+optional `AGENTEVOLVE_MODEL` / `AGENTEVOLVE_HARNESS` are read from the process
+environment. To keep them in a file instead, name it explicitly:
+
+```bash
+export AGENTEVOLVE_DOTENV=.env          # or: AgentEvolveSettings.from_env(dotenv_path=".env")
+```
+
+The library never *searches* for a `.env`. It will not walk up the directory
+tree, so it cannot pick up credentials belonging to an enclosing repository, and
+scrubbing a key out of the environment (`env -u OPENAI_API_KEY ...`) actually
+removes it. Values already in the environment always outrank the file.
 
 ## Quickstart
 
