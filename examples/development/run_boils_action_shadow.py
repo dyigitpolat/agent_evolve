@@ -32,7 +32,7 @@ WORKSPACE_ROOT = AGENT_EVOLVE_ROOT.parent
 if str(AGENT_EVOLVE_ROOT) not in sys.path:
     sys.path.insert(0, str(AGENT_EVOLVE_ROOT))
 
-from dotenv import load_dotenv  # noqa: E402
+from agent_evolve.settings import load_credentials  # noqa: E402
 from pydantic import BaseModel, ConfigDict, Field, model_validator  # noqa: E402
 
 from agent_evolve.domain.ids import LLMCallId  # noqa: E402
@@ -1206,7 +1206,7 @@ def main() -> None:
                 "oracle_parser_constructed": False,
             }
         )
-        load_dotenv(WORKSPACE_ROOT / ".env", override=False)
+        load_credentials(WORKSPACE_ROOT / ".env", override=False, optional=True)
         records = asyncio.run(
             _run_live(
                 response_writer=response_writer,

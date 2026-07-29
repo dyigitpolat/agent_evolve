@@ -35,6 +35,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel
 
+from agent_evolve.settings import load_credentials  # noqa: E402
 from agent_evolve.application.action_forecast_partitioning import (
     ActionForecastHealthSubsetPolicyBinding,
     ActionForecastHealthPolicyBinding,
@@ -2009,19 +2010,18 @@ def finalize_postcredential_abort(claim: LiveClaim, error: BaseException) -> Non
 
 
 def _load_dotenv_api_key() -> str:
+    """Load one credential at the live CLI boundary only.
+
+    Routed through ``load_credentials`` so a name declared in
+    ``AGENTEVOLVE_SCRUBBED`` stays unset. Reading the file directly, as this
+    once did, defeated the scrub outright -- it preferred the file's value over
+    the process environment, so removing the key changed nothing.
+    """
+
     env_path = WORKSPACE_ROOT / ".env"
-    value: str | None = None
     if env_path.is_file():
-        for raw in env_path.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            name, candidate = line.split("=", 1)
-            if name.strip() == "OPENROUTER_API_KEY":
-                value = candidate.strip().strip('"').strip("'")
-                break
-    if not value:
-        value = os.environ.get("OPENROUTER_API_KEY")
+        load_credentials(env_path, allow_credentials=("OPENROUTER_API_KEY",))
+    value = os.environ.get("OPENROUTER_API_KEY")
     if type(value) is not str or not value:
         raise ForecastWirePilotError("OPENROUTER_API_KEY is unavailable")
     return value

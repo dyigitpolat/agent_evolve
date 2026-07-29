@@ -50,7 +50,7 @@ from examples.development.launch_record import (  # noqa: E402
 # only for the provider-free ``prepare`` mode; ``live`` is untouched.
 install_launch_recorder()
 
-from dotenv import load_dotenv  # noqa: E402
+from agent_evolve.settings import load_credentials  # noqa: E402
 
 from agent_evolve.agentic import (  # noqa: E402
     BoundedPortfolioMemoryDoseContract,
@@ -4880,8 +4880,8 @@ async def _live(
     journals: dict[str, Any],
     expected_source_aggregate_sha256: str,
 ) -> dict[str, object]:
-    load_dotenv(WORKSPACE_ROOT / ".env", override=False)
-    load_dotenv(AGENT_EVOLVE_ROOT / ".env", override=False)
+    load_credentials(WORKSPACE_ROOT / ".env", override=False, optional=True)
+    load_credentials(AGENT_EVOLVE_ROOT / ".env", override=False, optional=True)
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if type(api_key) is not str or not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is unavailable")

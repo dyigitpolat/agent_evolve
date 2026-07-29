@@ -25,9 +25,27 @@ export AGENTEVOLVE_DOTENV=.env          # or: AgentEvolveSettings.from_env(doten
 ```
 
 The library never *searches* for a `.env`. It will not walk up the directory
-tree, so it cannot pick up credentials belonging to an enclosing repository, and
-scrubbing a key out of the environment (`env -u OPENAI_API_KEY ...`) actually
-removes it. Values already in the environment always outrank the file.
+tree, so it cannot pick up credentials belonging to an enclosing repository.
+Values already in the environment always outrank the file.
+
+### Proving a run made no provider call
+
+`env -u OPENROUTER_API_KEY ...` alone does **not** hold: any later
+`load_dotenv(path, override=False)` puts the key straight back, because
+`override=False` defers only to variables that are *present*, and a removed one
+is absent. A process cannot tell "never set" from "deliberately unset", so say
+which it is:
+
+```bash
+AGENTEVOLVE_SCRUBBED=OPENROUTER_API_KEY python run_campaign.py
+```
+
+Named variables are removed from the environment and can never be reintroduced
+from a file, whatever a caller asks for. Every `.env` read goes through
+`agent_evolve.settings.load_credentials`, which returns a `CredentialLoad`
+record naming exactly what it introduced, refused, and removed — seal that
+record in the run's receipt rather than asserting a constant. A run that needs
+no credentials at all can say so with `allow_credentials=()`.
 
 ## Quickstart
 

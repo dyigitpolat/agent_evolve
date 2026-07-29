@@ -152,28 +152,31 @@ def test_an_explicitly_named_dotenv_is_still_loaded(tmp_path):
     assert out["dotenv_source"] == str(named.resolve())
 
 
-def test_from_env_never_calls_dotenv_without_an_explicit_path(monkeypatch, tmp_path):
+def test_from_env_never_reads_a_file_nobody_named(monkeypatch, tmp_path):
     """Guard the mechanism directly, not just its observable effect."""
     dotenv = pytest.importorskip("dotenv")
-    calls = []
+    reads = []
 
-    monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(dotenv, "dotenv_values", lambda *a, **k: reads.append(a) or {})
     monkeypatch.setattr(
         dotenv,
         "find_dotenv",
         lambda *a, **k: pytest.fail("from_env() searched the filesystem for a .env"),
     )
+    monkeypatch.setattr(
+        dotenv,
+        "load_dotenv",
+        lambda *a, **k: pytest.fail("load_dotenv cannot honour a scrub list"),
+    )
     monkeypatch.delenv(settings_module.DOTENV_PATH_VAR, raising=False)
 
     AgentEvolveSettings.from_env()
-    assert calls == [], "from_env() read a .env nobody named"
+    assert reads == [], "from_env() read a .env nobody named"
 
     named = tmp_path / ".env"
     named.write_text("AE_DOTENV_SENTINEL=explicit\n")
     AgentEvolveSettings.from_env(dotenv_path=str(named))
-    assert len(calls) == 1
-    assert calls[0][0][0] == named
-    assert calls[0][1] == {"override": False}, "the process environment must outrank the file"
+    assert len(reads) == 1 and reads[0][0] == named
 
 
 def test_dotenv_path_env_var_is_an_explicit_path(monkeypatch, tmp_path):
@@ -204,10 +207,13 @@ def test_the_process_environment_outranks_a_named_dotenv(monkeypatch, tmp_path):
     assert AgentEvolveSettings.from_env(dotenv_path=str(named)).model == "openai:from-process"
 
 
-def test_settings_source_contains_no_searching_dotenv_call():
-    """A static ratchet: the searching form must never come back.
+def test_settings_source_never_calls_load_dotenv_or_find_dotenv():
+    """A static ratchet: neither unsafe primitive may come back.
 
-    Parsed rather than grepped so prose about the defect does not trip it.
+    ``find_dotenv`` searches upward by construction. ``load_dotenv`` sets
+    variables wholesale, so it cannot honour a scrub list no matter what
+    arguments it is given. Parsed rather than grepped so prose about the defects
+    does not trip it.
     """
     tree = ast.parse(_SETTINGS_SOURCE.read_text())
     for node in ast.walk(tree):
@@ -215,7 +221,177 @@ def test_settings_source_contains_no_searching_dotenv_call():
             continue
         func = node.func
         name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-        if name == "find_dotenv":
-            pytest.fail("find_dotenv() searches upward by construction")
-        if name == "load_dotenv" and not (node.args or node.keywords):
-            pytest.fail("load_dotenv() with no path searches upward for a .env")
+        if name in {"find_dotenv", "load_dotenv"}:
+            pytest.fail(f"{name}() cannot be used here; see this module's docstring")
+
+
+# --- the re-injection defect -------------------------------------------------
+#
+# `load_dotenv(path, override=False)` restores a variable that `env -u` removed:
+# override=False defers only to variables that are PRESENT, and a scrubbed one is
+# absent. These tests pin the replacement behaviour.
+
+
+def test_a_scrubbed_name_is_not_reintroduced_from_a_named_file(monkeypatch, tmp_path):
+    """The defect itself, at the unit level."""
+    named = tmp_path / ".env"
+    named.write_text("FAKE_PROVIDER_API_KEY=sk-fake-must-not-come-back\nAE_OK=fine\n")
+    monkeypatch.delenv("FAKE_PROVIDER_API_KEY", raising=False)
+    monkeypatch.delenv("AE_OK", raising=False)
+    monkeypatch.setenv(settings_module.SCRUBBED_VAR, "FAKE_PROVIDER_API_KEY")
+
+    load = settings_module.load_credentials(named)
+
+    assert "FAKE_PROVIDER_API_KEY" not in os.environ, "the scrubbed key was handed back"
+    assert load.refused_scrubbed == ("FAKE_PROVIDER_API_KEY",)
+    assert os.environ["AE_OK"] == "fine", "unrelated configuration must still load"
+    assert load.introduced == ("AE_OK",)
+
+
+def test_a_scrubbed_name_present_in_the_environment_is_removed(monkeypatch, tmp_path):
+    """Declaring a scrub also revokes a value already exported into the shell."""
+    named = tmp_path / ".env"
+    named.write_text("AE_OK=fine\n")
+    monkeypatch.setenv("FAKE_PROVIDER_API_KEY", "sk-fake-exported-earlier")
+    monkeypatch.setenv(settings_module.SCRUBBED_VAR, "FAKE_PROVIDER_API_KEY")
+
+    load = settings_module.load_credentials(named)
+
+    assert "FAKE_PROVIDER_API_KEY" not in os.environ
+    assert load.removed_from_environment == ("FAKE_PROVIDER_API_KEY",)
+
+
+def test_a_scrub_outranks_override_true(monkeypatch, tmp_path):
+    named = tmp_path / ".env"
+    named.write_text("FAKE_PROVIDER_API_KEY=sk-fake-must-not-come-back\n")
+    monkeypatch.delenv("FAKE_PROVIDER_API_KEY", raising=False)
+    monkeypatch.setenv(settings_module.SCRUBBED_VAR, "FAKE_PROVIDER_API_KEY")
+
+    settings_module.load_credentials(named, override=True)
+
+    assert "FAKE_PROVIDER_API_KEY" not in os.environ
+
+
+def test_a_run_can_declare_it_needs_no_credentials(monkeypatch, tmp_path):
+    """A provider-free runner states that, and the file cannot override it."""
+    named = tmp_path / ".env"
+    named.write_text("FAKE_PROVIDER_API_KEY=sk-fake\nOTHER_TOKEN=t\nAE_MODEL_NAME=m\n")
+    for name in ("FAKE_PROVIDER_API_KEY", "OTHER_TOKEN", "AE_MODEL_NAME"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv(settings_module.SCRUBBED_VAR, raising=False)
+
+    load = settings_module.load_credentials(named, allow_credentials=())
+
+    assert "FAKE_PROVIDER_API_KEY" not in os.environ
+    assert "OTHER_TOKEN" not in os.environ
+    assert load.refused_undeclared == ("FAKE_PROVIDER_API_KEY", "OTHER_TOKEN")
+    assert os.environ["AE_MODEL_NAME"] == "m", "non-credential config is not gated"
+
+
+def test_a_run_may_declare_exactly_the_credential_it_needs(monkeypatch, tmp_path):
+    named = tmp_path / ".env"
+    named.write_text("WANTED_API_KEY=sk-wanted\nUNWANTED_API_KEY=sk-unwanted\n")
+    monkeypatch.delenv("WANTED_API_KEY", raising=False)
+    monkeypatch.delenv("UNWANTED_API_KEY", raising=False)
+    monkeypatch.delenv(settings_module.SCRUBBED_VAR, raising=False)
+
+    load = settings_module.load_credentials(named, allow_credentials=("WANTED_API_KEY",))
+
+    assert os.environ["WANTED_API_KEY"] == "sk-wanted"
+    assert "UNWANTED_API_KEY" not in os.environ
+    assert load.refused_undeclared == ("UNWANTED_API_KEY",)
+
+
+def test_scrub_survives_a_real_subprocess_launch(tmp_path):
+    """End to end, in the shape the operator actually types."""
+    tree = _plant(tmp_path)
+    named = tree["root"] / ".env"
+    probe = (
+        "import json, os, sys; "
+        f"sys.path.insert(0, {str(tree['pkg'])!r}); "
+        "import settings; "
+        f"load = settings.load_credentials({str(named)!r}); "
+        "print(json.dumps({"
+        f"'env': {{k: os.environ.get(k) for k in {_LEAKABLE!r}}}, "
+        "'refused': list(load.refused_scrubbed)}))"
+    )
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(tree["home"]),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "AGENTEVOLVE_SCRUBBED": "OPENAI_API_KEY,ANTHROPIC_API_KEY",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=str(tree["deep"]),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, f"probe failed:\n{proc.stdout}\n{proc.stderr}"
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    assert out["env"]["OPENAI_API_KEY"] is None, "scrubbed key was re-injected"
+    assert out["env"]["ANTHROPIC_API_KEY"] is None, "scrubbed key was re-injected"
+    assert sorted(out["refused"]) == ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+    # The named file was genuinely read -- otherwise this proves nothing.
+    assert out["env"]["AE_DOTENV_SENTINEL"] == "leaked-from-ancestor"
+
+
+def test_no_runner_calls_python_dotenv_directly():
+    """The whole repository must go through the safe loader.
+
+    The audit that found the re-injection defect also found that it survived in
+    the archive by luck: the one runner ever launched with a scrubbed key
+    happened not to call ``load_dotenv``, while the module it imported did --
+    inside a function rather than at import time. Hoisting that one call would
+    have silently defeated every scrubbed launch. This ratchet removes the luck.
+    """
+    repo_root = _SETTINGS_SOURCE.parents[2]
+    offenders = []
+    for path in sorted((repo_root / "src").rglob("*.py")) + sorted(
+        (repo_root / "examples").rglob("*.py")
+    ):
+        if path == _SETTINGS_SOURCE:
+            continue  # the one module allowed to touch python-dotenv
+        try:
+            tree = ast.parse(path.read_text())
+        except (SyntaxError, UnicodeDecodeError):  # pragma: no cover
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name in {"load_dotenv", "find_dotenv", "dotenv_values"}:
+                offenders.append(f"{path.relative_to(repo_root)}:{node.lineno} {name}()")
+
+    assert offenders == [], (
+        "these call python-dotenv directly and so cannot honour AGENTEVOLVE_SCRUBBED; "
+        "use agent_evolve.settings.load_credentials instead:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_an_optional_dotenv_may_be_absent_but_still_enforces_the_scrub(monkeypatch, tmp_path):
+    """Layering a workspace .env over a repository one must tolerate a gap."""
+    monkeypatch.setenv("FAKE_PROVIDER_API_KEY", "sk-fake-exported-earlier")
+    monkeypatch.setenv(settings_module.SCRUBBED_VAR, "FAKE_PROVIDER_API_KEY")
+
+    load = settings_module.load_credentials(tmp_path / "absent.env", optional=True)
+
+    assert load.dotenv_path is None and load.introduced == ()
+    assert "FAKE_PROVIDER_API_KEY" not in os.environ, "a missing file must not skip the scrub"
+
+
+def test_load_credentials_still_refuses_to_search(monkeypatch, tmp_path):
+    """The first defect must not reappear through the new entry point."""
+    dotenv = pytest.importorskip("dotenv")
+    monkeypatch.setattr(
+        dotenv,
+        "find_dotenv",
+        lambda *a, **k: pytest.fail("load_credentials() searched for a .env"),
+    )
+    with pytest.raises(FileNotFoundError):
+        settings_module.load_credentials(tmp_path / "absent.env")

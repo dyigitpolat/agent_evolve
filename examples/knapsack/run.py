@@ -11,12 +11,11 @@ import argparse
 import sys
 from pathlib import Path
 
-import dotenv
-
+from agent_evolve.settings import load_credentials
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 # Repo .env first, then knapsack/.env (later file wins). override=True beats shell/IDE env.
-dotenv.load_dotenv(_REPO_ROOT / ".env", override=True)
-dotenv.load_dotenv(_REPO_ROOT / "examples" / "knapsack" / ".env", override=True)
+load_credentials(_REPO_ROOT / ".env", override=True, optional=True)
+load_credentials(_REPO_ROOT / "examples" / "knapsack" / ".env", override=True, optional=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 

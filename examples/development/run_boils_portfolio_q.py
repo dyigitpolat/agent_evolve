@@ -35,7 +35,7 @@ WORKSPACE_ROOT = AGENT_EVOLVE_ROOT.parent
 if str(AGENT_EVOLVE_ROOT) not in sys.path:
     sys.path.insert(0, str(AGENT_EVOLVE_ROOT))
 
-from dotenv import load_dotenv  # noqa: E402
+from agent_evolve.settings import load_credentials  # noqa: E402
 
 from agent_evolve.agentic import (  # noqa: E402
     AgenticBenchmark,
@@ -1229,8 +1229,8 @@ async def _execute_live(
     planner_journal: DurableJsonlJournal,
     wave_journal: DurableJsonlJournal,
 ) -> dict[str, object]:
-    load_dotenv(WORKSPACE_ROOT / ".env", override=False)
-    load_dotenv(AGENT_EVOLVE_ROOT / ".env", override=False)
+    load_credentials(WORKSPACE_ROOT / ".env", override=False, optional=True)
+    load_credentials(AGENT_EVOLVE_ROOT / ".env", override=False, optional=True)
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is unavailable in live mode")

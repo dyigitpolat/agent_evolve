@@ -29,7 +29,7 @@ WORKSPACE_ROOT = AGENT_EVOLVE_ROOT.parent
 if str(AGENT_EVOLVE_ROOT) not in sys.path:
     sys.path.insert(0, str(AGENT_EVOLVE_ROOT))
 
-from dotenv import load_dotenv
+from agent_evolve.settings import load_credentials
 
 from agent_evolve.application.agentic_evolution import (
     AgenticEvolutionEngine,
@@ -796,7 +796,7 @@ def main() -> None:
     )
     run_dir = args.log_root.resolve() / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
-    load_dotenv(WORKSPACE_ROOT / ".env", override=False)
+    load_credentials(WORKSPACE_ROOT / ".env", override=False, optional=True)
     support._write_json(run_dir / "manifest.json", _manifest(args, run_id))
     try:
         summary = asyncio.run(_run(args, run_dir))

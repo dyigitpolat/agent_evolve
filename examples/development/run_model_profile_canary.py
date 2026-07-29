@@ -27,7 +27,7 @@ WORKSPACE_ROOT = AGENT_EVOLVE_ROOT.parent
 if str(AGENT_EVOLVE_ROOT) not in sys.path:
     sys.path.insert(0, str(AGENT_EVOLVE_ROOT))
 
-from dotenv import load_dotenv  # noqa: E402
+from agent_evolve.settings import load_credentials  # noqa: E402
 from pydantic import BaseModel, ConfigDict, Field, model_validator  # noqa: E402
 
 from agent_evolve.domain.ids import LLMCallId  # noqa: E402
@@ -297,8 +297,8 @@ async def _live(
     # The research workspace owns shared provider credentials; a submodule-local
     # file remains an optional developer override source.  Neither path nor any
     # credential value crosses the durable evidence boundary.
-    load_dotenv(WORKSPACE_ROOT / ".env", override=False)
-    load_dotenv(AGENT_EVOLVE_ROOT / ".env", override=False)
+    load_credentials(WORKSPACE_ROOT / ".env", override=False, optional=True)
+    load_credentials(AGENT_EVOLVE_ROOT / ".env", override=False, optional=True)
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if type(api_key) is not str or not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is unavailable")

@@ -46,7 +46,7 @@ from examples.development.launch_record import (  # noqa: E402
 # only for the provider-free ``prepare`` mode; ``live`` is untouched.
 install_launch_recorder()
 
-from dotenv import load_dotenv  # noqa: E402
+from agent_evolve.settings import load_credentials  # noqa: E402
 
 from agent_evolve.agentic import (  # noqa: E402
     DeterministicIdFactory,
@@ -775,8 +775,8 @@ def _require_source_closure(expected: str) -> dict[str, object]:
 
 
 def _read_live_api_key() -> str:
-    load_dotenv(WORKSPACE_ROOT / ".env", override=False)
-    load_dotenv(AGENT_EVOLVE_ROOT / ".env", override=False)
+    load_credentials(WORKSPACE_ROOT / ".env", override=False, optional=True)
+    load_credentials(AGENT_EVOLVE_ROOT / ".env", override=False, optional=True)
     value = os.environ.get("OPENROUTER_API_KEY")
     if type(value) is not str or not value:
         raise RuntimeError("OPENROUTER_API_KEY is unavailable")

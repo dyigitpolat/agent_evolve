@@ -30,7 +30,7 @@ WORKSPACE_ROOT = AGENT_EVOLVE_ROOT.parent
 if str(AGENT_EVOLVE_ROOT) not in sys.path:
     sys.path.insert(0, str(AGENT_EVOLVE_ROOT))
 
-from dotenv import load_dotenv  # noqa: E402
+from agent_evolve.settings import load_credentials  # noqa: E402
 
 from agent_evolve.application.agentic_evolution import (  # noqa: E402
     ReflectionCallRequest,
@@ -979,8 +979,8 @@ async def _live(
         outbound.append(value)
 
     try:
-        load_dotenv(WORKSPACE_ROOT / ".env", override=False)
-        load_dotenv(AGENT_EVOLVE_ROOT / ".env", override=False)
+        load_credentials(WORKSPACE_ROOT / ".env", override=False, optional=True)
+        load_credentials(AGENT_EVOLVE_ROOT / ".env", override=False, optional=True)
         api_key = os.environ.get("OPENROUTER_API_KEY")
         if type(api_key) is not str or not api_key:
             raise RuntimeError("OpenRouter credential is unavailable")

@@ -30,7 +30,7 @@ WORKSPACE_ROOT = AGENT_EVOLVE_ROOT.parent
 if str(AGENT_EVOLVE_ROOT) not in sys.path:
     sys.path.insert(0, str(AGENT_EVOLVE_ROOT))
 
-from dotenv import load_dotenv  # noqa: E402
+from agent_evolve.settings import load_credentials  # noqa: E402
 
 from agent_evolve.application.agentic_evolution import (  # noqa: E402
     AgenticEvolutionEngine,
@@ -1129,7 +1129,7 @@ def main() -> None:
     event_writer = v1.DurableJsonlWriter(run_dir / "events.jsonl")
     evaluation_writer = v1.DurableJsonlWriter(run_dir / "evaluations.jsonl")
     queue_writer = v1.DurableJsonlWriter(run_dir / "queue_outcomes.jsonl")
-    load_dotenv(WORKSPACE_ROOT / ".env", override=False)
+    load_credentials(WORKSPACE_ROOT / ".env", override=False, optional=True)
     started_ns = time.perf_counter_ns()
     status = "failed"
     try:

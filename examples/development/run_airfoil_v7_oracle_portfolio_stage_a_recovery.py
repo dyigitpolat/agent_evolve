@@ -918,9 +918,9 @@ class LiveDependencies:
 
 def production_dependencies() -> LiveDependencies:
     def load_key() -> str:
-        from dotenv import load_dotenv
+        from agent_evolve.settings import load_credentials
 
-        load_dotenv(WORKSPACE_ROOT / ".env", override=False)
+        load_credentials(WORKSPACE_ROOT / ".env", override=False, optional=True)
         return os.environ.get("OPENROUTER_API_KEY", "")
 
     return LiveDependencies(

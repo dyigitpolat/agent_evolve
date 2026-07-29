@@ -46,6 +46,7 @@ if str(AGENT_EVOLVE_ROOT) not in sys.path:
 
 from pydantic import BaseModel  # noqa: E402
 
+from agent_evolve.settings import load_credentials  # noqa: E402
 from agent_evolve.application.action_allocation import (  # noqa: E402
     GREEDY_RISK_DIVERSITY_ALLOCATOR_DEFINITION_SHA256,
     GREEDY_RISK_DIVERSITY_ALLOCATOR_ID,
@@ -2690,22 +2691,18 @@ def execute_live(
 
 
 def _load_dotenv_api_key() -> str:
-    """Load one credential at the live CLI boundary only."""
+    """Load one credential at the live CLI boundary only.
+
+    Routed through ``load_credentials`` so a name declared in
+    ``AGENTEVOLVE_SCRUBBED`` stays unset. Reading the file directly, as this
+    once did, defeated the scrub outright -- it preferred the file's value over
+    the process environment, so removing the key changed nothing.
+    """
 
     env_path = WORKSPACE_ROOT / ".env"
-    if not env_path.is_file():
-        raise AirfoilTwoStageRunError("workspace .env is unavailable")
-    value: str | None = None
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        name, candidate = line.split("=", 1)
-        if name.strip() == "OPENROUTER_API_KEY":
-            value = candidate.strip().strip('"').strip("'")
-            break
-    if not value:
-        value = os.environ.get("OPENROUTER_API_KEY")
+    if env_path.is_file():
+        load_credentials(env_path, allow_credentials=("OPENROUTER_API_KEY",))
+    value = os.environ.get("OPENROUTER_API_KEY")
     if type(value) is not str or not value:
         raise AirfoilTwoStageRunError("OPENROUTER_API_KEY is unavailable")
     return value

@@ -36,7 +36,7 @@ WORKSPACE_ROOT = AGENT_EVOLVE_ROOT.parent
 if str(AGENT_EVOLVE_ROOT) not in sys.path:
     sys.path.insert(0, str(AGENT_EVOLVE_ROOT))
 
-from dotenv import load_dotenv  # noqa: E402
+from agent_evolve.settings import load_credentials  # noqa: E402
 
 from agent_evolve.application.agentic_evolution import (  # noqa: E402
     AgenticEvolutionEngine,
@@ -2480,7 +2480,7 @@ def main() -> None:
 
         event_writer = DurableJsonlWriter(run_dir / "events.jsonl")
         queue_writer = DurableJsonlWriter(run_dir / "queue_outcomes.jsonl")
-        load_dotenv(WORKSPACE_ROOT / ".env")
+        load_credentials(WORKSPACE_ROOT / ".env", optional=True)
         summary = asyncio.run(
             _run_live(
                 problem=problem,

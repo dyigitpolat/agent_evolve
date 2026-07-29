@@ -43,7 +43,7 @@ from examples.development.launch_record import (  # noqa: E402
 # only for the provider-free ``prepare`` mode; ``live`` is untouched.
 install_launch_recorder()
 
-from dotenv import load_dotenv  # noqa: E402
+from agent_evolve.settings import load_credentials  # noqa: E402
 
 from agent_evolve.agentic import (  # noqa: E402
     BOUNDED_PORTFOLIO_MEMORY_DOSE_POLICY_DEFINITION_SHA256,
@@ -4360,8 +4360,8 @@ def _is_exact_active_neutral_arm_pair(values: tuple[object, ...]) -> bool:
 def _read_live_api_key() -> str:
     """The sole credential-read boundary; prepare and control never call it."""
 
-    load_dotenv(WORKSPACE_ROOT / ".env", override=False)
-    load_dotenv(AGENT_EVOLVE_ROOT / ".env", override=False)
+    load_credentials(WORKSPACE_ROOT / ".env", override=False, optional=True)
+    load_credentials(AGENT_EVOLVE_ROOT / ".env", override=False, optional=True)
     value = os.environ.get("OPENROUTER_API_KEY")
     if type(value) is not str or not value:
         raise RuntimeError("OPENROUTER_API_KEY is unavailable")

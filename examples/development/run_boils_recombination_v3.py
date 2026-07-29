@@ -33,7 +33,7 @@ WORKSPACE_ROOT = AGENT_EVOLVE_ROOT.parent
 if str(AGENT_EVOLVE_ROOT) not in sys.path:
     sys.path.insert(0, str(AGENT_EVOLVE_ROOT))
 
-from dotenv import load_dotenv  # noqa: E402
+from agent_evolve.settings import load_credentials  # noqa: E402
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator  # noqa: E402
 
 from agent_evolve.domain.ids import CandidateId, LLMCallId  # noqa: E402
@@ -1906,7 +1906,7 @@ def main() -> None:
             trace,
             schedule=PHYSICAL_SCHEDULE,
         )
-        load_dotenv(WORKSPACE_ROOT / ".env", override=False)
+        load_credentials(WORKSPACE_ROOT / ".env", override=False, optional=True)
         if support._sha256(run_dir / "runner_source.py") != support._sha256(
             Path(__file__).resolve()
         ):
