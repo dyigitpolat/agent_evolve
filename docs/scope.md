@@ -116,6 +116,21 @@ For the corpus guard the answer was no, and one line of thought would have
 found it. The guard now resolves paths by calling the same helper the loaders
 call, so it cannot answer differently from the code it is protecting.
 
+**And it is not rare.** The count passed eight when a CI workflow was run for
+the first time and immediately found four more: metadata claiming support for
+a Python version the code could not run on, a hand-written list of the failures
+someone happened to see in their own environment, a test asserting which
+exception the interpreter raises rather than what the code guarantees, and
+three existence guards that resolved a path differently from the read two lines
+below them. All four came from a single afternoon of exercising something that
+had never been run.
+
+That is the lesson, and it is not that the codebase is bad. This is simply what
+unexercised checks look like. A check that has never been made to fail is a
+check nobody has evidence about, and the only thing that reliably finds these is
+running the thing you claimed works -- on the version you claimed, in the
+environment you claimed, from the artifact you actually ship.
+
 This is also why `agent_evolve check` exists and why the `random` proposer
 ships as a first-class arm: an optimizer compared only against itself is the
 same pathology at experiment scale.
