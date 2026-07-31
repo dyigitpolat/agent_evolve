@@ -352,7 +352,7 @@ from agent_evolve.integrations.botorch.subprocess_qlognehvi_batch import (  # no
 )
 from agent_evolve.campaign_profiles import CampaignExperimentProfile  # noqa: E402
 from agent_evolve.campaign_presets import (  # noqa: E402
-    SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES,
+    CAMPAIGN_SCALE_SHAPES,
     PortfolioScaleShape,
 )
 from agent_evolve.campaign_variation_topology import (  # noqa: E402
@@ -796,13 +796,13 @@ if GLOBAL_LOCAL_INITIAL_DESIGN:
     CAMPAIGN_SCALE_SHAPE = PortfolioScaleShape("g5_k4_r1", 5, 2, 4, 1)
 elif COMMON_POOL_ACQUISITION:
     try:
-        CAMPAIGN_SCALE_SHAPE = SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES[
+        CAMPAIGN_SCALE_SHAPE = CAMPAIGN_SCALE_SHAPES[
             _SCALE_SHAPE_ID
         ]
     except KeyError as error:
         raise ValueError(
-            "AGENT_EVOLVE_SCALE_SHAPE must name a registered small-budget "
-            "shape: " + ", ".join(SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES)
+            "AGENT_EVOLVE_SCALE_SHAPE must name a registered campaign "
+            "shape: " + ", ".join(CAMPAIGN_SCALE_SHAPES)
         ) from error
 else:
     if _SCALE_SHAPE_ID != "g6_k4_r2":

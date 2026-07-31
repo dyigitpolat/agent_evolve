@@ -164,6 +164,54 @@ SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES = {
 }
 
 
+# Anytime-curve rungs.  Everything above is a near-reference budget, so until
+# now the largest expressible campaign was B40 -- and that was a **registry
+# cap, not a design choice**.  It is the reason every number this project holds
+# sits at B=38: a claim about evaluation efficiency is a claim about a curve,
+# and no curve past B40 could be expressed at all.
+#
+# These rungs are additions.  No entry above is modified, so nothing in flight
+# changes shape underneath it; a run selects by ``shape_id`` and every existing
+# id still resolves to exactly the shape it did before.
+#
+# Budget, from ``planned_offspring_occurrences``:
+#     P * (ceil(G/2) * K + floor(G/2) * R)   plus the two benchmark seeds
+#
+# ``g24_k17_r8`` is the classical-matched rung: 600 offspring + 2 seeds = 602
+# charged occurrences, matching the sealed classical anytime arms' budget of
+# 600 so our curve and NSGA-II's are read on the same axis.  It preserves the
+# reference rung's 2:1 portfolio-to-recombination balance (g6_k4_r2 is K=4,
+# R=2), so it is the same method run longer rather than a different one.
+# ``g12_k8_r4`` is the same balance at 144 + 2 = 146, a cheaper rung for
+# smoking the path before the full curve is bought.
+#
+# ``generation_count`` is independently capped at 24 by ``PortfolioScaleShape``
+# validation, so depth alone cannot reach 600; these rungs buy the remaining
+# budget in width, which is why K is large rather than G.
+ANYTIME_CURVE_CAMPAIGN_SCALE_SHAPES = {
+    value.shape_id: value
+    for value in (
+        PortfolioScaleShape("g12_k8_r4", 12, 2, 8, 4),
+        PortfolioScaleShape("g24_k17_r8", 24, 2, 17, 8),
+    )
+}
+
+
+#: Every registered shape, small-budget and anytime-curve alike.  Lookups that
+#: want the full set use this; the two registries above stay exactly as they
+#: were for any caller that deliberately wants only the near-reference rungs.
+CAMPAIGN_SCALE_SHAPES = {
+    **SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES,
+    **ANYTIME_CURVE_CAMPAIGN_SCALE_SHAPES,
+}
+
+
+CLASSICAL_MATCHED_B602_SCALE_SHAPE = ANYTIME_CURVE_CAMPAIGN_SCALE_SHAPES[
+    "g24_k17_r8"
+]
+ANYTIME_SMOKE_B146_SCALE_SHAPE = ANYTIME_CURVE_CAMPAIGN_SCALE_SHAPES[
+    "g12_k8_r4"
+]
 REFERENCE_36_OFFSPRING_SCALE_SHAPE = EQUAL_36_OFFSPRING_SCALE_SHAPES[
     "g6_k4_r2"
 ]
@@ -456,6 +504,10 @@ class DelayedPortfolioCampaignPreset:
 
 __all__ = [
     "ANCHOR_HEAVY_36_OFFSPRING_SCALE_SHAPE",
+    "ANYTIME_CURVE_CAMPAIGN_SCALE_SHAPES",
+    "ANYTIME_SMOKE_B146_SCALE_SHAPE",
+    "CAMPAIGN_SCALE_SHAPES",
+    "CLASSICAL_MATCHED_B602_SCALE_SHAPE",
     "DelayedPortfolioCampaignPreset",
     "EQUAL_36_OFFSPRING_SCALE_SHAPES",
     "EQUAL_60_OFFSPRING_SCALE_SHAPES",
