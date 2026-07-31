@@ -26,6 +26,12 @@ jobs:
       # The research corpus is not in this repository. Naming a path that does
       # not exist is deliberate: it asserts the guard works, so a corpus-only
       # test is skipped rather than failing CI on a file it was never given.
+      # The shipped surface, in about a second. It fails before the broad
+      # suite spends ten minutes telling you the same thing.
+      - name: Public contract
+        env:
+          AGENTEVOLVE_RESEARCH_CORPUS: /nonexistent
+        run: python -m pytest tests/test_public_contract.py -q
       - name: Test
         env:
           AGENTEVOLVE_RESEARCH_CORPUS: /nonexistent

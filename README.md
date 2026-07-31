@@ -175,8 +175,9 @@ price before it spends anything, so a default nobody chose cannot bill anyone.
 
 ```bash
 pip install 'agent_evolve[dev]'
-python -m pytest tests/              # the shipped package, offline, ~90 seconds
-python -m pytest tests/ -m research  # the research suite; needs the corpus
+python -m pytest tests/test_public_contract.py   # the shipped surface, ~1 second
+python -m pytest tests/                          # the package, offline, ~10 minutes
+python -m pytest tests/ -m research              # the research suite; needs the corpus
 ```
 
 The default run is what someone who cloned this repository can actually use.
