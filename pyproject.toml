@@ -31,6 +31,11 @@ dependencies = [
 # runs -- `proposer="random"` needs no provider and no credentials.
 llm = ["pydantic-ai>=1.0,<2"]
 pydantic_ai = ["pydantic-ai>=1.0,<2"]  # previous name, kept working
+# The numerical acquisition engine. Kept as a proposal source alongside the
+# model, not replaced by it: the model supplies hit rate, the engine supplies
+# the rare large hit that carries a heavy-tailed total, and a good slate
+# composes both. Heavy, so it is opt-in.
+research = ["botorch>=0.11", "numpy>=1.24"]
 dev = ["pytest>=7", "pytest-timeout>=2"]
 all = ["pydantic-ai>=1.0,<2", "pytest>=7", "pytest-timeout>=2"]
 
