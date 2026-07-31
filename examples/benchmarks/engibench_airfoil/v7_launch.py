@@ -24,6 +24,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
+from examples.development.corpus_paths import resolve_corpus_path
+
 from agent_evolve.agentic import (
     AgenticBenchmark,
     AgenticCallTelemetry,
@@ -182,7 +184,12 @@ def _read_route_snapshot(path: Path, *, label: str) -> tuple[dict[str, object], 
     """Read one dated public route snapshot without consulting the network."""
 
     try:
-        content = path.resolve(strict=True).read_bytes()
+        # Resolve across the 2026-07-28 archive split before the strict
+        # resolve. Without it a snapshot that moved intact reported as
+        # "unavailable or malformed", which conflates a file being elsewhere
+        # with its contents being wrong -- two very different findings for
+        # anything that prices a run.
+        content = resolve_corpus_path(path).resolve(strict=True).read_bytes()
         value = json.loads(content)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"{label} route snapshot is unavailable or malformed") from exc
