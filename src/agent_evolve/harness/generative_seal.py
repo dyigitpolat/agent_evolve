@@ -39,6 +39,7 @@ from agent_evolve.domain.generative_emission import (
     GenerativeEmission,
     GenerativeProposalCall,
     SealedGuidanceCall,
+    SealedRunHeader,
     generative_prompt_sha256,
 )
 from agent_evolve.domain.typed_json import freeze_json, thaw_json
@@ -161,6 +162,33 @@ class SealedGenerativeHarness(HarnessBase):
     def _on_bind(self, ctx: HarnessContext, cfg: LLMConfig) -> None:
         if self._delegate is not None:
             self._delegate.bind(ctx, cfg)
+        if self._mode == "record" and not self._calls:
+            # The header opens the chain, before any question is asked, because
+            # it declares which questions this proposer will be asked at all.
+            self._append(
+                SealedRunHeader(
+                    proposer_id=str(getattr(self._delegate, "id", "unknown")),
+                    requested_model=cfg.model,
+                    candidate_schema_sha256=self._schema_sha256,
+                    provides_insights=bool(
+                        getattr(self._delegate, "provides_insights", True)
+                    ),
+                )
+            )
+        elif self._mode == "replay":
+            if not self._sealed or type(self._sealed[0]) is not SealedRunHeader:
+                raise SealedReplayDriftError(
+                    "the sealed journal has no run header, so the recorded "
+                    "proposer's declarations cannot be recovered"
+                )
+            header = self._sealed[0]
+            if header.candidate_schema_sha256 != self._schema_sha256:
+                raise SealedReplayDriftError(
+                    "the sealed run was recorded against a different candidate "
+                    "schema than the one now bound"
+                )
+            self._cursor = 1
+            self._append(header)
 
     def set_call_observer(self, observer) -> None:  # noqa: ANN001 - port signature
         super().set_call_observer(observer)
@@ -182,6 +210,20 @@ class SealedGenerativeHarness(HarnessBase):
 
     @property
     def provides_insights(self) -> bool:
+        """Whether the loop should ask this proposer for guidance at all.
+
+        In replay the answer is *read from the sealed run header*, not guessed
+        and not inferred. The loop skips guidance calls for a proposer that
+        declares it makes none -- an uninformed baseline is exactly that case --
+        so a replay that assumed ``True`` because the delegate is absent issues a
+        call the recording never made, and then reports a drift it invented
+        itself. Inferring it from which guidance calls appear does not work
+        either: a proposer that declines *failure* insights is still asked for
+        the constraint guide, so the journal holds guidance calls in both cases.
+        """
+
+        if self._mode == "replay":
+            return bool(self._sealed[0].provides_insights)
         return bool(getattr(self._delegate, "provides_insights", True))
 
     # -- the seven operations ---------------------------------------------

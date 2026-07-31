@@ -57,11 +57,13 @@ __all__ = [
     "GenerativeProposalCall",
     "MAX_EMISSIONS_PER_CALL",
     "SealedGuidanceCall",
+    "SealedRunHeader",
     "chain_sealed_calls",
     "generative_prompt_sha256",
     "validate_generative_emission",
     "validate_generative_proposal_call",
     "validate_sealed_guidance_call",
+    "validate_sealed_run_header",
 ]
 
 
@@ -87,6 +89,7 @@ _PROMPT_HASH_DOMAIN = b"agent-evolve:generative-proposal-prompt:v1\x00"
 _EMISSION_HASH_DOMAIN = b"agent-evolve:generative-proposal-emission:v1\x00"
 _CALL_HASH_DOMAIN = b"agent-evolve:generative-proposal-call:v1\x00"
 _GUIDANCE_CALL_HASH_DOMAIN = b"agent-evolve:generative-guidance-call:v1\x00"
+_RUN_HEADER_HASH_DOMAIN = b"agent-evolve:generative-run-header:v1\x00"
 
 
 def _frame(payload: bytes) -> bytes:
@@ -291,6 +294,7 @@ class GenerativeProposalCall:
         validate_generative_proposal_call(self)
         return {
             "schema_version": 1,
+            "record_kind": "proposal",
             "call_ordinal": self.call_ordinal,
             "op": self.op,
             "requested_model": self.requested_model,
@@ -392,6 +396,7 @@ class SealedGuidanceCall:
         validate_sealed_guidance_call(self)
         return {
             "schema_version": 1,
+            "record_kind": "guidance",
             "call_ordinal": self.call_ordinal,
             "op": self.op,
             "requested_model": self.requested_model,
@@ -429,6 +434,85 @@ def validate_sealed_guidance_call(call: SealedGuidanceCall) -> None:
     SealedGuidanceCall.__post_init__(call)
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class SealedRunHeader:
+    """The run-level declarations a replay cannot re-derive from the calls.
+
+    ``provides_insights`` is the reason this record exists. The loop skips
+    guidance operations entirely for a proposer that declares it makes none --
+    an uninformed baseline is exactly that case -- and a replay has no delegate
+    to ask. Guessing produced a call the recording never made, and then a drift
+    error about a divergence the replay had itself invented. A declaration that
+    changes which calls happen has to be sealed, not inferred.
+    """
+
+    proposer_id: str
+    requested_model: str
+    candidate_schema_sha256: str
+    provides_insights: bool
+    call_ordinal: int = 0
+    previous_call_sha256: str = GENESIS_CALL_SHA256
+
+    def __post_init__(self) -> None:
+        if type(self.proposer_id) is not str or _TOKEN.fullmatch(
+            self.proposer_id
+        ) is None:
+            raise ValueError("proposer_id must use the closed lowercase token grammar")
+        if (
+            type(self.requested_model) is not str
+            or _MODEL_ID.fullmatch(self.requested_model) is None
+        ):
+            raise ValueError("requested_model must be a closed model identifier")
+        require_sha256(self.candidate_schema_sha256, "candidate_schema_sha256")
+        if type(self.provides_insights) is not bool:
+            raise TypeError("provides_insights must be an exact bool")
+        if self.call_ordinal != 0:
+            raise ValueError("the run header is always the head of the chain")
+        if self.previous_call_sha256 != GENESIS_CALL_SHA256:
+            raise ValueError("the run header follows nothing")
+
+    @property
+    def identity_sha256(self) -> str:
+        validate_sealed_run_header(self)
+        digest = hashlib.sha256()
+        digest.update(_RUN_HEADER_HASH_DOMAIN)
+        digest.update(_frame(self.proposer_id.encode("ascii")))
+        digest.update(_frame(self.requested_model.encode("ascii")))
+        digest.update(bytes.fromhex(self.candidate_schema_sha256))
+        digest.update(b"\x01" if self.provides_insights else b"\x00")
+        return digest.hexdigest()
+
+    def to_record(self) -> dict[str, object]:
+        validate_sealed_run_header(self)
+        return {
+            "schema_version": 1,
+            "record_kind": "run_header",
+            "call_ordinal": 0,
+            "proposer_id": self.proposer_id,
+            "requested_model": self.requested_model,
+            "candidate_schema_sha256": self.candidate_schema_sha256,
+            "provides_insights": self.provides_insights,
+            "previous_call_sha256": self.previous_call_sha256,
+            "call_identity_sha256": self.identity_sha256,
+        }
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not SealedRunHeader or type(other) is not SealedRunHeader:
+            return False
+        return self.to_record() == other.to_record()
+
+    def __hash__(self) -> int:
+        return hash((SealedRunHeader, self.identity_sha256))
+
+
+def validate_sealed_run_header(header: SealedRunHeader) -> None:
+    """Revalidate an exact run header at a public trust boundary."""
+
+    if type(header) is not SealedRunHeader:
+        raise TypeError("header must be an exact SealedRunHeader")
+    SealedRunHeader.__post_init__(header)
+
+
 def chain_sealed_calls(
     calls: tuple[object, ...],
 ) -> str:
@@ -445,9 +529,18 @@ def chain_sealed_calls(
         raise TypeError("calls must be an exact tuple")
     if not calls:
         raise ValueError("a campaign chain requires at least one call")
+    if type(calls[0]) is not SealedRunHeader:
+        raise ValueError(
+            "a sealed chain begins with its run header; without it a replay "
+            "cannot know which operations the recorded proposer declined"
+        )
     previous = GENESIS_CALL_SHA256
     for index, call in enumerate(calls):
-        if type(call) is GenerativeProposalCall:
+        if type(call) is SealedRunHeader:
+            validate_sealed_run_header(call)
+            if index != 0:
+                raise ValueError("a run header can only be the head of the chain")
+        elif type(call) is GenerativeProposalCall:
             validate_generative_proposal_call(call)
         elif type(call) is SealedGuidanceCall:
             validate_sealed_guidance_call(call)

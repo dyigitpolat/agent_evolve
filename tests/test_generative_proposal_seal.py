@@ -22,6 +22,7 @@ from agent_evolve.domain.generative_emission import (
     GENESIS_CALL_SHA256,
     GenerativeEmission,
     GenerativeProposalCall,
+    SealedRunHeader,
     chain_sealed_calls,
     generative_prompt_sha256,
 )
@@ -156,6 +157,15 @@ def test_a_call_that_returned_nothing_cannot_be_sealed_as_a_success():
 # -- the chain -----------------------------------------------------------
 
 
+def _header():
+    return SealedRunHeader(
+        proposer_id="scripted",
+        requested_model="openai/gpt-5.6-luna",
+        candidate_schema_sha256=candidate_schema_sha256(Candidate),
+        provides_insights=True,
+    )
+
+
 def _call(ordinal, previous, x=2):
     return GenerativeProposalCall(
         call_ordinal=ordinal,
@@ -169,15 +179,17 @@ def _call(ordinal, previous, x=2):
 
 
 def test_a_call_that_did_not_happen_cannot_be_spliced_into_the_chain():
-    first = _call(0, GENESIS_CALL_SHA256)
-    second = _call(1, first.identity_sha256)
-    assert chain_sealed_calls((first, second))
+    head = _header()
+    first = _call(1, head.identity_sha256)
+    second = _call(2, first.identity_sha256)
+    assert chain_sealed_calls((head, first, second))
 
-    # The fabrication: a third call inserted between them, claiming the same
-    # predecessor the real second call claims.
-    forged = _call(1, first.identity_sha256, x=8)
+    # The fabrication: an extra call inserted after the first, renumbered so the
+    # ordinals still run 0,1,2,3. It cannot inherit a predecessor digest that
+    # exists, because the call it claims to follow never produced one.
+    forged = _call(2, first.identity_sha256, x=8)
     renumbered = GenerativeProposalCall(
-        call_ordinal=2,
+        call_ordinal=3,
         op=second.op,
         requested_model=second.requested_model,
         prompt_sha256=second.prompt_sha256,
@@ -186,13 +198,26 @@ def test_a_call_that_did_not_happen_cannot_be_spliced_into_the_chain():
         previous_call_sha256=second.previous_call_sha256,
     )
     with pytest.raises(ValueError, match="does not follow"):
-        chain_sealed_calls((first, forged, renumbered))
+        chain_sealed_calls((head, first, forged, renumbered))
 
 
 def test_a_chain_that_starts_mid_run_has_no_head():
-    orphan = _call(0, "a" * 64)
-    with pytest.raises(ValueError, match="does not follow"):
+    orphan = _call(1, "a" * 64)
+    with pytest.raises(ValueError, match="begins with its run header"):
         chain_sealed_calls((orphan,))
+
+
+def test_a_chain_without_its_run_header_does_not_close():
+    """The header declares which operations the proposer declined.
+
+    A chain missing it replays a proposer whose declarations are unknown, and
+    guessing them produces calls the recording never made.
+    """
+
+    head = _header()
+    first = _call(1, head.identity_sha256)
+    with pytest.raises(ValueError, match="begins with its run header"):
+        chain_sealed_calls((first,))
 
 
 # -- record then replay --------------------------------------------------
@@ -230,7 +255,7 @@ def test_the_seal_records_what_validate_said_not_what_the_model_hoped(tmp_path):
     recorder = _bind(build_generative_proposer(problem, delegate=scripted))
     recorder.generate_initial(2)
 
-    call = recorder.calls[0]
+    call = recorder.calls[1]
     assert [e.accepted for e in call.emissions] == [True, False]
     assert "x must be even" in call.emissions[1].rejection_reason
 
@@ -292,14 +317,13 @@ def test_replay_refuses_an_emission_drawn_from_a_different_schema():
         candidate_model = Wider
 
     wider = WiderProblem()
-    replayer = _bind(
-        build_generative_proposer(
-            wider, delegate=None, mode="replay", sealed_calls=recorder.calls
-        ),
-        wider,
-    )
     with pytest.raises(SealedReplayDriftError, match="different candidate schema"):
-        replayer.generate_initial(1)
+        _bind(
+            build_generative_proposer(
+                wider, delegate=None, mode="replay", sealed_calls=recorder.calls
+            ),
+            wider,
+        )
 
 
 def test_replay_cannot_serve_more_calls_than_were_sealed():
@@ -474,7 +498,7 @@ def test_seeds_are_bred_from_rather_than_ignored():
         ),
     )
 
-    ops = [c.op for c in harness.calls]
+    ops = [c.op for c in harness.calls[1:]]
     assert "generate_initial" not in ops, ops
     assert ops[0] == "performance_insights", ops
     assert ops[1] == "generate_offspring", ops
@@ -502,7 +526,7 @@ def test_without_seeds_the_first_call_is_still_initial_sampling():
             use_failure_insights=False,
         ),
     )
-    assert harness.calls[0].op == "generate_initial"
+    assert harness.calls[1].op == "generate_initial"
 
 
 def test_the_default_directives_do_not_describe_one_problems_structure():

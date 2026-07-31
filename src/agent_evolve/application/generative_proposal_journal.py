@@ -24,6 +24,7 @@ from agent_evolve.domain.generative_emission import (
     GenerativeEmission,
     GenerativeProposalCall,
     SealedGuidanceCall,
+    SealedRunHeader,
     chain_sealed_calls,
 )
 from agent_evolve.domain.typed_json import freeze_json
@@ -81,7 +82,15 @@ def write_generative_journal(path: Path, calls: Sequence[Any]) -> str:
 def _call_from_record(record: dict) -> Any:
     if record.get("schema_version") != 1:
         raise ValueError("unsupported sealed call schema_version")
-    if "emissions" in record:
+    kind = record.get("record_kind")
+    if kind == "run_header":
+        call = SealedRunHeader(
+            proposer_id=str(record["proposer_id"]),
+            requested_model=str(record["requested_model"]),
+            candidate_schema_sha256=str(record["candidate_schema_sha256"]),
+            provides_insights=bool(record["provides_insights"]),
+        )
+    elif "emissions" in record:
         emissions = tuple(
             GenerativeEmission(
                 configuration=freeze_json(dict(item["configuration"])),
@@ -138,6 +147,7 @@ def verify_generative_journal(path: Path) -> dict:
 
     calls = read_generative_journal(path)
     terminal = chain_sealed_calls(calls)
+    header = calls[0]
     proposals = tuple(c for c in calls if type(c) is GenerativeProposalCall)
     emitted = sum(len(c.emissions) for c in proposals)
     accepted = sum(1 for c in proposals for e in c.emissions if e.accepted)
@@ -149,9 +159,11 @@ def verify_generative_journal(path: Path) -> dict:
     return {
         "path": str(path),
         "terminal_sha256": terminal,
-        "calls": len(calls),
+        "proposer_id": header.proposer_id,
+        "provides_insights": header.provides_insights,
+        "calls": len(calls) - 1,
         "proposal_calls": len(proposals),
-        "guidance_calls": len(calls) - len(proposals),
+        "guidance_calls": len(calls) - 1 - len(proposals),
         "emitted_configurations": emitted,
         "accepted_configurations": accepted,
         "distinct_accepted_configurations": len(distinct),
