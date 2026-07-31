@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from dataclasses import dataclass, field
 
 from agent_evolve.application.evolution_campaign import ParentVariationBinding
@@ -52,8 +53,16 @@ from agent_evolve.policies.selection.proposal_support import (
 )
 from agent_evolve.ports.decision_metric_projection import DecisionMetricProjection
 from agent_evolve.ports.portfolio_selection import PortfolioSelectionRequest
+from agent_evolve.ports.portfolio_selection import (
+    pairwise_disjoint_parent_patch_pairs,
+    single_path_parent_patch_option_ids,
+)
 from agent_evolve.ports.contextual_search_allocation import (
     ContextualPortfolioAllocationContract,
+)
+from agent_evolve.ports.variation_source import (
+    finite_variation_operator_id,
+    finite_variation_source_id,
 )
 
 
@@ -61,6 +70,74 @@ _OBJECTIVE_DOMAIN = b"agent-evolve:equal-weight-slate-objective:v1\x00"
 _SEMANTIC_OBJECTIVE_DOMAIN = (
     b"agent-evolve:equal-weight-semantic-slate-objective:v1\x00"
 )
+
+
+def _contextual_feasibility_witness_option_ids(
+    *,
+    variation: ParentVariationBinding,
+    allocation: ContextualPortfolioAllocationContract | None,
+) -> tuple[str, ...]:
+    """Recover and revalidate the controller's exact current-contract witness.
+
+    Candidate-pool screening is allowed to shrink semantic-forecast work, but
+    it may not erase the only slate known to realize a prospectively selected
+    source/operator allocation.  The controller exposes only authenticated
+    option identities; this boundary resolves them to request-local opaque IDs
+    and independently checks all generic count and patch constraints.
+    """
+
+    if allocation is None or not (
+        allocation.feasibility_witness_option_identity_sha256s
+    ):
+        return ()
+    allocation.__post_init__()
+    option_by_identity = {
+        value.identity_sha256: value for value in variation.contract.options
+    }
+    identities = allocation.feasibility_witness_option_identity_sha256s
+    try:
+        options = tuple(option_by_identity[value] for value in identities)
+    except KeyError as error:
+        raise ValueError(
+            "contextual feasibility witness escapes the finite variation contract"
+        ) from error
+    option_ids = tuple(sorted(value.option_id for value in options))
+    source_counts = tuple(
+        sorted(Counter(finite_variation_source_id(value) for value in options).items())
+    )
+    operator_counts = tuple(
+        sorted(Counter(finite_variation_operator_id(value) for value in options).items())
+    )
+
+    def with_zero_arms(
+        observed: tuple[tuple[str, int], ...],
+        requested: tuple[tuple[str, int], ...],
+    ) -> tuple[tuple[str, int], ...]:
+        counts = dict(observed)
+        return tuple((arm_id, counts.get(arm_id, 0)) for arm_id, _ in requested)
+
+    if (
+        with_zero_arms(source_counts, allocation.source_target_counts)
+        != allocation.source_target_counts
+        or with_zero_arms(operator_counts, allocation.operator_target_counts)
+        != allocation.operator_target_counts
+    ):
+        raise ValueError(
+            "contextual feasibility witness differs from its source/operator targets"
+        )
+    if len(
+        single_path_parent_patch_option_ids(variation.contract, option_ids)
+    ) < allocation.minimum_single_path_interventions:
+        raise ValueError(
+            "contextual feasibility witness violates its intervention floor"
+        )
+    if len(
+        pairwise_disjoint_parent_patch_pairs(variation.contract, option_ids)
+    ) < allocation.minimum_disjoint_parent_patch_pairs:
+        raise ValueError(
+            "contextual feasibility witness violates its offspring-opportunity floor"
+        )
+    return option_ids
 
 
 def _canonical_json(value: object) -> bytes:
@@ -344,6 +421,12 @@ class CalibratedCampaignBindingFactory:
                 family_min_support=self.family_min_support,
             ),
         )
+        contextual_feasibility_witness_option_ids = (
+            _contextual_feasibility_witness_option_ids(
+                variation=variation,
+                allocation=contextual_allocation,
+            )
+        )
         common_pool = (
             None
             if self.common_candidate_pool_policy is None
@@ -360,6 +443,9 @@ class CalibratedCampaignBindingFactory:
                     request.require_pairwise_disjoint_parent_patches
                 ),
                 required_option_ids=common_pool_required_option_ids(request),
+                certified_feasibility_witness_option_ids=(
+                    contextual_feasibility_witness_option_ids
+                ),
             )
         )
         proposal_support = (

@@ -23,6 +23,7 @@ from agent_evolve.application.portfolio_evolution import (
     PortfolioVariationWaveResult,
 )
 from agent_evolve.domain.patch import require_sha256
+from agent_evolve.ports.variation_source import finite_variation_operator_id
 
 
 _TOKEN = re.compile(r"^[a-z][a-z0-9_.:-]{0,255}$")
@@ -30,10 +31,11 @@ _BATCH_DOMAIN = b"agent-evolve:contextual-portfolio-outcome-batch:v1\x00"
 CONTEXTUAL_PORTFOLIO_OUTCOME_POLICY_ID = (
     "normalized_fixed_reference_contextual_portfolio_outcomes"
 )
-CONTEXTUAL_PORTFOLIO_OUTCOME_POLICY_VERSION = 1
+CONTEXTUAL_PORTFOLIO_OUTCOME_POLICY_VERSION = 2
 CONTEXTUAL_PORTFOLIO_OUTCOME_DEFINITION_SHA256 = hashlib.sha256(
-    b"agent-evolve:normalized-fixed-reference-contextual-portfolio-outcomes:v1;"
-    b"source-labels=framework-injected;operator=atomic-or-composite-family;"
+    b"agent-evolve:normalized-fixed-reference-contextual-portfolio-outcomes:v2;"
+    b"source-labels=framework-injected;"
+    b"operator=sealed-finite-option-evaluation-operator;"
     b"utility=nonnegative-campaign-archive-marginal;normalization=stage-sum;"
     b"infeasible-yield=zero;final-persistence=delayed;descendant=delayed;"
     b"workload-objective-model-provider-fields=false"
@@ -48,12 +50,6 @@ def _canonical_json(value: object) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("ascii", errors="strict")
-
-
-def _operator_id(family: str) -> str:
-    if type(family) is not str or _TOKEN.fullmatch(family) is None:
-        raise ValueError("finite action family must use the closed token grammar")
-    return "composite" if family.startswith("composite") else "atomic"
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +201,10 @@ def observe_contextual_portfolio_outcomes(
     ):
         if not result.action_attributions:
             raise ValueError("contextual credit requires exact action attributions")
+        option_by_id = {
+            value.option_id: value
+            for value in wave.selection_request.finite_variation_contract.options
+        }
         for member, attribution, source, utility in zip(
             result.receipt.members,
             result.action_attributions,
@@ -212,12 +212,17 @@ def observe_contextual_portfolio_outcomes(
             utilities,
             strict=True,
         ):
+            option = option_by_id.get(member.materialization.option_id)
+            if option is None:
+                raise ValueError("evaluated action escapes its sealed finite contract")
+            if option.identity_sha256 != member.materialization.option_identity_sha256:
+                raise ValueError("evaluated action identity differs from its contract")
             observations.append(
                 ContextualSearchObservation(
                     campaign_scope_sha256=campaign_scope_sha256,
                     wave_index=wave_index,
                     source_id=source,
-                    operator_id=_operator_id(attribution.family),
+                    operator_id=finite_variation_operator_id(option),
                     option_identity_sha256=(
                         member.materialization.option_identity_sha256
                     ),

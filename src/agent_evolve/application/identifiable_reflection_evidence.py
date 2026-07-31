@@ -65,6 +65,60 @@ IDENTIFIABLE_REFLECTION_EVIDENCE_POLICY_DEFINITION_SHA256 = hashlib.sha256(
 ).hexdigest()
 
 
+class NoIdentifiableMutationEvidenceError(ValueError):
+    """Typed E0 result for a sealed cutoff with no admissible contrast.
+
+    Absence of an exact single-intervention contrast is an expected scientific
+    outcome, not a provider or campaign failure.  The pure projector retains a
+    ``ValueError`` compatibility boundary for callers that require a snapshot,
+    while publishing the complete exclusion partition so the campaign runtime
+    can convert this condition into an authenticated zero-provider-call
+    abstention.
+    """
+
+    def __init__(
+        self,
+        *,
+        observation_count: int,
+        exclusions: tuple[tuple["ReflectionEvidenceExclusionReason", int], ...],
+    ) -> None:
+        if type(observation_count) is not int or observation_count < 0:
+            raise ValueError("observation_count must be non-negative")
+        if type(exclusions) is not tuple or any(
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not ReflectionEvidenceExclusionReason
+            or type(item[1]) is not int
+            or item[1] <= 0
+            for item in exclusions
+        ):
+            raise TypeError("exclusions must contain typed positive counts")
+        if tuple(reason.value for reason, _ in exclusions) != tuple(
+            sorted({reason.value for reason, _ in exclusions})
+        ):
+            raise ValueError("exclusions must be unique and canonical")
+        if sum(count for _, count in exclusions) != observation_count:
+            raise ValueError("E0 exclusions must partition all observations")
+        super().__init__("sealed cutoff contains no identifiable mutation evidence")
+        self.observation_count = observation_count
+        self.exclusions = exclusions
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "evidence_tier": "e0",
+            "status": "abstained_no_identifiable_mutation_evidence",
+            "observation_count": self.observation_count,
+            "identifiable_contrast_count": 0,
+            "exclusions": [
+                {"reason": reason.value, "count": count}
+                for reason, count in self.exclusions
+            ],
+            "provider_calls": 0,
+            "publishable_reflection_content": False,
+        }
+
+
 def _canonical_json(value: object) -> bytes:
     return json.dumps(
         value,
@@ -1057,7 +1111,12 @@ def project_identifiable_reflection_evidence(
             )
         )
     if not contrasts:
-        raise ValueError("sealed cutoff contains no identifiable mutation evidence")
+        raise NoIdentifiableMutationEvidenceError(
+            observation_count=len(observations),
+            exclusions=tuple(
+                sorted(exclusions.items(), key=lambda value: value[0].value)
+            ),
+        )
     return IdentifiableReflectionEvidenceSnapshot(
         campaign_sha256=campaign_sha256,
         workload_instance_sha256=workload_instance_sha256,
@@ -1077,6 +1136,7 @@ __all__ = [
     "IDENTIFIABLE_REFLECTION_EVIDENCE_POLICY_ID",
     "IDENTIFIABLE_REFLECTION_EVIDENCE_POLICY_VERSION",
     "MAX_REFLECTION_LOCAL_INTERVENTION_VALUE_BYTES",
+    "NoIdentifiableMutationEvidenceError",
     "IdentifiableMutationReflectionContrast",
     "IdentifiableMutationReflectionHypothesisCluster",
     "IdentifiableReflectionEvidenceSnapshot",

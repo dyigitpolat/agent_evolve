@@ -32,6 +32,9 @@ from agent_evolve.domain.patch import require_sha256
 _POST_RECOMBINATION_BATCH_DOMAIN = (
     b"agent-evolve:contextual-post-recombination-credit-batch:v1\x00"
 )
+_POST_STAGE_SURVIVAL_BATCH_DOMAIN = (
+    b"agent-evolve:contextual-post-stage-survival-credit-batch:v1\x00"
+)
 _PERSISTENCE_BATCH_DOMAIN = (
     b"agent-evolve:contextual-terminal-persistence-credit-batch:v1\x00"
 )
@@ -43,6 +46,16 @@ CONTEXTUAL_DELAYED_CREDIT_DEFINITION_SHA256 = hashlib.sha256(
     b"sealed-post-stage-front;descendant=selected-direct-recombinant-survives-"
     b"sealed-post-stage-front;unselected-descendant=unobserved;"
     b"persistence=successful-campaign-terminal-front-membership;"
+    b"availability=strictly-after-source-wave;"
+    b"workload-objective-model-provider-fields=false"
+).hexdigest()
+CONTEXTUAL_POST_STAGE_SURVIVAL_POLICY_ID = "sealed_contextual_stage_survival"
+CONTEXTUAL_POST_STAGE_SURVIVAL_POLICY_VERSION = 1
+CONTEXTUAL_POST_STAGE_SURVIVAL_DEFINITION_SHA256 = hashlib.sha256(
+    b"agent-evolve:sealed-contextual-stage-survival:v1;"
+    b"source=prior-contextual-observations;"
+    b"stage-survival=sealed-post-stage-front-membership;"
+    b"descendant=unobserved-when-no-source-descendant-attempt;"
     b"availability=strictly-after-source-wave;"
     b"workload-objective-model-provider-fields=false"
 ).hexdigest()
@@ -111,6 +124,7 @@ class ContextualPostRecombinationCreditBatch:
         _canonical_candidate_ids(
             self.selected_source_candidate_ids,
             name="selected_source_candidate_ids",
+            allow_empty=True,
         )
         _canonical_candidate_ids(
             self.stage_surviving_source_candidate_ids,
@@ -186,6 +200,127 @@ class ContextualPostRecombinationCreditBatch:
                 "policy_id": CONTEXTUAL_DELAYED_CREDIT_POLICY_ID,
                 "policy_version": CONTEXTUAL_DELAYED_CREDIT_POLICY_VERSION,
                 "definition_sha256": CONTEXTUAL_DELAYED_CREDIT_DEFINITION_SHA256,
+            },
+        }
+
+    def to_record(self) -> dict[str, object]:
+        self.__post_init__()
+        return {
+            **self._unsigned_record(),
+            "credits": [value.to_record() for value in self.credits],
+            "batch_sha256": self.batch_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ContextualPostStageSurvivalCreditBatch:
+    """Persistence evidence when a later stage evaluates no source descendant.
+
+    A capacity broker can legitimately allocate a transition to another
+    proposal expert.  The prior source candidates still acquire observable
+    post-stage frontier-survival outcomes, while descendant usefulness remains
+    unobserved rather than being mislabeled false.
+    """
+
+    campaign_scope_sha256: str
+    source_wave_index: int
+    available_at_wave_index: int
+    stage_request_sha256: str
+    source_observation_sha256s: tuple[str, ...]
+    stage_surviving_source_candidate_ids: tuple[CandidateId, ...]
+    post_stage_front_candidate_ids: tuple[CandidateId, ...]
+    credits: tuple[ContextualSearchDelayedCredit, ...]
+    batch_sha256: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        require_sha256(self.campaign_scope_sha256, "campaign_scope_sha256")
+        require_sha256(self.stage_request_sha256, "stage_request_sha256")
+        if type(self.source_wave_index) is not int or self.source_wave_index <= 0:
+            raise ValueError("source_wave_index must be positive")
+        if (
+            type(self.available_at_wave_index) is not int
+            or self.available_at_wave_index <= self.source_wave_index
+        ):
+            raise ValueError("stage-survival credit must become available later")
+        if (
+            type(self.source_observation_sha256s) is not tuple
+            or not self.source_observation_sha256s
+            or self.source_observation_sha256s
+            != tuple(sorted(set(self.source_observation_sha256s)))
+        ):
+            raise ValueError("source observations must be non-empty and canonical")
+        for value in self.source_observation_sha256s:
+            require_sha256(value, "source_observation_sha256")
+        _canonical_candidate_ids(
+            self.stage_surviving_source_candidate_ids,
+            name="stage_surviving_source_candidate_ids",
+            allow_empty=True,
+        )
+        front = _canonical_candidate_ids(
+            self.post_stage_front_candidate_ids,
+            name="post_stage_front_candidate_ids",
+        )
+        if not set(self.stage_surviving_source_candidate_ids).issubset(front):
+            raise ValueError("stage survivors escape the post-stage front")
+        if (
+            type(self.credits) is not tuple
+            or not self.credits
+            or any(
+                type(value) is not ContextualSearchDelayedCredit
+                for value in self.credits
+            )
+        ):
+            raise ValueError("credits must contain exact delayed-credit values")
+        for value in self.credits:
+            value.__post_init__()
+            if (
+                value.campaign_scope_sha256 != self.campaign_scope_sha256
+                or value.available_at_wave_index != self.available_at_wave_index
+                or value.stage_front_persisted is None
+                or value.final_front_persisted is not None
+                or value.useful_descendant_observed is not None
+            ):
+                raise ValueError("post-stage survival credit differs from its batch")
+        credit_sources = tuple(
+            sorted(value.source_observation_sha256 for value in self.credits)
+        )
+        if credit_sources != self.source_observation_sha256s:
+            raise ValueError("post-stage credits differ from source observations")
+        if tuple(value.credit_sha256 for value in self.credits) != tuple(
+            sorted({value.credit_sha256 for value in self.credits})
+        ):
+            raise ValueError("post-stage credits must be unique and canonical")
+        object.__setattr__(
+            self,
+            "batch_sha256",
+            hashlib.sha256(
+                _POST_STAGE_SURVIVAL_BATCH_DOMAIN
+                + _canonical_json(self._unsigned_record())
+            ).hexdigest(),
+        )
+
+    def _unsigned_record(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "campaign_scope_sha256": self.campaign_scope_sha256,
+            "source_wave_index": self.source_wave_index,
+            "available_at_wave_index": self.available_at_wave_index,
+            "stage_request_sha256": self.stage_request_sha256,
+            "source_observation_sha256s": list(self.source_observation_sha256s),
+            "stage_surviving_source_candidate_ids": [
+                value.value for value in self.stage_surviving_source_candidate_ids
+            ],
+            "post_stage_front_candidate_ids": [
+                value.value for value in self.post_stage_front_candidate_ids
+            ],
+            "credit_sha256s": [value.credit_sha256 for value in self.credits],
+            "descendant_outcome": "unobserved_no_source_descendant_attempt",
+            "policy": {
+                "policy_id": CONTEXTUAL_POST_STAGE_SURVIVAL_POLICY_ID,
+                "policy_version": CONTEXTUAL_POST_STAGE_SURVIVAL_POLICY_VERSION,
+                "definition_sha256": (
+                    CONTEXTUAL_POST_STAGE_SURVIVAL_DEFINITION_SHA256
+                ),
             },
         }
 
@@ -379,6 +514,73 @@ def observe_contextual_post_recombination_credit(
     )
 
 
+def observe_contextual_post_stage_survival(
+    *,
+    campaign_scope_sha256: str,
+    source_wave_index: int,
+    stage_request_sha256: str,
+    observations: tuple[ContextualSearchObservation, ...],
+    post_stage_front_candidate_ids: tuple[CandidateId, ...],
+) -> ContextualPostStageSurvivalCreditBatch:
+    """Adjudicate source persistence when no source descendant was attempted."""
+
+    require_sha256(campaign_scope_sha256, "campaign_scope_sha256")
+    require_sha256(stage_request_sha256, "stage_request_sha256")
+    if type(source_wave_index) is not int or source_wave_index <= 0:
+        raise ValueError("source_wave_index must be positive")
+    if (
+        type(observations) is not tuple
+        or not observations
+        or any(type(value) is not ContextualSearchObservation for value in observations)
+    ):
+        raise ValueError("observations must contain exact contextual values")
+    observation_by_candidate: dict[CandidateId, ContextualSearchObservation] = {}
+    for value in observations:
+        value.__post_init__()
+        if (
+            value.campaign_scope_sha256 != campaign_scope_sha256
+            or value.wave_index != source_wave_index
+        ):
+            raise ValueError("observation differs from the source wave")
+        if value.candidate_id is None:
+            raise ValueError("stage-survival credit requires candidate-bound values")
+        if value.candidate_id in observation_by_candidate:
+            raise ValueError("contextual source wave repeats a candidate")
+        observation_by_candidate[value.candidate_id] = value
+    front = _canonical_candidate_ids(
+        post_stage_front_candidate_ids,
+        name="post_stage_front_candidate_ids",
+    )
+    front_set = set(front)
+    survivors = tuple(sorted(set(observation_by_candidate) & front_set))
+    credits = tuple(
+        sorted(
+            (
+                ContextualSearchDelayedCredit(
+                    campaign_scope_sha256=campaign_scope_sha256,
+                    source_observation_sha256=value.observation_sha256,
+                    available_at_wave_index=source_wave_index + 1,
+                    stage_front_persisted=candidate_id in front_set,
+                )
+                for candidate_id, value in observation_by_candidate.items()
+            ),
+            key=lambda value: value.credit_sha256,
+        )
+    )
+    return ContextualPostStageSurvivalCreditBatch(
+        campaign_scope_sha256=campaign_scope_sha256,
+        source_wave_index=source_wave_index,
+        available_at_wave_index=source_wave_index + 1,
+        stage_request_sha256=stage_request_sha256,
+        source_observation_sha256s=tuple(
+            sorted(value.observation_sha256 for value in observations)
+        ),
+        stage_surviving_source_candidate_ids=survivors,
+        post_stage_front_candidate_ids=front,
+        credits=credits,
+    )
+
+
 def observe_contextual_terminal_persistence(
     *,
     campaign_scope_sha256: str,
@@ -437,8 +639,13 @@ __all__ = [
     "CONTEXTUAL_DELAYED_CREDIT_DEFINITION_SHA256",
     "CONTEXTUAL_DELAYED_CREDIT_POLICY_ID",
     "CONTEXTUAL_DELAYED_CREDIT_POLICY_VERSION",
+    "CONTEXTUAL_POST_STAGE_SURVIVAL_DEFINITION_SHA256",
+    "CONTEXTUAL_POST_STAGE_SURVIVAL_POLICY_ID",
+    "CONTEXTUAL_POST_STAGE_SURVIVAL_POLICY_VERSION",
     "ContextualPostRecombinationCreditBatch",
+    "ContextualPostStageSurvivalCreditBatch",
     "ContextualTerminalPersistenceCreditBatch",
     "observe_contextual_post_recombination_credit",
+    "observe_contextual_post_stage_survival",
     "observe_contextual_terminal_persistence",
 ]

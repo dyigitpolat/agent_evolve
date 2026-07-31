@@ -341,6 +341,23 @@ def pairwise_disjoint_parent_patch_pairs(
     )
 
 
+def single_path_parent_patch_option_ids(
+    contract: FiniteVariationContract,
+    option_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Return canonical options that change exactly one parent-relative path.
+
+    This is structural evidence derived from the sealed finite variation
+    contract.  It carries no objective, workload, model, or provider
+    semantics and is therefore safe for generic trusted allocation code.
+    """
+
+    paths = _parent_patch_paths_by_option(contract, option_ids)
+    return tuple(
+        option_id for option_id in sorted(option_ids) if len(paths[option_id]) == 1
+    )
+
+
 def _validate_family_exposure_bounds(
     values: tuple[tuple[str, int, int], ...],
     *,
@@ -3142,6 +3159,7 @@ __all__ = [
     "finite_option_ids_have_pairwise_disjoint_parent_patch_subset",
     "pairwise_disjoint_parent_patch_witness",
     "pairwise_disjoint_parent_patch_pairs",
+    "single_path_parent_patch_option_ids",
     "project_family_exposure_bounds_to_pairwise_disjoint_feasibility",
     "resolve_ranked_portfolio_decision",
     "validate_card_transfer_score_receipt",

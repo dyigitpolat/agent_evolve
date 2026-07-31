@@ -89,6 +89,7 @@ from agent_evolve.ports.structured_generator import (
     StructuredPromptLineage,
     StructuredStreamCleanupTimeoutError,
     StructuredStreamTimeoutError,
+    StructuredStreamTimeoutPhase,
     identity_prompt_lineage,
 )
 
@@ -151,9 +152,9 @@ _STRUCTURED_OUTPUT_EVIDENCE_FIELDS = frozenset(
     }
 )
 SCHEMA_REPAIR_POLICY_ID = "structured_output_schema_repair"
-SCHEMA_REPAIR_POLICY_VERSION = 3
+SCHEMA_REPAIR_POLICY_VERSION = 4
 SCHEMA_REPAIR_PROMPT_RENDERER_ID = "agent_evolve.schema_repair_prompt"
-SCHEMA_REPAIR_PROMPT_RENDERER_REVISION = "schema_repair_v3"
+SCHEMA_REPAIR_PROMPT_RENDERER_REVISION = "schema_repair_v4"
 MAX_SCHEMA_REPAIR_SUFFIX_UTF8_BYTES = 24_576
 MAX_SCHEMA_REPAIR_SCHEMA_NODES = 4_096
 MAX_SCHEMA_REPAIR_REQUIRED_PATHS = 256
@@ -220,6 +221,28 @@ _SEMANTIC_REPAIR_GUIDANCE: dict[ValidationIssueReasonCode, str] = {
         "Correction: every metric prediction must use an adjudicable non-unknown "
         "direction and an explicitly allowed comparison anchor; supply a source "
         "role only when that anchor kind requires one."
+    ),
+    ValidationIssueReasonCode.RESIDUAL_RADIUS_CONTRACT_VIOLATION: (
+        "Correction: every residual member must contain exactly an allowed "
+        "number of component_option_ids."
+    ),
+    ValidationIssueReasonCode.RESIDUAL_OPTION_CONTRACT_VIOLATION: (
+        "Correction: within each residual member, use distinct option IDs that "
+        "are all available for its selected parent; a two-option member must "
+        "copy one of that parent's declared safe disjoint pairs."
+    ),
+    ValidationIssueReasonCode.RESIDUAL_METRIC_CONTRACT_VIOLATION: (
+        "Correction: within every residual member, emit each required metric "
+        "exactly once and emit no other metric."
+    ),
+    ValidationIssueReasonCode.RESIDUAL_QUANTILE_ORDER_VIOLATION: (
+        "Correction: every metric forecast must contain finite raw deltas in "
+        "nondecreasing order: p10_delta <= p50_delta <= p90_delta."
+    ),
+    ValidationIssueReasonCode.RESIDUAL_PLAN_DIVERSITY_VIOLATION: (
+        "Correction: residual members must be distinct parent-relative plans "
+        "and collectively cover at least the requested number of distinct "
+        "parents."
     ),
 }
 _DEFAULT_SEMANTIC_REPAIR_GUIDANCE = (
@@ -1421,7 +1444,7 @@ class SchemaRepairAttemptPolicy:
             prompt=repaired_prompt,
             prompt_lineage=_schema_repair_prompt_lineage(request),
         )
-        return self._prepared(repaired, AttemptRequestVariant.SCHEMA_REPAIR_V3)
+        return self._prepared(repaired, AttemptRequestVariant.SCHEMA_REPAIR_V4)
 
 
 class ExactTransportSchemaRepairAttemptPolicy:
@@ -1451,7 +1474,7 @@ class ExactTransportSchemaRepairAttemptPolicy:
         if context.active_output_failure is None:
             return self._exact.request_for_attempt(request, context=context)
         prepared = self._repair.request_for_attempt(request, context=context)
-        if prepared.evidence.variant is not AttemptRequestVariant.SCHEMA_REPAIR_V3:
+        if prepared.evidence.variant is not AttemptRequestVariant.SCHEMA_REPAIR_V4:
             raise StructuredGenerationError(
                 kind=GenerationFailureKind.INVALID_REQUEST,
                 retryable=False,
@@ -1792,6 +1815,91 @@ class OpaqueHTTP400OnceRetryClassifier:
         return classified
 
 
+class BoundedOpaqueHTTP400RetryClassifier:
+    """Retry an identical opaque pre-stream HTTP 400 to the task budget.
+
+    A provider can transiently reject several byte-identical, contract-valid
+    requests before accepting the next replay.  This policy remains narrower
+    than treating HTTP 400 as generally retryable:
+
+    * the response must be an ``invalid_request`` status 400 with a redacted
+      envelope fingerprint and no typed provider code or validation detail;
+    * every preceding failure in the replay chain must have the same envelope
+      fingerprint and the same closed failure shape; and
+    * the queue's immutable ``LLMTask.max_attempts`` remains the hard bound.
+
+    Composition roots must pair this classifier with an exact-payload attempt
+    policy.  Actionable 4xx responses, post-content stream failures, and a
+    changed opaque envelope remain terminal.
+    """
+
+    def __init__(self) -> None:
+        self._non_repeating = NonRepeatingStreamTransportRetryClassifier()
+
+    @staticmethod
+    def _is_opaque_http_400(
+        error: StructuredGenerationError,
+    ) -> bool:
+        return (
+            error.kind is GenerationFailureKind.INVALID_REQUEST
+            and error.status_code == 400
+            and error.provider_error_code is None
+            and error.provider_error_envelope_sha256 is not None
+            and error.retry_after_seconds is None
+            and error.output_failure_mode is None
+            and not error.validation_issues
+        )
+
+    @staticmethod
+    def _continues_same_chain(
+        *,
+        error: StructuredGenerationError,
+        context: LLMAttemptContext,
+    ) -> bool:
+        if context.attempt_number == 1:
+            return context.previous_failure is None
+        previous = context.previous_failure
+        return (
+            previous is not None
+            and previous.kind
+            == GenerationFailureKind.INVALID_REQUEST.value
+            and previous.status_code == 400
+            and previous.provider_error_code is None
+            and previous.provider_error_envelope_sha256
+            == error.provider_error_envelope_sha256
+            and previous.retry_after_seconds is None
+            and previous.output_failure_mode is None
+            and not previous.validation_issues
+            and context.active_output_failure is None
+        )
+
+    def classify(
+        self,
+        error: Exception,
+        *,
+        context: LLMAttemptContext,
+    ) -> RetryClassification:
+        classified = self._non_repeating.classify(
+            error,
+            context=context,
+        )
+        if not (
+            classified.disposition is RetryDisposition.FAIL
+            and isinstance(error, StructuredGenerationError)
+            and self._is_opaque_http_400(error)
+            and self._continues_same_chain(
+                error=error,
+                context=context,
+            )
+        ):
+            return classified
+        return RetryClassification(
+            disposition=RetryDisposition.RETRY,
+            reason=RetryReason.TRANSIENT,
+            sanitized_failure=classified.sanitized_failure,
+        )
+
+
 class OpaqueHTTP400AndSchemaRepairOnceRetryClassifier:
     """Combine exact opaque-400 recovery with one strict output repair.
 
@@ -1869,6 +1977,102 @@ class OpaqueHTTP400AndBoundedSchemaRepairRetryClassifier:
             and repair.reason is RetryReason.OUTPUT_INVALID
         ):
             return repair
+        return classified
+
+
+class FirstEventResilientBoundedSchemaRepairRetryClassifier:
+    """Recover a content-blind first-event timeout inside one logical sample.
+
+    This policy preserves the opaque-HTTP-400 and bounded schema-repair
+    semantics of :class:`OpaqueHTTP400AndBoundedSchemaRepairRetryClassifier`.
+    It additionally retries a supervised ``FIRST_EVENT`` timeout because no
+    provider content was observed and therefore no candidate outcome can be
+    selected or discarded.  ``IDLE`` and ``ABSOLUTE`` timeouts remain
+    terminal because they follow observable stream progress, as do cleanup
+    timeouts whose underlying attempt may still be running.
+
+    The queue's immutable attempt and partitioned retry budgets remain the
+    hard bounds.  Composition roots must pair this classifier with an exact
+    transport/schema-repair attempt policy so the retry continues the same
+    recorded logical sample rather than silently changing its prompt.
+    """
+
+    def __init__(self) -> None:
+        self._bounded_schema_repair = (
+            OpaqueHTTP400AndBoundedSchemaRepairRetryClassifier()
+        )
+        self._structured = StructuredGenerationRetryClassifier()
+
+    def classify(
+        self,
+        error: Exception,
+        *,
+        context: LLMAttemptContext,
+    ) -> RetryClassification:
+        classified = self._bounded_schema_repair.classify(error, context=context)
+        if not (
+            isinstance(error, StructuredStreamTimeoutError)
+            and error.phase is StructuredStreamTimeoutPhase.FIRST_EVENT
+        ):
+            return classified
+        retry = self._structured.classify(error, context=context)
+        if (
+            retry.disposition is RetryDisposition.RETRY
+            and retry.reason is RetryReason.TIMEOUT
+        ):
+            return retry
+        return classified
+
+
+class BoundedPrestreamAndSchemaRepairRetryClassifier:
+    """Bound opaque pre-stream recovery, schema repair, and first-event retry.
+
+    This is the long-running campaign policy.  It preserves exact request
+    bytes across opaque HTTP-400 and transport retries, admits bounded repair
+    resampling only after typed invalid output, and retries only the
+    content-blind first-event stream timeout.  Idle, absolute, and cleanup
+    timeouts remain terminal.
+    """
+
+    def __init__(self) -> None:
+        self._opaque_http_400 = BoundedOpaqueHTTP400RetryClassifier()
+        self._structured = StructuredGenerationRetryClassifier()
+
+    def classify(
+        self,
+        error: Exception,
+        *,
+        context: LLMAttemptContext,
+    ) -> RetryClassification:
+        classified = self._opaque_http_400.classify(
+            error,
+            context=context,
+        )
+        if (
+            isinstance(error, StructuredGenerationError)
+            and error.kind is GenerationFailureKind.OUTPUT_INVALID
+            and error.retryable
+        ):
+            repair = self._structured.classify(
+                error,
+                context=context,
+            )
+            if (
+                repair.disposition is RetryDisposition.RETRY
+                and repair.reason is RetryReason.OUTPUT_INVALID
+            ):
+                return repair
+        if not (
+            isinstance(error, StructuredStreamTimeoutError)
+            and error.phase is StructuredStreamTimeoutPhase.FIRST_EVENT
+        ):
+            return classified
+        retry = self._structured.classify(error, context=context)
+        if (
+            retry.disposition is RetryDisposition.RETRY
+            and retry.reason is RetryReason.TIMEOUT
+        ):
+            return retry
         return classified
 
 
@@ -2412,9 +2616,12 @@ __all__ = [
     "StructuredGenerationExecutor",
     "StructuredGenerationRetryClassifier",
     "NonRepeatingStreamTransportRetryClassifier",
+    "BoundedOpaqueHTTP400RetryClassifier",
+    "BoundedPrestreamAndSchemaRepairRetryClassifier",
     "OpaqueHTTP400OnceRetryClassifier",
     "OpaqueHTTP400AndSchemaRepairOnceRetryClassifier",
     "OpaqueHTTP400AndBoundedSchemaRepairRetryClassifier",
+    "FirstEventResilientBoundedSchemaRepairRetryClassifier",
     "TransportOnlyStructuredGenerationRetryClassifier",
     "create_production_queued_runner",
     "structured_generation_output_evidence_record",

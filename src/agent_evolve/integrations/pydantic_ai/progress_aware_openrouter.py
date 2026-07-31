@@ -26,8 +26,10 @@ from agent_evolve.integrations.pydantic_ai.json_schema_dialect import (
     OpenRouterJsonSchemaDialect,
 )
 from agent_evolve.integrations.pydantic_ai.queued_runner import (
+    BoundedPrestreamAndSchemaRepairRetryClassifier,
     ExactPayloadAttemptPolicy,
     ExactTransportSchemaRepairAttemptPolicy,
+    FirstEventResilientBoundedSchemaRepairRetryClassifier,
     NonRepeatingStreamTransportRetryClassifier,
     OpaqueHTTP400AndBoundedSchemaRepairRetryClassifier,
     OpaqueHTTP400AndSchemaRepairOnceRetryClassifier,
@@ -64,12 +66,20 @@ class ProgressAwareRetryMode(str, Enum):
     OPAQUE_HTTP_400_AND_BOUNDED_SCHEMA_REPAIR = (
         "opaque_http_400_and_bounded_schema_repair"
     )
+    FIRST_EVENT_RESILIENT_BOUNDED_SCHEMA_REPAIR = (
+        "first_event_resilient_bounded_schema_repair"
+    )
+    BOUNDED_PRESTREAM_AND_SCHEMA_REPAIR = (
+        "bounded_prestream_and_schema_repair"
+    )
 
 
 _SCHEMA_REPAIR_RETRY_MODES = frozenset(
     {
         ProgressAwareRetryMode.OPAQUE_HTTP_400_AND_SCHEMA_REPAIR_ONCE,
         ProgressAwareRetryMode.OPAQUE_HTTP_400_AND_BOUNDED_SCHEMA_REPAIR,
+        ProgressAwareRetryMode.FIRST_EVENT_RESILIENT_BOUNDED_SCHEMA_REPAIR,
+        ProgressAwareRetryMode.BOUNDED_PRESTREAM_AND_SCHEMA_REPAIR,
     }
 )
 
@@ -242,7 +252,7 @@ class ProgressAwareOpenRouterConfig:
                 ),
                 "attempt_timeout_ns": None,
                 "attempt_request_policy": (
-                    "exact_transport_schema_repair_v3"
+                    "exact_transport_schema_repair_v4"
                     if self.retry_mode in _SCHEMA_REPAIR_RETRY_MODES
                     else "exact_payload"
                 ),
@@ -388,6 +398,12 @@ def create_progress_aware_openrouter_runner(
             ),
             ProgressAwareRetryMode.OPAQUE_HTTP_400_AND_BOUNDED_SCHEMA_REPAIR: (
                 OpaqueHTTP400AndBoundedSchemaRepairRetryClassifier
+            ),
+            ProgressAwareRetryMode.FIRST_EVENT_RESILIENT_BOUNDED_SCHEMA_REPAIR: (
+                FirstEventResilientBoundedSchemaRepairRetryClassifier
+            ),
+            ProgressAwareRetryMode.BOUNDED_PRESTREAM_AND_SCHEMA_REPAIR: (
+                BoundedPrestreamAndSchemaRepairRetryClassifier
             ),
         }[config.retry_mode](),
     )

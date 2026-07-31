@@ -239,10 +239,10 @@ class FinitePortfolioActionSemanticsCompiler:
     """Default structural semantics for one engine-materialized finite option."""
 
     compiler_id: str = "finite_portfolio_action_semantics"
-    compiler_version: int = 2
+    compiler_version: int = 3
     definition_sha256: str = hashlib.sha256(
-        b"agent-evolve:finite-portfolio-action-semantics:v2;"
-        b"exact-finite-contract-identity"
+        b"agent-evolve:finite-portfolio-action-semantics:v3;"
+        b"exact-finite-contract-identity;intervention-arity-from-changed-paths"
     ).hexdigest()
 
     def compile(
@@ -276,7 +276,11 @@ class FinitePortfolioActionSemanticsCompiler:
         )
         return CampaignObservedActionSemantics(
             observed_action=action,
-            intervention_identifiability=(InterventionIdentifiability.EXACT_SINGLE),
+            intervention_identifiability=(
+                InterventionIdentifiability.EXACT_SINGLE
+                if len(context.changed_paths) == 1
+                else InterventionIdentifiability.JOINT_WITHOUT_ABLATION
+            ),
             mechanism_identifying_design=False,
             compiler_id=self.compiler_id,
             compiler_version=self.compiler_version,

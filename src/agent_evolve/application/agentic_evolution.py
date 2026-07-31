@@ -3753,6 +3753,102 @@ class AgenticEvolutionEngine:
         )
         return candidate
 
+    async def register_materialized_candidate(
+        self,
+        configuration: dict[str, Any],
+        *,
+        label: str,
+        generation: int,
+        proposal_source_id: str,
+        proposal_source_version: int,
+        proposal_source_definition_sha256: str,
+        proposal_decision_sha256: str,
+        proposal_rank: int,
+        candidate_id: CandidateId | None = None,
+    ) -> EvolutionCandidate:
+        """Evaluate a full configuration selected by an injected search expert.
+
+        The expert owns proposal generation and selection; the engine retains
+        candidate identity, evaluation/cache semantics, and trace authority.
+        This is intentionally distinct from ``register_seed`` so acquisition,
+        specialist incumbents, and future proxy-gated experts cannot disappear
+        into seed provenance.
+        """
+
+        if type(configuration) is not dict:
+            raise TypeError("configuration must be an exact dict")
+        if type(label) is not str or not label.strip():
+            raise ValueError("label must be non-empty")
+        if type(generation) is not int or generation <= 0:
+            raise ValueError("generation must be positive")
+        if (
+            type(proposal_source_id) is not str
+            or not proposal_source_id.isascii()
+            or not proposal_source_id
+            or proposal_source_id != proposal_source_id.strip()
+            or any(value.isspace() for value in proposal_source_id)
+        ):
+            raise ValueError("proposal_source_id must be a canonical ASCII token")
+        if type(proposal_source_version) is not int or proposal_source_version <= 0:
+            raise ValueError("proposal_source_version must be positive")
+        require_sha256(
+            proposal_source_definition_sha256,
+            "proposal_source_definition_sha256",
+        )
+        require_sha256(proposal_decision_sha256, "proposal_decision_sha256")
+        if type(proposal_rank) is not int or proposal_rank <= 0:
+            raise ValueError("proposal_rank must be positive")
+
+        occurrence, frozen = self._new_occurrence(
+            configuration,
+            operator_invocation_id=None,
+            candidate_id=candidate_id,
+        )
+        valid, objectives, failure, detailed, resolution = await self._evaluate(frozen)
+        candidate = EvolutionCandidate(
+            occurrence=occurrence,
+            configuration=frozen,
+            objectives=objectives,
+            valid=valid,
+            generation=generation,
+            label=label,
+            design_rationale=(
+                f"Full configuration selected by {proposal_source_id} "
+                f"rank {proposal_rank}."
+            ),
+            failure_message=failure,
+            detailed_evaluation=detailed,
+            objective_resolution_receipt=resolution,
+        )
+        self._emit(
+            "materialized_candidate_registered",
+            candidate_id=candidate.candidate_id.value,
+            generation=generation,
+            label=label,
+            valid=valid,
+            configuration=candidate.configuration_dict,
+            objectives=candidate.objective_map,
+            failure=failure,
+            proposal_source={
+                "source_id": proposal_source_id,
+                "source_version": proposal_source_version,
+                "definition_sha256": proposal_source_definition_sha256,
+                "decision_sha256": proposal_decision_sha256,
+                "rank": proposal_rank,
+            },
+            **(
+                {}
+                if detailed is None
+                else {"detailed_evaluation": detailed.to_record()}
+            ),
+            **(
+                {}
+                if resolution is None
+                else {"objective_resolution": resolution.to_record()}
+            ),
+        )
+        return candidate
+
     def _obligation_requests(
         self, classification: ThreeWayPatchClassification
     ) -> tuple[PreservationObligationRequest, ...]:

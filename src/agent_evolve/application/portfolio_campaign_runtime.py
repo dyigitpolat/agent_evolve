@@ -23,6 +23,7 @@ import json
 import math
 import re
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from agent_evolve.agentic import PhenotypeIdentity, PortfolioEvolutionComposition
@@ -50,6 +51,13 @@ from agent_evolve.application.campaign_execution import (
     CampaignStageReceipt,
     CampaignStageRequest,
     SelectorAuditExecutionMode,
+    encode_selector_audit_text,
+)
+from agent_evolve.application.campaign_capacity_recourse import (
+    CampaignCapacityRecoursePort,
+    CampaignCapacityRecourseRequest,
+    validate_campaign_capacity_recourse_port,
+    validate_campaign_capacity_recourse_result,
 )
 from agent_evolve.application.concurrent_stage import gather_concurrent_stage
 from agent_evolve.application.contextual_campaign_planning import (
@@ -57,6 +65,7 @@ from agent_evolve.application.contextual_campaign_planning import (
 )
 from agent_evolve.application.contextual_delayed_credit import (
     observe_contextual_post_recombination_credit,
+    observe_contextual_post_stage_survival,
     observe_contextual_terminal_persistence,
 )
 from agent_evolve.application.evolution_campaign import (
@@ -79,8 +88,17 @@ from agent_evolve.application.campaign_search_phase import (
     attach_campaign_search_phase_context,
     campaign_search_phase_context,
 )
+from agent_evolve.application.campaign_variation_envelope import (
+    CampaignVariationEnvelopeLane,
+    CampaignVariationEnvelopePolicy,
+    CampaignVariationEnvelopeRequest,
+    campaign_variation_envelope_context_record,
+    campaign_variation_envelope_trace_record,
+    validate_campaign_variation_envelope_result,
+)
 from agent_evolve.application.identifiable_reflection_evidence import (
     IdentifiableReflectionEvidenceSnapshot,
+    NoIdentifiableMutationEvidenceError,
     ReflectionFalsificationFeedback,
     project_identifiable_reflection_evidence,
 )
@@ -178,6 +196,7 @@ _CAMPAIGN_ROLE_TOKEN = re.compile(r"^[a-z][a-z0-9_.-]{0,95}$")
 CAMPAIGN_CONTEXTUAL_HISTORY_KEY = "campaign_contextual_history"
 CAMPAIGN_ARCHIVE_CONTEXT_KEY = "campaign_archive_context"
 CAMPAIGN_FRONTIER_TARGET_KEY = "campaign_frontier_target"
+CAMPAIGN_VARIATION_ENVELOPE_KEY = "campaign_variation_envelope"
 CAMPAIGN_IDENTIFIABLE_REFLECTION_BINDING_KEY = (
     "campaign_identifiable_reflection_binding"
 )
@@ -193,6 +212,21 @@ _WAVE_PREPARATION_DOMAIN = b"agent-evolve:campaign-portfolio-wave-preparation:v1
 _IDENTIFIABLE_REFLECTION_QUERY_DOMAIN = (
     b"agent-evolve:campaign-identifiable-reflection-query:v1\x00"
 )
+
+
+class RecombinationEvaluationAllocationMode(str, Enum):
+    """Choose which generic proposal port receives recombination capacity.
+
+    ``NATIVE_THEN_RECOURSE`` preserves the production behavior: evaluate the
+    replay-safe native recombination slate and ask the injected recourse port
+    only to fill unused occurrences.  ``RECOURSE_ONLY`` is an explicit
+    prospective ablation that gives the complete stage budget to the recourse
+    specialist.  Neither mode names a workload, objective, provider, or
+    concrete proposal algorithm.
+    """
+
+    NATIVE_THEN_RECOURSE = "native_then_recourse"
+    RECOURSE_ONLY = "recourse_only"
 _IDENTIFIABLE_REFLECTION_SOURCE_DOMAIN = (
     b"agent-evolve:campaign-identifiable-reflection-source:v1\x00"
 )
@@ -2624,6 +2658,7 @@ class AgenticPortfolioCampaignRuntime:
     context_enricher: CampaignPortfolioContextEnricher | None = None
     contextual_search_planner: CampaignContextualSearchPlanner | None = None
     frontier_target_allocator: CampaignPortfolioFrontierTargetAllocator | None = None
+    variation_envelope: CampaignVariationEnvelopePolicy | None = None
     memory_estimand_projector: CampaignPortfolioMemoryEstimandProjector | None = None
     learning_lifecycle: CampaignLearningLifecyclePort | None = None
     identifiable_reflection_executor: CampaignReflectionExecutor | None = None
@@ -2641,6 +2676,10 @@ class AgenticPortfolioCampaignRuntime:
     recombination_utility_binder: CampaignRecombinationUtilityBinder | None = None
     owned_resources: CampaignOwnedRuntimeResourcePort | None = None
     recombination: PortfolioRecombination | None = None
+    capacity_recourse: CampaignCapacityRecoursePort | None = None
+    recombination_evaluation_allocation_mode: RecombinationEvaluationAllocationMode = (
+        RecombinationEvaluationAllocationMode.NATIVE_THEN_RECOURSE
+    )
     selector_request_prompt_renderer: CampaignSelectorRequestPromptRenderer | None = (
         None
     )
@@ -2683,6 +2722,10 @@ class AgenticPortfolioCampaignRuntime:
         str,
         CampaignIdentifiableReflectionInput,
     ] = field(init=False, default_factory=dict)
+    _identifiable_reflection_abstentions: dict[str, FrozenJsonObject] = field(
+        init=False,
+        default_factory=dict,
+    )
     _consumed_reflection_source_evidence_ids: set[str] = field(
         init=False,
         default_factory=set,
@@ -2746,6 +2789,13 @@ class AgenticPortfolioCampaignRuntime:
             raise ValueError(
                 "contextual and standalone frontier target allocation are mutually "
                 "exclusive"
+            )
+        if self.variation_envelope is not None and not isinstance(
+            self.variation_envelope,
+            CampaignVariationEnvelopePolicy,
+        ):
+            raise TypeError(
+                "variation_envelope must implement CampaignVariationEnvelopePolicy"
             )
         if self.memory_estimand_projector is not None and not isinstance(
             self.memory_estimand_projector,
@@ -2834,6 +2884,20 @@ class AgenticPortfolioCampaignRuntime:
             raise TypeError(
                 "recombination_utility_binder must implement its runtime port"
             )
+        if self.capacity_recourse is not None:
+            validate_campaign_capacity_recourse_port(self.capacity_recourse)
+        if type(self.recombination_evaluation_allocation_mode) is not (
+            RecombinationEvaluationAllocationMode
+        ):
+            raise TypeError(
+                "recombination_evaluation_allocation_mode must be exact"
+            )
+        if (
+            self.recombination_evaluation_allocation_mode
+            is RecombinationEvaluationAllocationMode.RECOURSE_ONLY
+            and self.capacity_recourse is None
+        ):
+            raise ValueError("recourse-only allocation requires a recourse port")
         if self.owned_resources is not None and not isinstance(
             self.owned_resources, CampaignOwnedRuntimeResourcePort
         ):
@@ -3209,8 +3273,11 @@ class AgenticPortfolioCampaignRuntime:
                 "selector_call_id": wave.selection_request.call_id.value,
                 "request_sha256": wave.selection_request.request_sha256,
                 "decision_sha256": decision.decision_sha256,
-                "request_text": request_text,
-                "response_text": _canonical_text(response),
+                **encode_selector_audit_text("request_text", request_text),
+                **encode_selector_audit_text(
+                    "response_text",
+                    _canonical_text(response),
+                ),
                 "request_text_kind": "exact_framework_prompt",
                 "response_text_kind": "trusted_structured_decision_projection",
             }
@@ -3265,18 +3332,92 @@ class AgenticPortfolioCampaignRuntime:
         build_hashes: list[tuple[str, str]] = []
         wave_preparations: list[CampaignPortfolioWavePreparationReceipt] = []
         lanes_by_id = {lane.lane_id: lane for lane in selection.lanes}
-        for parent_slot, decision_slot in enumerate(selection.decision_slots):
-            parent_lane = lanes_by_id[decision_slot.lane_id]
-            parent = parent_lane.parent
-            variation = self.workload_ports.catalog.bind(
+        lane_inputs = tuple(
+            (
+                parent_slot,
+                decision_slot,
+                lanes_by_id[decision_slot.lane_id],
+            )
+            for parent_slot, decision_slot in enumerate(selection.decision_slots)
+        )
+        base_variations = tuple(
+            self.workload_ports.catalog.bind(
                 self.prepared.benchmark_session.benchmark,
-                parent.configuration,
+                parent_lane.parent.configuration,
                 known,
             )
+            for _, _, parent_lane in lane_inputs
+        )
+        variation_envelope_evidence: dict[str, object] | None = None
+        variation_envelope_trace: dict[str, object] | None = None
+        variations = base_variations
+        if self.variation_envelope is not None:
+            envelope_request = CampaignVariationEnvelopeRequest(
+                campaign_scope_sha256=self.task_sha256,
+                generation=step.generation,
+                evaluation_slots_per_lane=step.offspring_per_parent,
+                state=state,
+                archive_utility=request.archive_utility,
+                lanes=tuple(
+                    sorted(
+                        (
+                            CampaignVariationEnvelopeLane(
+                                lane_id=parent_lane.lane_id,
+                                parent=parent_lane.parent,
+                                base_variation=variation,
+                            )
+                            for (_, _, parent_lane), variation in zip(
+                                lane_inputs,
+                                base_variations,
+                                strict=True,
+                            )
+                        ),
+                        key=lambda value: value.lane_id,
+                    )
+                ),
+            )
+            envelope_result = self.variation_envelope.enrich(envelope_request)
+            validate_campaign_variation_envelope_result(
+                policy=self.variation_envelope,
+                request=envelope_request,
+                result=envelope_result,
+            )
+            variation_by_lane = {
+                value.lane_id: value.variation for value in envelope_result.lanes
+            }
+            variations = tuple(
+                variation_by_lane[parent_lane.lane_id]
+                for _, _, parent_lane in lane_inputs
+            )
+            variation_envelope_evidence = (
+                campaign_variation_envelope_context_record(envelope_result)
+            )
+            variation_envelope_trace = campaign_variation_envelope_trace_record(
+                request=envelope_request,
+                result=envelope_result,
+            )
+
+        for (
+            parent_slot,
+            decision_slot,
+            parent_lane,
+        ), base_variation, variation in zip(
+            lane_inputs,
+            base_variations,
+            variations,
+            strict=True,
+        ):
+            parent_lane = lanes_by_id[decision_slot.lane_id]
+            parent = parent_lane.parent
+            # Workload evidence is owned by the workload catalog authority and
+            # therefore remains bound to its exact issued base view.  External
+            # proposal experts carry their own authenticated envelope evidence;
+            # requiring a workload adapter to reissue every generic expert
+            # union would couple the inverted API back to individual experts.
             evidence_context = self.workload_ports.evidence.context(
                 self.prepared.benchmark_session,
                 parent.configuration,
-                variation,
+                base_variation,
                 self._memory,
             )
             workload_context_sha256 = typed_json_sha256(evidence_context)
@@ -3305,10 +3446,22 @@ class AgenticPortfolioCampaignRuntime:
                     portfolio_generations=portfolio_generations,
                 ),
             )
+            if variation_envelope_evidence is not None:
+                envelope_context = thaw_json(evidence_context)
+                if type(envelope_context) is not dict:
+                    raise TypeError("campaign evidence context must be an object")
+                if CAMPAIGN_VARIATION_ENVELOPE_KEY in envelope_context:
+                    raise ValueError(
+                        "base context uses the reserved variation-envelope key"
+                    )
+                envelope_context[CAMPAIGN_VARIATION_ENVELOPE_KEY] = (
+                    variation_envelope_evidence
+                )
+                evidence_context = _object(envelope_context)
             evidence_cards = self.workload_ports.evidence.cards(
                 self.prepared.benchmark_session,
                 parent.configuration,
-                variation,
+                base_variation,
                 self._memory,
             )
             build = CampaignPortfolioWaveContext(
@@ -3675,6 +3828,9 @@ class AgenticPortfolioCampaignRuntime:
                         "portfolio_wave_receipts": [
                             value.receipt.to_record() for value in results
                         ],
+                        "variation_envelope_trace_receipt": (
+                            variation_envelope_trace
+                        ),
                         "candidates": [
                             _candidate_record(candidate) for candidate in candidates
                         ],
@@ -3841,10 +3997,16 @@ class AgenticPortfolioCampaignRuntime:
                 )
             )
         waves = tuple(waves_list)
-        results = await gather_concurrent_stage(
-            self.recombination.run(wave) for wave in waves
+        allocation_mode = self.recombination_evaluation_allocation_mode
+        results = (
+            ()
+            if allocation_mode
+            is RecombinationEvaluationAllocationMode.RECOURSE_ONLY
+            else await gather_concurrent_stage(
+                self.recombination.run(wave) for wave in waves
+            )
         )
-        candidates = tuple(
+        recombination_candidates = tuple(
             candidate for result in results for candidate in result.candidates
         )
         scored_candidate_count = sum(
@@ -3853,11 +4015,52 @@ class AgenticPortfolioCampaignRuntime:
         infeasible_candidate_count = sum(
             len(result.infeasible_candidates) for result in results
         )
-        if scored_candidate_count + infeasible_candidate_count != len(candidates):
+        if scored_candidate_count + infeasible_candidate_count != len(
+            recombination_candidates
+        ):
             raise RuntimeError(
                 "recombination disposition partition does not cover selected ITT "
                 "candidates"
             )
+        planned_capacity = step.planned_candidate_evaluations
+        if len(recombination_candidates) > planned_capacity:
+            raise RuntimeError("recombination exceeded its prepared capacity")
+        recourse_result = None
+        missing_capacity = planned_capacity - len(recombination_candidates)
+        if missing_capacity and self.capacity_recourse is not None:
+            preview = self._preview_archive(recombination_candidates)
+            cache_at_recourse = _cache_misses(
+                await self.composition.engine.evaluation_cache_snapshot()
+            )
+            recourse_state = OptimizerState(
+                generation=step.generation,
+                candidates=tuple((*self._history, *recombination_candidates)),
+                archive=preview.snapshot(),
+                archive_snapshot_hash=pareto_archive_snapshot_hash(
+                    preview.snapshot()
+                ),
+                unique_evaluations=cache_at_recourse,
+                logical_llm_calls=self._selector_calls,
+            )
+            recourse_request = CampaignCapacityRecourseRequest(
+                campaign_scope_sha256=self.task_sha256,
+                preparation_sha256=request.preparation_sha256,
+                stage_request_sha256=request.request_sha256,
+                generation=step.generation,
+                planned_candidate_occurrences=planned_capacity,
+                realized_candidate_occurrences=len(recombination_candidates),
+                state=recourse_state,
+            )
+            recourse_result = await self.capacity_recourse.fill(recourse_request)
+            validate_campaign_capacity_recourse_result(
+                port=self.capacity_recourse,
+                request=recourse_request,
+                result=recourse_result,
+            )
+        recourse_candidates = (
+            () if recourse_result is None else recourse_result.candidates
+        )
+        candidates = tuple((*recombination_candidates, *recourse_candidates))
         for candidate in candidates:
             self._history.append(candidate)
             self.archive.consider(candidate)
@@ -3866,6 +4069,7 @@ class AgenticPortfolioCampaignRuntime:
             source_generation
         )
         contextual_post_recombination_credit = None
+        contextual_post_stage_survival_credit = None
         planner = self.contextual_search_planner
         if planner is not None:
             source_wave_index = (source_generation + 1) // 2
@@ -3875,28 +4079,39 @@ class AgenticPortfolioCampaignRuntime:
                 if value.campaign_scope_sha256 == planner.campaign_scope_sha256
                 and value.wave_index == source_wave_index
             )
-            contextual_post_recombination_credit = (
-                observe_contextual_post_recombination_credit(
-                    campaign_scope_sha256=planner.campaign_scope_sha256,
-                    source_wave_index=source_wave_index,
-                    observations=source_observations,
-                    results=results,
-                    post_stage_front_candidate_ids=tuple(
-                        sorted(value.candidate_id for value in self.archive.front)
-                    ),
+            if results:
+                contextual_post_recombination_credit = (
+                    observe_contextual_post_recombination_credit(
+                        campaign_scope_sha256=planner.campaign_scope_sha256,
+                        source_wave_index=source_wave_index,
+                        observations=source_observations,
+                        results=results,
+                        post_stage_front_candidate_ids=tuple(
+                            sorted(value.candidate_id for value in self.archive.front)
+                        ),
+                    )
                 )
-            )
+                delayed_credits = contextual_post_recombination_credit.credits
+            else:
+                contextual_post_stage_survival_credit = (
+                    observe_contextual_post_stage_survival(
+                        campaign_scope_sha256=planner.campaign_scope_sha256,
+                        source_wave_index=source_wave_index,
+                        stage_request_sha256=request.request_sha256,
+                        observations=source_observations,
+                        post_stage_front_candidate_ids=tuple(
+                            sorted(value.candidate_id for value in self.archive.front)
+                        ),
+                    )
+                )
+                delayed_credits = contextual_post_stage_survival_credit.credits
             preview_ledger = type(planner.ledger)(
                 observations=list(planner.ledger.observations),
                 delayed_credits=list(planner.ledger.delayed_credits),
                 allocation_realizations=list(planner.ledger.allocation_realizations),
             )
-            preview_ledger.append_delayed_credit_batch(
-                contextual_post_recombination_credit.credits
-            )
-            planner.ledger.delayed_credits.extend(
-                contextual_post_recombination_credit.credits
-            )
+            preview_ledger.append_delayed_credit_batch(delayed_credits)
+            planner.ledger.delayed_credits.extend(delayed_credits)
         cache_after = _cache_misses(
             await self.composition.engine.evaluation_cache_snapshot()
         )
@@ -3916,18 +4131,47 @@ class AgenticPortfolioCampaignRuntime:
                     "candidates": [
                         _candidate_record(candidate) for candidate in candidates
                     ],
-                    "selected_itt_candidate_count": len(candidates),
+                    "selected_itt_candidate_count": len(recombination_candidates),
                     "scored_candidate_count": scored_candidate_count,
                     "candidate_infeasible_count": infeasible_candidate_count,
                     "candidate_infeasibility_recourse": (
                         "retain_selected_itt_reject_from_archive_no_resampling"
                     ),
                     "archive_after": thaw_json(self._archive_record()),
+                    "capacity": {
+                        "allocation_mode": allocation_mode.value,
+                        "native_wave_count": len(waves),
+                        "native_wave_evaluation_suppressed": (
+                            allocation_mode
+                            is RecombinationEvaluationAllocationMode.RECOURSE_ONLY
+                        ),
+                        "planned_candidate_occurrences": planned_capacity,
+                        "recombination_candidate_occurrences": len(
+                            recombination_candidates
+                        ),
+                        "missing_candidate_occurrences": missing_capacity,
+                        "recourse_enabled": self.capacity_recourse is not None,
+                        "recourse_candidate_occurrences": len(
+                            recourse_candidates
+                        ),
+                        "realized_candidate_occurrences": len(candidates),
+                        "capacity_complete": len(candidates) == planned_capacity,
+                        "recourse_result": (
+                            None
+                            if recourse_result is None
+                            else recourse_result.to_record()
+                        ),
+                    },
                     "archive_aware_source_utility": utility_binder is not None,
                     "contextual_post_recombination_credit": (
                         None
                         if contextual_post_recombination_credit is None
                         else contextual_post_recombination_credit.to_record()
+                    ),
+                    "contextual_post_stage_survival_credit": (
+                        None
+                        if contextual_post_stage_survival_credit is None
+                        else contextual_post_stage_survival_credit.to_record()
                     ),
                 }
             ),
@@ -4138,7 +4382,56 @@ class AgenticPortfolioCampaignRuntime:
                 ),
                 sealed_cutoff_event_index_inclusive=source_portfolio_generation,
             )
-            source_projection = evidence_source.project(query)
+            if (
+                request.request_sha256 in self._identifiable_reflection_inputs
+                or request.request_sha256
+                in self._identifiable_reflection_abstentions
+            ):
+                raise ValueError("reflection request was already executed")
+            try:
+                source_projection = evidence_source.project(query)
+            except NoIdentifiableMutationEvidenceError as abstention:
+                # E0 is decided entirely from the sealed committed registry.
+                # Advance the cutoff and authenticate the abstention without
+                # invoking the model executor or campaign-learning lifecycle.
+                record = {
+                    **abstention.to_record(),
+                    "reflection_request_sha256": request.request_sha256,
+                    "query_sha256": query.query_sha256,
+                    "source_generation": source_generation,
+                    "prior_cutoff_event_index_exclusive": (
+                        query.prior_cutoff_event_index_exclusive
+                    ),
+                    "sealed_cutoff_event_index_inclusive": (
+                        query.sealed_cutoff_event_index_inclusive
+                    ),
+                    "source_stage_payload_exposed": False,
+                    "recombination_results_exposed": False,
+                    "learning_registration_permitted": False,
+                    "test_admission_permitted": False,
+                }
+                frozen_abstention = _object(record)
+                self._identifiable_reflection_abstentions[
+                    request.request_sha256
+                ] = frozen_abstention
+                self._last_identifiable_reflection_cutoff = (
+                    source_portfolio_generation
+                )
+                return CampaignReflectionReceipt(
+                    request_sha256=request.request_sha256,
+                    preparation_sha256=request.preparation_sha256,
+                    source_generation=source_generation,
+                    source_stage_receipt_sha256=(
+                        request.source_stage.receipt_sha256
+                    ),
+                    logical_agent_calls=request.wave.call_count,
+                    visibility=(
+                        ReflectionVisibility.QUARANTINED_UNTIL_BLOCK_CLOSE
+                    ),
+                    status=CampaignReflectionStatus.ABSTAINED,
+                    failure_type=None,
+                    quarantined_result=frozen_abstention,
+                )
             if type(source_projection) is not (
                 CampaignIdentifiableReflectionEvidenceProjection
             ):
@@ -4149,8 +4442,6 @@ class AgenticPortfolioCampaignRuntime:
                 query=query,
                 source=source_projection,
             )
-            if request.request_sha256 in self._identifiable_reflection_inputs:
-                raise ValueError("reflection request was already executed")
             source_evidence_ids = self._validate_identifiable_reflection_lineage(
                 reflection_input
             )
@@ -4354,6 +4645,12 @@ class AgenticPortfolioCampaignRuntime:
                             self._identifiable_reflection_inputs.items()
                         )
                     ],
+                    "identifiable_reflection_abstentions": [
+                        thaw_json(value)
+                        for _, value in sorted(
+                            self._identifiable_reflection_abstentions.items()
+                        )
+                    ],
                     "contextual_terminal_persistence_credit": (
                         None
                         if contextual_terminal_credit is None
@@ -4433,6 +4730,7 @@ __all__ = [
     "CampaignPortfolioWavePreparationReceipt",
     "CampaignPortfolioOutcomeUpdater",
     "CampaignRecombinationUtilityBinder",
+    "RecombinationEvaluationAllocationMode",
     "CampaignLegacyRecombinationReflectionExecutor",
     "CampaignReflectionFalsificationSource",
     "CampaignReflectionExecutor",

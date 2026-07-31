@@ -143,6 +143,8 @@ class SlateAllocationRole(str, Enum):
     MEMORY_HYPOTHESIS = "memory_hypothesis"
     FALSIFICATION_DISAGREEMENT = "falsification_disagreement"
     STRUCTURAL_COVERAGE = "structural_coverage"
+    ACQUISITION_CERTIFIED = "acquisition_certified"
+    REGRET_BOUNDED_INFORMATION = "regret_bounded_information"
 
 
 _CALIBRATED_ROLES = (

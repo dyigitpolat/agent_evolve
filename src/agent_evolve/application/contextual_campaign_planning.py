@@ -15,6 +15,10 @@ from agent_evolve.application.contextual_search_controller import (
     PhaseAwareContextualSearchController,
     slice_contextual_search_decision,
 )
+from agent_evolve.application.action_structural_signature import (
+    parent_relative_changed_json_paths_by_option,
+    parent_relative_path_sets_are_disjoint,
+)
 from agent_evolve.application.campaign_execution import CampaignStageRequest
 from agent_evolve.application.evolution_campaign import (
     ParentVariationBinding,
@@ -36,15 +40,14 @@ from agent_evolve.ports.contextual_search_allocation import (
 from agent_evolve.ports.frontier_target import (
     CampaignPortfolioFrontierTarget,
     CampaignPortfolioFrontierTargetAllocator,
+    objective_space_target_from_campaign_target,
 )
 from agent_evolve.ports.variation_source import (
     PRIMARY_VARIATION_SOURCE_ID,
     finite_variation_operator_id,
     finite_variation_source_ids,
     finite_variation_source_id,
-)
-from agent_evolve.policies.variation.source_union_finite_catalog import (
-    required_source_evaluation_option_ids,
+    finite_variation_source_minimum_counts,
 )
 from agent_evolve.ports.portfolio_selection import (
     pairwise_disjoint_parent_patch_pairs,
@@ -52,9 +55,7 @@ from agent_evolve.ports.portfolio_selection import (
 
 
 _PLAN_DOMAIN = b"agent-evolve:contextual-campaign-search-plan:v1\x00"
-_JOINT_CONSTRAINT_DOMAIN = (
-    b"agent-evolve:finite-contract-joint-count-constraint:v1\x00"
-)
+_JOINT_CONSTRAINT_DOMAIN = b"agent-evolve:finite-contract-joint-count-constraint:v3\x00"
 
 
 @runtime_checkable
@@ -356,6 +357,9 @@ class FiniteContractContextualJointCapabilityProjector:
     min_distinct_families: int | None = None
     require_pairwise_disjoint_parent_patches: bool = False
     family_exposure_bounds: tuple[tuple[str, int, int], ...] = ()
+    operator_exposure_bounds: tuple[tuple[str, int, int], ...] = ()
+    minimum_single_path_interventions: int = 0
+    protect_future_recombination_opportunities: bool = False
     require_declared_source_floor_options: bool = True
 
     def __post_init__(self) -> None:
@@ -371,6 +375,17 @@ class FiniteContractContextualJointCapabilityProjector:
         if type(self.require_declared_source_floor_options) is not bool:
             raise TypeError(
                 "require_declared_source_floor_options must be an exact bool"
+            )
+        if type(self.protect_future_recombination_opportunities) is not bool:
+            raise TypeError(
+                "protect_future_recombination_opportunities must be an exact bool"
+            )
+        if (
+            type(self.minimum_single_path_interventions) is not int
+            or self.minimum_single_path_interventions < 0
+        ):
+            raise ValueError(
+                "minimum_single_path_interventions must be non-negative"
             )
         if type(self.family_exposure_bounds) is not tuple:
             raise TypeError("family_exposure_bounds must be an exact tuple")
@@ -391,6 +406,25 @@ class FiniteContractContextualJointCapabilityProjector:
             families.append(family)
         if families != sorted(set(families)):
             raise ValueError("family exposure bounds must be unique and canonical")
+        if type(self.operator_exposure_bounds) is not tuple:
+            raise TypeError("operator_exposure_bounds must be an exact tuple")
+        operators: list[str] = []
+        for value in self.operator_exposure_bounds:
+            if type(value) is not tuple or len(value) != 3:
+                raise TypeError("operator exposure bounds must be exact triples")
+            operator, minimum, maximum = value
+            if type(operator) is not str or not operator:
+                raise ValueError("operator exposure bound needs an operator")
+            if (
+                type(minimum) is not int
+                or type(maximum) is not int
+                or minimum < 0
+                or maximum < minimum
+            ):
+                raise ValueError("operator exposure bound is invalid")
+            operators.append(operator)
+        if operators != sorted(set(operators)):
+            raise ValueError("operator exposure bounds must be unique and canonical")
 
     @property
     def structural_constraint_sha256(self) -> str:
@@ -399,7 +433,18 @@ class FiniteContractContextualJointCapabilityProjector:
             _JOINT_CONSTRAINT_DOMAIN
             + _canonical_json(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
+                    "witness_solver": {
+                        "policy_id": "exact_structural_witness_search",
+                        "policy_version": 3,
+                        "pairwise_equivalence": (
+                            "source_operator_family_exact_changed_path_set"
+                        ),
+                        "pairwise_representative": "lexicographically_first_option",
+                        "pairwise_search_order": (
+                            "descending_compatibility_then_arm_family_option"
+                        ),
+                    },
                     "min_distinct_families": self.min_distinct_families,
                     "require_pairwise_disjoint_parent_patches": (
                         self.require_pairwise_disjoint_parent_patches
@@ -407,8 +452,26 @@ class FiniteContractContextualJointCapabilityProjector:
                     "family_exposure_bounds": [
                         list(value) for value in self.family_exposure_bounds
                     ],
+                    "operator_exposure_bounds": [
+                        list(value) for value in self.operator_exposure_bounds
+                    ],
+                    "minimum_single_path_interventions": (
+                        self.minimum_single_path_interventions
+                    ),
+                    "protect_future_recombination_opportunities": (
+                        self.protect_future_recombination_opportunities
+                    ),
+                    "offspring_opportunity_policy": (
+                        "reserve_planned_disjoint_parent_patch_pairs_when_consumed"
+                    ),
+                    "intervention_axis": (
+                        "exact_parent_relative_changed_json_path_count"
+                    ),
                     "require_declared_source_floor_options": (
                         self.require_declared_source_floor_options
+                    ),
+                    "source_floor_semantics": (
+                        "minimum_count_per_source_not_fixed_representative"
                     ),
                     "source_axis": "sealed_finite_variation_source",
                     "operator_axis": (
@@ -439,6 +502,31 @@ class FiniteContractContextualJointCapabilityProjector:
             self.min_distinct_families > evaluation_slots
         ):
             raise ValueError("minimum family diversity exceeds lane capacity")
+        if self.minimum_single_path_interventions > evaluation_slots:
+            raise ValueError("minimum single-path floor exceeds lane capacity")
+        future_recombination_widths = (
+            tuple(
+                step.offspring_per_parent
+                for step in context.prepared.schedule.steps
+                if step.source_portfolio_generation
+                == context.stage_request.step.generation
+            )
+            if self.protect_future_recombination_opportunities
+            else ()
+        )
+        if len(future_recombination_widths) > 1:
+            raise ValueError("portfolio generation has multiple recombination consumers")
+        minimum_disjoint_parent_patch_pairs = (
+            future_recombination_widths[0]
+            if self.protect_future_recombination_opportunities
+            and future_recombination_widths
+            else 0
+        )
+        maximum_selected_pairs = evaluation_slots * (evaluation_slots - 1) // 2
+        if minimum_disjoint_parent_patch_pairs > maximum_selected_pairs:
+            raise ValueError(
+                "planned recombination width exceeds the selected parent-pair universe"
+            )
         contract = context.variation.contract
         contract.__post_init__()
         options = contract.options
@@ -452,15 +540,64 @@ class FiniteContractContextualJointCapabilityProjector:
             raise ValueError("finite contract exposes a source outside planner arms")
         if not set(operator_by_option.values()).issubset(operator_arm_ids):
             raise ValueError("finite contract exposes an operator outside planner arms")
+        if not {
+            operator for operator, _, _ in self.operator_exposure_bounds
+        }.issubset(operator_arm_ids):
+            raise ValueError("operator exposure bound escapes planner arms")
         option_by_id = {value.option_id: value for value in options}
-        required_option_ids = (
-            required_source_evaluation_option_ids(contract)
+        changed_paths_by_option = parent_relative_changed_json_paths_by_option(
+            contract
+        )
+        changed_path_keys_by_option = {
+            option_id: tuple(path.schema_identity for path in paths)
+            for option_id, paths in changed_paths_by_option.items()
+        }
+        single_path_option_ids = {
+            option_id
+            for option_id, paths in changed_paths_by_option.items()
+            if len(paths) == 1
+        }
+        if len(single_path_option_ids) < self.minimum_single_path_interventions:
+            raise ValueError(
+                "finite contract cannot satisfy its single-path intervention floor"
+            )
+        source_minimum_counts = dict(
+            finite_variation_source_minimum_counts(contract)
             if self.require_declared_source_floor_options
             else ()
         )
-        required = set(required_option_ids)
-        if len(required) > evaluation_slots:
+        if not set(source_minimum_counts).issubset(source_arm_ids):
+            raise ValueError("declared source floor escapes planner arms")
+        if sum(source_minimum_counts.values()) > evaluation_slots:
             raise ValueError("declared source floors exceed lane capacity")
+        # Strict patch-disjoint feasibility depends only on source, operator,
+        # family, and the exact parent-relative path set.  Options sharing all
+        # four attributes are interchangeable to every constraint below and,
+        # because their non-empty path sets overlap, at most one can occur in
+        # a legal slate.  Collapse that exact equivalence before constructing
+        # the compatibility graph.  This is lossless but prevents a catalogue
+        # with many values per locus from turning a K-small witness query into
+        # an O(N**K) traversal over phenotype multiplicity.
+        pairwise_candidate_ids: tuple[str, ...] = ()
+        if self.require_pairwise_disjoint_parent_patches:
+            equivalence_groups: dict[
+                tuple[str, str, str, tuple[str, ...]], list[str]
+            ] = {}
+            for option in options:
+                option_id = option.option_id
+                signature = (
+                    source_by_option[option_id],
+                    operator_by_option[option_id],
+                    option.family,
+                    changed_path_keys_by_option[option_id],
+                )
+                equivalence_groups.setdefault(signature, []).append(option_id)
+            pairwise_candidate_ids = tuple(
+                sorted(
+                    min(option_ids)
+                    for option_ids in equivalence_groups.values()
+                )
+            )
         allowed_pairs = (
             None
             if not self.require_pairwise_disjoint_parent_patches
@@ -468,21 +605,71 @@ class FiniteContractContextualJointCapabilityProjector:
                 frozenset(value)
                 for value in pairwise_disjoint_parent_patch_pairs(
                     contract,
-                    tuple(value.option_id for value in options),
+                    pairwise_candidate_ids,
                 )
             }
         )
+        disjoint_pair_cache: dict[frozenset[str], bool] = {}
+
+        def pair_is_disjoint(left: str, right: str) -> bool:
+            if left == right:
+                return False
+            key = frozenset((left, right))
+            cached = disjoint_pair_cache.get(key)
+            if cached is not None:
+                return cached
+            value = parent_relative_path_sets_are_disjoint(
+                changed_paths_by_option[left],
+                changed_paths_by_option[right],
+            )
+            disjoint_pair_cache[key] = value
+            return value
+
+        def disjoint_pair_count(selected: tuple[str, ...]) -> int:
+            return sum(
+                pair_is_disjoint(left, right)
+                for index, left in enumerate(selected)
+                for right in selected[index + 1 :]
+            )
         family_bounds = {
             family: (minimum, maximum)
             for family, minimum, maximum in self.family_exposure_bounds
+        }
+        operator_bounds = {
+            operator: (minimum, maximum)
+            for operator, minimum, maximum in self.operator_exposure_bounds
         }
 
         def structurally_valid(
             selected: tuple[str, ...],
             *,
             check_pairwise_patches: bool = True,
+            check_offspring_opportunity: bool = True,
         ) -> bool:
-            if len(selected) != evaluation_slots or not required.issubset(selected):
+            if len(selected) != evaluation_slots:
+                return False
+            if any(
+                sum(source_by_option[value] == source_id for value in selected)
+                < minimum
+                for source_id, minimum in source_minimum_counts.items()
+            ):
+                return False
+            if any(
+                not minimum
+                <= sum(operator_by_option[value] == operator for value in selected)
+                <= maximum
+                for operator, (minimum, maximum) in operator_bounds.items()
+            ):
+                return False
+            if sum(
+                value in single_path_option_ids for value in selected
+            ) < self.minimum_single_path_interventions:
+                return False
+            if (
+                check_offspring_opportunity
+                and disjoint_pair_count(selected)
+                < minimum_disjoint_parent_patch_pairs
+            ):
                 return False
             families = tuple(option_by_id[value].family for value in selected)
             if self.min_distinct_families is not None and len(set(families)) < (
@@ -498,45 +685,32 @@ class FiniteContractContextualJointCapabilityProjector:
                 not check_pairwise_patches
                 or allowed_pairs is None
                 or all(
-                frozenset((left, right)) in allowed_pairs
-                for index, left in enumerate(selected)
-                for right in selected[index + 1 :]
+                    frozenset((left, right)) in allowed_pairs
+                    for index, left in enumerate(selected)
+                    for right in selected[index + 1 :]
                 )
             )
 
-        required_pairwise_valid = allowed_pairs is None or all(
-            frozenset((left, right)) in allowed_pairs
-            for index, left in enumerate(required_option_ids)
-            for right in required_option_ids[index + 1 :]
-        )
         compatible_degree = (
             {}
             if allowed_pairs is None
             else {
-                option.option_id: sum(
-                    frozenset((option.option_id, other.option_id)) in allowed_pairs
-                    for other in options
-                    if other.option_id != option.option_id
+                option_id: sum(
+                    frozenset((option_id, other_id)) in allowed_pairs
+                    for other_id in pairwise_candidate_ids
+                    if other_id != option_id
                 )
-                for option in options
+                for option_id in pairwise_candidate_ids
             }
         )
         pairwise_base_candidates = (
             ()
-            if allowed_pairs is None or not required_pairwise_valid
+            if allowed_pairs is None
             else tuple(
                 sorted(
-                    (
-                        option.option_id
-                        for option in options
-                        if option.option_id not in required
-                        and all(
-                            frozenset((option.option_id, selected)) in allowed_pairs
-                            for selected in required_option_ids
-                        )
-                    ),
+                    pairwise_candidate_ids,
                     key=lambda option_id: (
-                        compatible_degree[option_id],
+                        -compatible_degree[option_id],
                         source_by_option[option_id],
                         operator_by_option[option_id],
                         option_by_id[option_id].family,
@@ -545,20 +719,142 @@ class FiniteContractContextualJointCapabilityProjector:
                 )
             )
         )
+        options_by_arm_cell = {
+            (source_id, operator_id): tuple(
+                option.option_id
+                for option in options
+                if source_by_option[option.option_id] == source_id
+                and operator_by_option[option.option_id] == operator_id
+            )
+            for source_id in source_arm_ids
+            for operator_id in operator_arm_ids
+        }
+        base_options_by_arm_cell: dict[tuple[str, str], tuple[str, ...]] = {}
+        for arm_cell, group in options_by_arm_cell.items():
+            if allowed_pairs is not None:
+                base_options_by_arm_cell[arm_cell] = group
+                continue
+            # Family and exact intervention arity are the only option-level
+            # axes used by a base witness. Keep K representatives for each
+            # exact shape, interleaved across shapes so the first solution is
+            # diverse. Offspring opportunity is subsequently repaired over
+            # the complete changed-path equivalence domain.
+            by_shape: dict[tuple[str, bool], tuple[str, ...]] = {}
+            for family in sorted({option_by_id[value].family for value in group}):
+                for single_path in (True, False):
+                    members = tuple(
+                        value
+                        for value in group
+                        if option_by_id[value].family == family
+                        and (value in single_path_option_ids) is single_path
+                    )
+                    if members:
+                        by_shape[(family, single_path)] = members[:evaluation_slots]
+            reduced: list[str] = []
+            for rank in range(evaluation_slots):
+                reduced.extend(
+                    members[rank]
+                    for _, members in sorted(by_shape.items())
+                    if rank < len(members)
+                )
+            base_options_by_arm_cell[arm_cell] = tuple(reduced)
+
+        # Within one source/operator/family/arity signature, only the exact
+        # changed-path pattern can affect offspring opportunity. Retain one
+        # representative per pattern (up to K identical-path duplicates) so
+        # the bounded repair is complete without exposing the full catalogue
+        # multiplicity to the base marginal solver.
+        groups: dict[tuple[str, str, str, bool], list[str]] = {}
+        signature_by_option: dict[str, tuple[str, str, str, bool]] = {}
+        for option in options:
+            signature = (
+                source_by_option[option.option_id],
+                operator_by_option[option.option_id],
+                option.family,
+                option.option_id in single_path_option_ids,
+            )
+            groups.setdefault(signature, []).append(option.option_id)
+            signature_by_option[option.option_id] = signature
+        opportunity_domain_by_signature: dict[
+            tuple[str, str, str, bool], tuple[str, ...]
+        ] = {}
+        if minimum_disjoint_parent_patch_pairs:
+            for signature, option_ids in groups.items():
+                by_paths: dict[tuple[str, ...], list[str]] = {}
+                for option_id in sorted(option_ids):
+                    by_paths.setdefault(
+                        changed_path_keys_by_option[option_id], []
+                    ).append(option_id)
+                opportunity_domain_by_signature[signature] = tuple(
+                    option_id
+                    for paths in sorted(by_paths)
+                    for option_id in by_paths[paths][:evaluation_slots]
+                )
+
+        def repair_offspring_opportunity(
+            selected: tuple[str, ...],
+        ) -> tuple[str, ...] | None:
+            if (
+                not minimum_disjoint_parent_patch_pairs
+                or disjoint_pair_count(selected)
+                >= minimum_disjoint_parent_patch_pairs
+            ):
+                return selected
+            position_signatures = tuple(
+                signature_by_option[value] for value in selected
+            )
+
+            def search(
+                position: int,
+                chosen: tuple[str, ...],
+            ) -> tuple[str, ...] | None:
+                remaining = len(position_signatures) - position
+                observed_pairs = disjoint_pair_count(chosen)
+                optimistic_pairs = (
+                    observed_pairs
+                    + len(chosen) * remaining
+                    + remaining * (remaining - 1) // 2
+                )
+                if optimistic_pairs < minimum_disjoint_parent_patch_pairs:
+                    return None
+                if position == len(position_signatures):
+                    return chosen if structurally_valid(chosen) else None
+                domain = opportunity_domain_by_signature[
+                    position_signatures[position]
+                ]
+                preferred = selected[position]
+                ordered = tuple(
+                    sorted(
+                        domain,
+                        key=lambda option_id: (
+                            -sum(
+                                pair_is_disjoint(option_id, prior)
+                                for prior in chosen
+                            ),
+                            option_id != preferred,
+                            changed_path_keys_by_option[option_id],
+                            option_id,
+                        ),
+                    )
+                )
+                for option_id in ordered:
+                    if option_id in chosen:
+                        continue
+                    resolved = search(position + 1, (*chosen, option_id))
+                    if resolved is not None:
+                        return resolved
+                return None
+
+            return search(0, ())
 
         def first_witness(
             source_counts: tuple[int, ...],
             operator_counts: tuple[int, ...],
         ) -> tuple[str, ...] | None:
             source_targets = dict(zip(source_arm_ids, source_counts, strict=True))
-            operator_targets = dict(
-                zip(operator_arm_ids, operator_counts, strict=True)
-            )
+            operator_targets = dict(zip(operator_arm_ids, operator_counts, strict=True))
             required_source_counts = {value: 0 for value in source_arm_ids}
             required_operator_counts = {value: 0 for value in operator_arm_ids}
-            for option_id in required_option_ids:
-                required_source_counts[source_by_option[option_id]] += 1
-                required_operator_counts[operator_by_option[option_id]] += 1
             if any(
                 required_source_counts[value] > source_targets[value]
                 for value in source_arm_ids
@@ -568,16 +864,13 @@ class FiniteContractContextualJointCapabilityProjector:
             ):
                 return None
             if allowed_pairs is not None:
-                if not required_pairwise_valid:
-                    return None
-                initial = tuple(required_option_ids)
+                initial: tuple[str, ...] = ()
                 remaining_source = {
                     value: source_targets[value] - required_source_counts[value]
                     for value in source_arm_ids
                 }
                 remaining_operator = {
-                    value: operator_targets[value]
-                    - required_operator_counts[value]
+                    value: operator_targets[value] - required_operator_counts[value]
                     for value in operator_arm_ids
                 }
                 candidates = pairwise_base_candidates
@@ -608,10 +901,7 @@ class FiniteContractContextualJointCapabilityProjector:
                         < remaining
                         for arm_id, remaining in source_remaining.items()
                     ) or any(
-                        sum(
-                            operator_by_option[value] == arm_id
-                            for value in eligible
-                        )
+                        sum(operator_by_option[value] == arm_id for value in eligible)
                         < remaining
                         for arm_id, remaining in operator_remaining.items()
                     ):
@@ -680,7 +970,7 @@ class FiniteContractContextualJointCapabilityProjector:
                     (source_id, operator_id): sum(
                         source_by_option[value] == source_id
                         and operator_by_option[value] == operator_id
-                        for value in required_option_ids
+                        for value in ()
                     )
                     for source_id in source_arm_ids
                     for operator_id in operator_arm_ids
@@ -694,34 +984,13 @@ class FiniteContractContextualJointCapabilityProjector:
                         if required_count > target:
                             table_valid = False
                             break
-                        group = tuple(
-                            value.option_id
-                            for value in options
-                            if value.option_id not in required
-                            and source_by_option[value.option_id] == source_id
-                            and operator_by_option[value.option_id] == operator_id
-                        )
+                        group = base_options_by_arm_cell[(source_id, operator_id)]
                         needed = target - required_count
                         if needed > len(group):
                             table_valid = False
                             break
                         if needed:
-                            if allowed_pairs is None:
-                                reduced: list[str] = []
-                                for family in sorted(
-                                    {option_by_id[value].family for value in group}
-                                ):
-                                    reduced.extend(
-                                        tuple(
-                                            value
-                                            for value in group
-                                            if option_by_id[value].family == family
-                                        )[:evaluation_slots]
-                                    )
-                                group = tuple(reduced)
-                            cell_rows.append(
-                                ((source_id, operator_id), group, needed)
-                            )
+                            cell_rows.append(((source_id, operator_id), group, needed))
                     if not table_valid:
                         break
                 if not table_valid:
@@ -735,14 +1004,19 @@ class FiniteContractContextualJointCapabilityProjector:
                         ),
                     )
                 )
-                initial = tuple(required_option_ids)
+                initial: tuple[str, ...] = ()
 
                 def search(
                     cell_index: int,
                     selected: tuple[str, ...],
                 ) -> tuple[str, ...] | None:
                     if cell_index == len(ordered_cells):
-                        return selected if structurally_valid(selected) else None
+                        if not structurally_valid(
+                            selected,
+                            check_offspring_opportunity=False,
+                        ):
+                            return None
+                        return repair_offspring_opportunity(selected)
                     _, group, needed = ordered_cells[cell_index]
                     for choice in combinations(group, needed):
                         combined = (*selected, *choice)
@@ -769,10 +1043,14 @@ class FiniteContractContextualJointCapabilityProjector:
                                 ]
                                 for value in remaining_group
                             }
-                            if len(set(families)) + min(
-                                remaining_slots,
-                                len(remaining_families.difference(families)),
-                            ) < self.min_distinct_families:
+                            if (
+                                len(set(families))
+                                + min(
+                                    remaining_slots,
+                                    len(remaining_families.difference(families)),
+                                )
+                                < self.min_distinct_families
+                            ):
                                 continue
                         resolved = search(cell_index + 1, combined)
                         if resolved is not None:
@@ -784,75 +1062,12 @@ class FiniteContractContextualJointCapabilityProjector:
                     return tuple(sorted(witness))
             return None
 
-        marginal_witnesses: dict[
-            tuple[tuple[int, ...], tuple[int, ...]],
-            tuple[str, ...],
-        ] = {}
-        # Actions with the same source/operator/family signature are
-        # exchangeable for every constraint except parent-patch disjointness.
-        # Enumerate their bounded multiplicities once.  Besides being the
-        # complete solver when patch disjointness is disabled, this is an exact
-        # necessary-condition screen before the more expensive K-clique search.
-        # In particular, it rejects arm marginals whose family multiplicities
-        # cannot meet diversity before inspecting any option pair.
-        groups: dict[tuple[str, str, str], list[str]] = {}
-        for option in options:
-            if option.option_id in required:
-                continue
-            signature = (
-                source_by_option[option.option_id],
-                operator_by_option[option.option_id],
-                option.family,
-            )
-            groups.setdefault(signature, []).append(option.option_id)
-        signature_groups = tuple(
-            (signature, tuple(sorted(option_ids)))
-            for signature, option_ids in sorted(groups.items())
-        )
-        remaining_capacities = tuple(
-            sum(
-                min(len(option_ids), evaluation_slots)
-                for _, option_ids in signature_groups[index:]
-            )
-            for index in range(len(signature_groups) + 1)
-        )
-
-        def enumerate_signatures(
-            group_index: int,
-            selected: tuple[str, ...],
-        ) -> None:
-            remaining_slots = evaluation_slots - len(selected)
-            if remaining_slots < 0:
-                return
-            if group_index == len(signature_groups):
-                if remaining_slots != 0 or not structurally_valid(
-                    selected,
-                    check_pairwise_patches=False,
-                ):
-                    return
-                source_counts = tuple(
-                    sum(source_by_option[value] == arm_id for value in selected)
-                    for arm_id in source_arm_ids
-                )
-                operator_counts = tuple(
-                    sum(operator_by_option[value] == arm_id for value in selected)
-                    for arm_id in operator_arm_ids
-                )
-                marginal_witnesses.setdefault(
-                    (source_counts, operator_counts),
-                    tuple(sorted(selected)),
-                )
-                return
-            if remaining_slots > remaining_capacities[group_index]:
-                return
-            _, option_ids = signature_groups[group_index]
-            for count in range(min(len(option_ids), remaining_slots) + 1):
-                enumerate_signatures(
-                    group_index + 1,
-                    (*selected, *option_ids[:count]),
-                )
-
-        enumerate_signatures(0, tuple(required_option_ids))
+        # Eagerly enumerating every K-combination of structural signatures is
+        # O(G**K) in the number of exposed families. Large finite catalogues
+        # can have hundreds of such families even though the controller needs
+        # only the small source/operator marginal polytope. Solve those
+        # marginals directly below; the exact path-equivalence repair remains
+        # responsible for the registered offspring opportunity floor.
 
         vectors: list[ContextualJointCountVector] = []
         source_vectors = _bounded_compositions(
@@ -864,17 +1079,15 @@ class FiniteContractContextualJointCapabilityProjector:
             tuple(evaluation_slots for _ in operator_arm_ids),
         )
         for source_counts in source_vectors:
+            if any(
+                source_counts[source_arm_ids.index(source_id)] < minimum
+                for source_id, minimum in source_minimum_counts.items()
+            ):
+                continue
             for operator_counts in operator_vectors:
-                marginal_witness = marginal_witnesses.get(
-                    (source_counts, operator_counts)
-                )
-                if marginal_witness is None:
-                    continue
-                witness = (
-                    marginal_witness
-                    if allowed_pairs is None
-                    else first_witness(source_counts, operator_counts)
-                )
+                witness = first_witness(source_counts, operator_counts)
+                if witness is not None and allowed_pairs is None:
+                    witness = repair_offspring_opportunity(witness)
                 if witness is None:
                     continue
                 vectors.append(
@@ -887,8 +1100,7 @@ class FiniteContractContextualJointCapabilityProjector:
                         ),
                         feasibility_witness_option_identity_sha256s=tuple(
                             sorted(
-                                option_by_id[value].identity_sha256
-                                for value in witness
+                                option_by_id[value].identity_sha256 for value in witness
                             )
                         ),
                     )
@@ -905,6 +1117,12 @@ class FiniteContractContextualJointCapabilityProjector:
             feasible_vectors=tuple(
                 sorted(vectors, key=lambda value: value.vector_sha256)
             ),
+            minimum_single_path_interventions=(
+                self.minimum_single_path_interventions
+            ),
+            minimum_disjoint_parent_patch_pairs=(
+                minimum_disjoint_parent_patch_pairs
+            ),
         )
 
 
@@ -919,9 +1137,8 @@ class CampaignContextualSearchPlanner:
     incumbent_source_id: str = PRIMARY_VARIATION_SOURCE_ID
     incumbent_operator_id: str = "atomic"
     composition_positive_atomic_threshold: int = 2
-    joint_capability_projector: (
-        CampaignContextualJointCapabilityProjector | None
-    ) = None
+    require_objective_space_targets: bool = False
+    joint_capability_projector: CampaignContextualJointCapabilityProjector | None = None
     controller: PhaseAwareContextualSearchController = field(
         default_factory=PhaseAwareContextualSearchController
     )
@@ -957,14 +1174,14 @@ class CampaignContextualSearchPlanner:
             self.joint_capability_projector,
             CampaignContextualJointCapabilityProjector,
         ):
-            raise TypeError(
-                "joint_capability_projector must satisfy its inverted API"
-            )
+            raise TypeError("joint_capability_projector must satisfy its inverted API")
         if (
             type(self.composition_positive_atomic_threshold) is not int
             or self.composition_positive_atomic_threshold <= 0
         ):
             raise ValueError("composition threshold must be positive")
+        if type(self.require_objective_space_targets) is not bool:
+            raise TypeError("require_objective_space_targets must be exact bool")
 
     def plan(
         self,
@@ -1031,9 +1248,10 @@ class CampaignContextualSearchPlanner:
                 for value in ordered
             )
         )
-        if joint_count_capabilities and tuple(
-            value.slice_id for value in joint_count_capabilities
-        ) != slice_ids:
+        if (
+            joint_count_capabilities
+            and tuple(value.slice_id for value in joint_count_capabilities) != slice_ids
+        ):
             raise ValueError("joint capability projection changed campaign lanes")
         wave_index = (generation + 1) // 2
         total_portfolio_waves = len(prepared.schedule.portfolio_generations)
@@ -1109,6 +1327,14 @@ class CampaignContextualSearchPlanner:
             archive_utility=ordered[0].stage_request.archive_utility,
             lanes=tuple((value.parent_lane.lane_id, value.parent) for value in ordered),
         )
+        if self.require_objective_space_targets and any(
+            objective_space_target_from_campaign_target(value) is None
+            for value in frontier_targets
+        ):
+            raise ValueError(
+                "contextual frontier target omits the required raw objective-space "
+                "representation"
+            )
         plan = CampaignContextualSearchPlan(
             campaign_generation=generation,
             stage_allocation=stage_allocation,

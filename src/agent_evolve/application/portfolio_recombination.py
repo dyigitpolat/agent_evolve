@@ -89,6 +89,10 @@ _SOURCE_EXCLUSION_DOMAIN = (
     b"agent-evolve:portfolio-recombination-source-exclusion:v1\x00"
 )
 _NO_PAIR_DOMAIN = b"agent-evolve:portfolio-recombination-no-pair:v1\x00"
+_PREPARATION_DOMAIN = b"agent-evolve:prepared-portfolio-recombination:v1\x00"
+_PREPARED_MEMBER_DOMAIN = (
+    b"agent-evolve:evaluated-prepared-portfolio-recombination-member:v1\x00"
+)
 
 
 def _canonical_json(record: dict[str, object]) -> bytes:
@@ -1232,6 +1236,267 @@ class PortfolioRecombinationWaveResult:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedPortfolioRecombinationWave:
+    """Replay-complete recombination proposals before real evaluation."""
+
+    request: PortfolioRecombinationWaveRequest
+    branches: tuple[PortfolioRecombinationBranchBinding, ...]
+    source_exclusions: tuple[PortfolioRecombinationSourceExclusionReceipt, ...]
+    pair_attempts: tuple[PortfolioPairAttemptReceipt, ...]
+    pair_decision: PortfolioRecombinationPairDecision
+    selected_roles_and_pairs: tuple[
+        tuple[PortfolioRecombinationRole, tuple[CandidateId, CandidateId]],
+        ...,
+    ]
+    invocations: tuple[MaterializedInvocation, ...]
+    materializations: tuple[DisjointPatchMaterialization, ...]
+    no_pair: PortfolioRecombinationNoPairReceipt | None
+    selection_limit: int
+    preparation_sha256: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.request) is not PortfolioRecombinationWaveRequest:
+            raise TypeError("request must be an exact recombination wave request")
+        PortfolioRecombinationWaveRequest.__post_init__(self.request)
+        if type(self.branches) is not tuple or any(
+            type(value) is not PortfolioRecombinationBranchBinding
+            for value in self.branches
+        ):
+            raise TypeError("branches must contain exact bindings")
+        for value in self.branches:
+            PortfolioRecombinationBranchBinding.__post_init__(value)
+        if type(self.source_exclusions) is not tuple or any(
+            type(value) is not PortfolioRecombinationSourceExclusionReceipt
+            for value in self.source_exclusions
+        ):
+            raise TypeError("source_exclusions must contain exact receipts")
+        for value in self.source_exclusions:
+            PortfolioRecombinationSourceExclusionReceipt.__post_init__(value)
+        if type(self.pair_attempts) is not tuple or any(
+            type(value) is not PortfolioPairAttemptReceipt
+            for value in self.pair_attempts
+        ):
+            raise TypeError("pair_attempts must contain exact receipts")
+        for value in self.pair_attempts:
+            PortfolioPairAttemptReceipt.__post_init__(value)
+        if type(self.pair_decision) not in {
+            DisjointPairSelectionDecision,
+            ArchiveAwareDisjointPairSelectionDecision,
+        }:
+            raise TypeError("pair_decision must be an exact supported decision")
+        self.pair_decision.revalidate()
+        if type(self.selection_limit) is not int or self.selection_limit not in {1, 2}:
+            raise ValueError("selection_limit must be one or two")
+        if type(self.selected_roles_and_pairs) is not tuple:
+            raise TypeError("selected_roles_and_pairs must be an exact tuple")
+        expected: list[
+            tuple[PortfolioRecombinationRole, tuple[CandidateId, CandidateId]]
+        ] = []
+        if self.pair_decision.exploit_pair_ids is not None:
+            expected.append(("exploit", self.pair_decision.exploit_pair_ids))
+        if self.pair_decision.coverage_pair_ids is not None:
+            expected.append(("coverage", self.pair_decision.coverage_pair_ids))
+        if self.selected_roles_and_pairs != tuple(expected[: self.selection_limit]):
+            raise ValueError("prepared roles differ from the pair decision")
+        if (
+            type(self.invocations) is not tuple
+            or type(self.materializations) is not tuple
+            or len(self.invocations)
+            != len(self.materializations)
+            != len(self.selected_roles_and_pairs)
+        ):
+            raise ValueError("prepared invocations must exactly cover selected pairs")
+        safe_attempts = {
+            value.pair_ids: value for value in self.pair_attempts if value.replay_safe
+        }
+        target_ids: list[CandidateId] = []
+        for (_role, pair_ids), invocation, materialization in zip(
+            self.selected_roles_and_pairs,
+            self.invocations,
+            self.materializations,
+            strict=True,
+        ):
+            if type(invocation) is not MaterializedInvocation:
+                raise TypeError("invocations must contain exact values")
+            MaterializedInvocation.__post_init__(invocation)
+            if type(materialization) is not DisjointPatchMaterialization:
+                raise TypeError("materializations must contain exact values")
+            materialization.revalidate()
+            try:
+                attempt = safe_attempts[pair_ids]
+            except KeyError as error:
+                raise ValueError(
+                    "prepared selection is absent from safe pairs"
+                ) from error
+            if (
+                tuple(value.candidate_id for value in invocation.plan.parents)
+                != pair_ids
+                or invocation.candidate_id != attempt.target_candidate_id
+                or invocation.materialization_receipt_hash
+                != materialization.receipt_sha256
+                or invocation.materialization_receipt_hash
+                != attempt.materialization_receipt_sha256
+                or typed_json_sha256(invocation.draft.configuration)
+                != attempt.target_configuration_sha256
+            ):
+                raise ValueError("prepared invocation differs from pair evidence")
+            target_ids.append(invocation.candidate_id)
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("prepared recombination targets collide")
+        if self.selected_roles_and_pairs:
+            if self.no_pair is not None:
+                raise ValueError(
+                    "selected recombinations cannot carry no-pair evidence"
+                )
+        elif type(self.no_pair) is not PortfolioRecombinationNoPairReceipt:
+            raise TypeError(
+                "an empty recombination preparation requires no-pair evidence"
+            )
+        object.__setattr__(
+            self,
+            "preparation_sha256",
+            _hash_record(_PREPARATION_DOMAIN, self._unsigned_record()),
+        )
+
+    @property
+    def target_candidate_ids(self) -> tuple[CandidateId, ...]:
+        return tuple(value.candidate_id for value in self.invocations)
+
+    def _unsigned_record(self) -> dict[str, object]:
+        request = self.request
+        return {
+            "schema_version": 1,
+            "source_wave_receipt_sha256": (
+                request.source_result.receipt.receipt_sha256
+            ),
+            "source_request_sha256": (
+                request.source_wave.selection_request.request_sha256
+            ),
+            "ancestor_candidate_id": request.ancestor.candidate_id.value,
+            "ancestor_configuration_sha256": (
+                request.ancestor.occurrence.configuration_hash
+            ),
+            "generation": request.generation,
+            "branch_candidate_ids": [
+                value.candidate_id.value for value in self.branches
+            ],
+            "source_exclusion_sha256s": [
+                value.exclusion_sha256 for value in self.source_exclusions
+            ],
+            "pair_attempt_sha256s": [
+                _hash_record(
+                    _PREPARATION_DOMAIN,
+                    value.to_record(),
+                )
+                for value in self.pair_attempts
+            ],
+            "pair_decision": self.pair_decision.to_trace_record(),
+            "selected": [
+                {
+                    "role": role,
+                    "pair_ids": [value.value for value in pair_ids],
+                    "target_candidate_id": invocation.candidate_id.value,
+                    "target_configuration_sha256": typed_json_sha256(
+                        invocation.draft.configuration
+                    ),
+                    "materialization_receipt_sha256": (
+                        materialization.receipt_sha256
+                    ),
+                }
+                for (role, pair_ids), invocation, materialization in zip(
+                    self.selected_roles_and_pairs,
+                    self.invocations,
+                    self.materializations,
+                    strict=True,
+                )
+            ],
+            "selection_limit": self.selection_limit,
+            "no_pair_sha256": (
+                None if self.no_pair is None else self.no_pair.no_pair_sha256
+            ),
+            "evaluation_performed": False,
+        }
+
+    def to_record(self) -> dict[str, object]:
+        self.__post_init__()
+        return {
+            **self._unsigned_record(),
+            "preparation_sha256": self.preparation_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluatedPreparedRecombinationMember:
+    """One broker-selected prepared recombination and its real outcome."""
+
+    preparation_sha256: str
+    selection_role: PortfolioRecombinationRole
+    pair_ids: tuple[CandidateId, CandidateId]
+    invocation: MaterializedInvocation
+    materialization: DisjointPatchMaterialization
+    outcome: InvocationOutcome
+    receipt: PortfolioRecombinationMemberReceipt
+    evaluation_sha256: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        require_sha256(self.preparation_sha256, "preparation_sha256")
+        if self.selection_role not in {"exploit", "coverage"}:
+            raise ValueError("selection_role must be exploit or coverage")
+        if (
+            type(self.pair_ids) is not tuple
+            or len(self.pair_ids) != 2
+            or any(type(value) is not CandidateId for value in self.pair_ids)
+        ):
+            raise TypeError("pair_ids must contain two exact candidate IDs")
+        if type(self.invocation) is not MaterializedInvocation:
+            raise TypeError("invocation must be exact")
+        MaterializedInvocation.__post_init__(self.invocation)
+        if type(self.materialization) is not DisjointPatchMaterialization:
+            raise TypeError("materialization must be exact")
+        self.materialization.revalidate()
+        if type(self.outcome) is not InvocationOutcome:
+            raise TypeError("outcome must be exact")
+        InvocationOutcome.__post_init__(self.outcome)
+        if type(self.receipt) is not PortfolioRecombinationMemberReceipt:
+            raise TypeError("receipt must be exact")
+        PortfolioRecombinationMemberReceipt.__post_init__(self.receipt)
+        candidate = self.outcome.candidate
+        if (
+            candidate is None
+            or self.receipt.selection_role != self.selection_role
+            or self.receipt.pair_ids != self.pair_ids
+            or self.invocation.candidate_id != self.receipt.target_candidate_id
+            or candidate.candidate_id != self.receipt.target_candidate_id
+            or self.materialization.receipt_sha256
+            != self.receipt.materialization_receipt_sha256
+        ):
+            raise ValueError("evaluated prepared member has inconsistent joins")
+        object.__setattr__(
+            self,
+            "evaluation_sha256",
+            _hash_record(_PREPARED_MEMBER_DOMAIN, self._unsigned_record()),
+        )
+
+    def _unsigned_record(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "preparation_sha256": self.preparation_sha256,
+            "selection_role": self.selection_role,
+            "pair_ids": [value.value for value in self.pair_ids],
+            "target_candidate_id": self.invocation.candidate_id.value,
+            "materialization_receipt_sha256": self.materialization.receipt_sha256,
+            "member_outcome_sha256": self.receipt.outcome_sha256,
+        }
+
+    def to_record(self) -> dict[str, object]:
+        self.__post_init__()
+        return {
+            **self._unsigned_record(),
+            "evaluation_sha256": self.evaluation_sha256,
+        }
+
+
 @dataclass(slots=True)
 class PortfolioRecombination:
     """Enumerate safe disjoint unions and evaluate exploit/coverage selections."""
@@ -1507,60 +1772,27 @@ class PortfolioRecombination:
             candidate_failure=candidate_failure,
         )
 
-    async def run(
+    def prepare(
         self,
         request: PortfolioRecombinationWaveRequest,
-        *,
-        reward_binding: RewardPolicyBinding | None = None,
-    ) -> PortfolioRecombinationWaveResult:
-        """Enumerate all source pairs and evaluate a bounded deterministic slate.
-
-        The pair policy can nominate an exploit pair and a coverage pair, while
-        the enclosing campaign protocol owns the offspring envelope.  Keeping
-        that envelope explicit here lets generic campaign shapes request one
-        recombination child without evaluating and then discarding a second
-        child outside their preregistered budget.
-        """
+    ) -> PreparedPortfolioRecombinationWave:
+        """Materialize the bounded exploit/coverage slate without evaluating it."""
 
         if type(request) is not PortfolioRecombinationWaveRequest:
             raise TypeError("request must be an exact recombination wave request")
         PortfolioRecombinationWaveRequest.__post_init__(request)
-        if reward_binding is not None:
-            if type(reward_binding) is not RewardPolicyBinding:
-                raise TypeError("reward_binding must be exact or None")
-            RewardPolicyBinding.__post_init__(reward_binding)
-        source_receipt_sha256 = request.source_result.receipt.receipt_sha256
-        source_request_sha256 = request.source_wave.selection_request.request_sha256
-        source_contract_sha256 = (
-            request.source_wave.selection_request.finite_variation_contract.identity_sha256
-        )
-        ancestor_sha256 = request.ancestor.occurrence.configuration_hash
-        generation = request.generation
-        label_prefix = request.label_prefix
-        phase = request.phase
-        exposure_snapshot = request.path_family_exposures
-        source_archive_snapshot = request.source_archive_snapshot
-        source_utilities = request.source_utilities
-        source_archive_snapshot_sha256 = (
-            None
-            if source_archive_snapshot is None
-            else source_archive_snapshot.snapshot_sha256
-        )
-        source_utilities_sha256 = (
-            None if source_utilities is None else source_utilities.receipt_sha256
-        )
         branches, source_exclusions = self._branch_bindings(request)
-        attempts, eligible, materializations = self._enumerate_pairs(
+        attempts, eligible, materializations_by_pair = self._enumerate_pairs(
             request,
             branches,
         )
         decision: PortfolioRecombinationPairDecision
-        if source_utilities is None:
+        if request.source_utilities is None:
             decision = self.pair_policy.select(eligible)
         else:
             decision = self.archive_pair_policy.select(
                 eligible,
-                source_utilities=source_utilities,
+                source_utilities=request.source_utilities,
             )
         selected: list[
             tuple[PortfolioRecombinationRole, tuple[CandidateId, CandidateId]]
@@ -1570,6 +1802,7 @@ class PortfolioRecombination:
         if decision.coverage_pair_ids is not None:
             selected.append(("coverage", decision.coverage_pair_ids))
         selected = selected[: self.selection_limit]
+
         candidate_by_id = {
             value.candidate_id: value
             for value in request.source_result.scored_candidates
@@ -1577,74 +1810,21 @@ class PortfolioRecombination:
         invocations: list[MaterializedInvocation] = []
         selected_materializations: list[DisjointPatchMaterialization] = []
         for role, pair_ids in selected:
-            materialization = materializations[pair_ids]
-            invocation = materialized_disjoint_invocation(
-                plan=InvocationPlan(
-                    operator_kind=OperatorKind.THREE_WAY_RECOMBINATION,
-                    parents=tuple(candidate_by_id[value] for value in pair_ids),
-                    generation=generation,
-                    label=f"{label_prefix}.{role}",
-                    common_ancestor=request.ancestor,
-                    phase=phase,
-                ),
-                materialization=materialization,
+            materialization = materializations_by_pair[pair_ids]
+            invocations.append(
+                materialized_disjoint_invocation(
+                    plan=InvocationPlan(
+                        operator_kind=OperatorKind.THREE_WAY_RECOMBINATION,
+                        parents=tuple(candidate_by_id[value] for value in pair_ids),
+                        generation=request.generation,
+                        label=f"{request.label_prefix}.{role}",
+                        common_ancestor=request.ancestor,
+                        phase=request.phase,
+                    ),
+                    materialization=materialization,
+                )
             )
-            invocations.append(invocation)
             selected_materializations.append(materialization)
-        invocation_tuple = tuple(invocations)
-        if invocation_tuple:
-            outcomes = await self.engine.run_materialized_invocations(
-                invocation_tuple,
-                reward_binding=reward_binding,
-            )
-        else:
-            outcomes = ()
-        if type(outcomes) is not tuple or len(outcomes) != len(invocation_tuple):
-            raise ValueError("engine returned a partial recombination outcome wave")
-        branch_by_id = {value.candidate_id: value for value in branches}
-        members = tuple(
-            self._join_outcome(
-                role=role,
-                invocation=invocation,
-                materialization=materialization,
-                branches=branch_by_id,
-                outcome=outcome,
-            )
-            for (role, _), invocation, materialization, outcome in zip(
-                selected,
-                invocation_tuple,
-                selected_materializations,
-                outcomes,
-                strict=True,
-            )
-        )
-        if (
-            request.generation != generation
-            or request.label_prefix != label_prefix
-            or request.phase != phase
-            or request.path_family_exposures != exposure_snapshot
-            or request.source_archive_snapshot != source_archive_snapshot
-            or request.source_utilities != source_utilities
-            or (
-                None
-                if request.source_archive_snapshot is None
-                else request.source_archive_snapshot.snapshot_sha256
-            )
-            != source_archive_snapshot_sha256
-            or (
-                None
-                if request.source_utilities is None
-                else request.source_utilities.receipt_sha256
-            )
-            != source_utilities_sha256
-            or request.source_result.receipt.receipt_sha256 != source_receipt_sha256
-            or request.source_wave.selection_request.request_sha256
-            != source_request_sha256
-            or request.source_wave.selection_request.finite_variation_contract.identity_sha256
-            != source_contract_sha256
-            or request.ancestor.occurrence.configuration_hash != ancestor_sha256
-        ):
-            raise ValueError("source wave or ancestor drifted during recombination")
         no_pair = (
             None
             if eligible
@@ -1660,24 +1840,169 @@ class PortfolioRecombination:
                 replay_safe_pair_count=0,
             )
         )
-        receipt = PortfolioRecombinationWaveReceipt(
-            source_wave_receipt_sha256=source_receipt_sha256,
-            source_request_sha256=source_request_sha256,
-            source_decision_sha256=request.source_result.receipt.decision_sha256,
-            source_contract_sha256=source_contract_sha256,
-            ancestor_candidate_id=request.ancestor.candidate_id,
-            ancestor_configuration_sha256=ancestor_sha256,
-            generation=generation,
+        return PreparedPortfolioRecombinationWave(
+            request=request,
             branches=branches,
             source_exclusions=source_exclusions,
-            path_family_exposures=exposure_snapshot,
             pair_attempts=attempts,
             pair_decision=decision,
-            members=members,
-            selection_limit=self.selection_limit,
+            selected_roles_and_pairs=tuple(selected),
+            invocations=tuple(invocations),
+            materializations=tuple(selected_materializations),
             no_pair=no_pair,
+            selection_limit=self.selection_limit,
         )
-        return PortfolioRecombinationWaveResult(receipt=receipt, outcomes=outcomes)
+
+    async def evaluate_prepared_members(
+        self,
+        prepared: PreparedPortfolioRecombinationWave,
+        selected_candidate_ids: tuple[CandidateId, ...],
+        *,
+        reward_binding: RewardPolicyBinding | None = None,
+    ) -> tuple[EvaluatedPreparedRecombinationMember, ...]:
+        """Evaluate only a downstream-selected subset of prepared unions."""
+
+        if type(prepared) is not PreparedPortfolioRecombinationWave:
+            raise TypeError("prepared must be an exact recombination preparation")
+        prepared.__post_init__()
+        if type(selected_candidate_ids) is not tuple or not selected_candidate_ids:
+            raise ValueError("selected_candidate_ids must be a non-empty exact tuple")
+        if any(type(value) is not CandidateId for value in selected_candidate_ids):
+            raise TypeError(
+                "selected_candidate_ids must contain exact CandidateId values"
+            )
+        for value in selected_candidate_ids:
+            CandidateId.__post_init__(value)
+        if len(set(selected_candidate_ids)) != len(selected_candidate_ids):
+            raise ValueError("selected_candidate_ids cannot contain duplicates")
+        if reward_binding is not None:
+            if type(reward_binding) is not RewardPolicyBinding:
+                raise TypeError("reward_binding must be exact or None")
+            RewardPolicyBinding.__post_init__(reward_binding)
+
+        rows = {
+            invocation.candidate_id: (role, pair_ids, invocation, materialization)
+            for (role, pair_ids), invocation, materialization in zip(
+                prepared.selected_roles_and_pairs,
+                prepared.invocations,
+                prepared.materializations,
+                strict=True,
+            )
+        }
+        try:
+            selected = tuple(rows[value] for value in selected_candidate_ids)
+        except KeyError as error:
+            raise ValueError(
+                "evaluation selected outside prepared recombinations"
+            ) from error
+        invocations = tuple(value[2] for value in selected)
+        outcomes = await self.engine.run_materialized_invocations(
+            invocations,
+            reward_binding=reward_binding,
+        )
+        if type(outcomes) is not tuple or len(outcomes) != len(invocations):
+            raise ValueError("engine returned a partial recombination outcome wave")
+        branch_by_id = {value.candidate_id: value for value in prepared.branches}
+        values: list[EvaluatedPreparedRecombinationMember] = []
+        for (role, pair_ids, invocation, materialization), outcome in zip(
+            selected,
+            outcomes,
+            strict=True,
+        ):
+            receipt = self._join_outcome(
+                role=role,
+                invocation=invocation,
+                materialization=materialization,
+                branches=branch_by_id,
+                outcome=outcome,
+            )
+            values.append(
+                EvaluatedPreparedRecombinationMember(
+                    preparation_sha256=prepared.preparation_sha256,
+                    selection_role=role,
+                    pair_ids=pair_ids,
+                    invocation=invocation,
+                    materialization=materialization,
+                    outcome=outcome,
+                    receipt=receipt,
+                )
+            )
+        return tuple(values)
+
+    @staticmethod
+    def _result_from_complete_evaluation(
+        prepared: PreparedPortfolioRecombinationWave,
+        evaluated: tuple[EvaluatedPreparedRecombinationMember, ...],
+    ) -> PortfolioRecombinationWaveResult:
+        if type(prepared) is not PreparedPortfolioRecombinationWave:
+            raise TypeError("prepared must be exact")
+        prepared.__post_init__()
+        if type(evaluated) is not tuple or any(
+            type(value) is not EvaluatedPreparedRecombinationMember
+            for value in evaluated
+        ):
+            raise TypeError("evaluated must contain exact prepared members")
+        if tuple(value.invocation.candidate_id for value in evaluated) != (
+            prepared.target_candidate_ids
+        ):
+            raise ValueError("complete result must evaluate every prepared member")
+        request = prepared.request
+        receipt = PortfolioRecombinationWaveReceipt(
+            source_wave_receipt_sha256=(
+                request.source_result.receipt.receipt_sha256
+            ),
+            source_request_sha256=(
+                request.source_wave.selection_request.request_sha256
+            ),
+            source_decision_sha256=request.source_result.receipt.decision_sha256,
+            source_contract_sha256=(
+                request.source_wave.selection_request
+                .finite_variation_contract.identity_sha256
+            ),
+            ancestor_candidate_id=request.ancestor.candidate_id,
+            ancestor_configuration_sha256=(
+                request.ancestor.occurrence.configuration_hash
+            ),
+            generation=request.generation,
+            branches=prepared.branches,
+            source_exclusions=prepared.source_exclusions,
+            path_family_exposures=request.path_family_exposures,
+            pair_attempts=prepared.pair_attempts,
+            pair_decision=prepared.pair_decision,
+            members=tuple(value.receipt for value in evaluated),
+            selection_limit=prepared.selection_limit,
+            no_pair=prepared.no_pair,
+        )
+        return PortfolioRecombinationWaveResult(
+            receipt=receipt,
+            outcomes=tuple(value.outcome for value in evaluated),
+        )
+
+    async def run(
+        self,
+        request: PortfolioRecombinationWaveRequest,
+        *,
+        reward_binding: RewardPolicyBinding | None = None,
+    ) -> PortfolioRecombinationWaveResult:
+        """Enumerate all source pairs and evaluate a bounded deterministic slate.
+
+        The pair policy can nominate an exploit pair and a coverage pair, while
+        the enclosing campaign protocol owns the offspring envelope.  Keeping
+        that envelope explicit here lets generic campaign shapes request one
+        recombination child without evaluating and then discarding a second
+        child outside their preregistered budget.
+        """
+
+        prepared = self.prepare(request)
+        if prepared.target_candidate_ids:
+            evaluated = await self.evaluate_prepared_members(
+                prepared,
+                prepared.target_candidate_ids,
+                reward_binding=reward_binding,
+            )
+        else:
+            evaluated = ()
+        return self._result_from_complete_evaluation(prepared, evaluated)
 
 
 __all__ = [
@@ -1699,6 +2024,8 @@ __all__ = [
     "PortfolioRecombinationWaveReceipt",
     "PortfolioRecombinationWaveRequest",
     "PortfolioRecombinationWaveResult",
+    "PreparedPortfolioRecombinationWave",
+    "EvaluatedPreparedRecombinationMember",
     "bind_portfolio_recombination_source_utilities",
     "frozen_archive_source_utility_context",
     "portfolio_recombination_observed_sources",

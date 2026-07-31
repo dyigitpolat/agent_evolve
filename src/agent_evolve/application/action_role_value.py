@@ -44,18 +44,19 @@ from agent_evolve.ports.action_forecast import (
 
 
 ROLE_FACTORIZED_ACTION_UTILITY_ID = "role_factorized_action_portfolio"
-ROLE_FACTORIZED_ACTION_UTILITY_VERSION = 1
+ROLE_FACTORIZED_ACTION_UTILITY_VERSION = 2
 ROLE_FACTORIZED_ACTION_UTILITY_DEFINITION_SHA256 = hashlib.sha256(
-    b"agent-evolve:role-factorized-action-portfolio:v1;"
+    b"agent-evolve:role-factorized-action-portfolio:v2;"
     b"roles=reliable-archive-exploit,residual-bridge,epistemic-probe;"
-    b"default-slots=2,1,1;normalization=sealed-eligible-empirical-cdf-midrank;"
+    b"slots=wave-budgeted-with-default-2,1,1;"
+    b"normalization=sealed-eligible-empirical-cdf-midrank;"
     b"exploit=joint-reliability-adjusted-fixed-reference-hypervolume;"
     b"bridge=singleton-residual-target-closure;"
     b"probe=one-minus-weakest-target-metric-confidence;"
     b"assignment=maximum-weight-injective-role-assignment;"
     b"workload-model-provider-family-option-text-branches=false;outcomes=false"
 ).hexdigest()
-_BINDING_DOMAIN = b"agent-evolve:role-factorized-action-binding:v1\x00"
+_BINDING_DOMAIN = b"agent-evolve:role-factorized-action-binding:v2\x00"
 _ELIGIBLE_DOMAIN = b"agent-evolve:role-factorized-eligible:v1\x00"
 
 
@@ -221,7 +222,7 @@ def _cached_role_sequences(
 
 @dataclass(frozen=True, slots=True)
 class RoleFactorizedActionPortfolioUtility:
-    """Identified utility with two exploit, one bridge, and one probe slot."""
+    """Identified utility with an explicit workload-neutral role budget."""
 
     exploit_utility: ReliabilityAdjustedResidualCellExpectedHypervolumeUtility
     bridge_utility: ResidualTargetClosurePortfolioUtility
@@ -275,10 +276,10 @@ class RoleFactorizedActionPortfolioUtility:
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a non-negative exact integer")
-        if self.exploit_slots <= 0 or self.bridge_slots != 1 or self.probe_slots != 1:
-            raise ValueError(
-                "v1 requires positive exploit slots and exactly one bridge/probe"
-            )
+        if self.exploit_slots <= 0:
+            raise ValueError("role allocation requires at least one exploit slot")
+        if self.bridge_slots > 1 or self.probe_slots > 1:
+            raise ValueError("v2 supports at most one protected bridge/probe slot")
         if self.portfolio_size > 8:
             raise ValueError("role-factorized portfolios are bounded to eight")
         if (
@@ -475,6 +476,8 @@ def build_role_factorized_action_utility(
     exploit_utility: ReliabilityAdjustedResidualCellExpectedHypervolumeUtility,
     bridge_utility: ResidualTargetClosurePortfolioUtility,
     exploit_slots: int = 2,
+    bridge_slots: int = 1,
+    probe_slots: int = 1,
 ) -> RoleFactorizedActionPortfolioUtility:
     """Freeze rank-normalized role evidence from one forecast cutoff."""
 
@@ -504,6 +507,14 @@ def build_role_factorized_action_utility(
     bridge_utility.__post_init__()
     if type(exploit_slots) is not int or exploit_slots <= 0:
         raise ValueError("exploit_slots must be a positive exact integer")
+    for name, value in (
+        ("bridge_slots", bridge_slots),
+        ("probe_slots", probe_slots),
+    ):
+        if type(value) is not int or not 0 <= value <= 1:
+            raise ValueError(f"{name} must be zero or one")
+    if exploit_slots + bridge_slots + probe_slots > 8:
+        raise ValueError("role-factorized portfolios are bounded to eight")
 
     quantiles = (
         ForecastQuantile.P10,
@@ -582,6 +593,8 @@ def build_role_factorized_action_utility(
         score_rows=score_rows,
         exploit_denominators=tuple(denominators),
         exploit_slots=exploit_slots,
+        bridge_slots=bridge_slots,
+        probe_slots=probe_slots,
     )
 
 

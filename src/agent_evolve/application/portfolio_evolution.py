@@ -15,7 +15,7 @@ import json
 import math
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from enum import Enum
 from typing import Protocol, runtime_checkable
@@ -121,6 +121,7 @@ _MEMORY_CONTEXT_PROJECTION_DOMAIN = (
     b"agent-evolve:portfolio-memory-context-projection:v1\x00"
 )
 _WAVE_DOMAIN = b"agent-evolve:portfolio-evolution-wave:v1\x00"
+_PREPARED_WAVE_DOMAIN = b"agent-evolve:portfolio-evolution-prepared-wave:v1\x00"
 _AGGREGATION_BINDING_DOMAIN = (
     b"agent-evolve:portfolio-reward-aggregation-binding:v1\x00"
 )
@@ -2015,6 +2016,189 @@ class ProviderTrafficWitness(Protocol):
 
     def observed_provider_calls(self) -> int: ...
 
+@dataclass(frozen=True, slots=True)
+class PreparedPortfolioVariationWave:
+    """One selected and materialized portfolio before any real evaluation.
+
+    This is the public hand-off used by residual proposal markets.  The LLM
+    decision has already been resolved against the sealed finite contract and
+    every target occurrence has been allocated, but the expensive evaluator
+    has not run.  A downstream broker can therefore compare these actions with
+    acquisition, restart, or recombination proposals before spending budget.
+    """
+
+    wave: PortfolioVariationWaveRequest
+    selection: PortfolioSelectionResult
+    selection_telemetry_sha256: str
+    invocations: tuple[MaterializedInvocation, ...]
+    materializations: tuple[PortfolioMemberMaterializationReceipt, ...]
+    preparation_sha256: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.wave) is not PortfolioVariationWaveRequest:
+            raise TypeError("wave must be an exact PortfolioVariationWaveRequest")
+        PortfolioVariationWaveRequest.__post_init__(self.wave)
+        if type(self.selection) is not PortfolioSelectionResult:
+            raise TypeError("selection must be an exact PortfolioSelectionResult")
+        PortfolioSelectionResult.__post_init__(self.selection)
+        telemetry = self.selection.telemetry
+        require_sha256(
+            self.selection_telemetry_sha256,
+            "selection_telemetry_sha256",
+        )
+        # A provider-free selection has no telemetry to digest, by construction:
+        # there was no call. It carries the distinct sentinel instead, and the
+        # zero it asserts was verified against a traffic witness at selection
+        # time. Absence is therefore checked here, never inferred.
+        if telemetry is None:
+            if not self.selection.provider_free:
+                raise ValueError("prepared portfolio selection requires telemetry")
+            if self.selection_telemetry_sha256 != (
+                PROVIDER_FREE_SELECTION_TELEMETRY_SHA256
+            ):
+                raise ValueError(
+                    "a provider-free prepared selection must carry the "
+                    "provider-free telemetry sentinel"
+                )
+        elif (
+            portfolio_selection_telemetry_sha256(telemetry)
+            != self.selection_telemetry_sha256
+        ):
+            raise ValueError("prepared telemetry identity differs from selection")
+        validate_ranked_portfolio_decision(
+            self.wave.selection_request,
+            self.selection.decision,
+        )
+        count = len(self.selection.decision.members)
+        if (
+            type(self.invocations) is not tuple
+            or type(self.materializations) is not tuple
+            or len(self.invocations) != count
+            or len(self.materializations) != count
+        ):
+            raise ValueError("prepared members must exactly cover the selection")
+        for invocation in self.invocations:
+            if type(invocation) is not MaterializedInvocation:
+                raise TypeError("invocations must contain exact materialized values")
+            MaterializedInvocation.__post_init__(invocation)
+        for receipt in self.materializations:
+            if type(receipt) is not PortfolioMemberMaterializationReceipt:
+                raise TypeError("materializations must contain exact receipts")
+            PortfolioMemberMaterializationReceipt.__post_init__(receipt)
+        for selected, invocation, receipt in zip(
+            self.selection.decision.members,
+            self.invocations,
+            self.materializations,
+            strict=True,
+        ):
+            if (
+                selected.rank != receipt.rank
+                or selected.option_id != receipt.option_id
+                or selected.option_identity_sha256
+                != receipt.option_identity_sha256
+                or selected.child_configuration_sha256
+                != receipt.child_configuration_sha256
+                or invocation.candidate_id != receipt.candidate_id
+                or invocation.materialization_receipt_hash
+                != receipt.receipt_sha256
+                or invocation.plan.parents != (self.wave.parent,)
+                or invocation.plan.generation != self.wave.generation
+                or typed_json_sha256(freeze_json(invocation.draft.configuration))
+                != receipt.child_configuration_sha256
+            ):
+                raise ValueError(
+                    "prepared invocation differs from its selected finite option"
+                )
+        candidate_ids = tuple(value.candidate_id for value in self.invocations)
+        child_sha256s = tuple(
+            value.child_configuration_sha256 for value in self.materializations
+        )
+        if (
+            len(set(candidate_ids)) != count
+            or len(set(child_sha256s)) != count
+        ):
+            raise ValueError("prepared portfolio contains colliding members")
+        object.__setattr__(
+            self,
+            "preparation_sha256",
+            _hash_record(
+                _PREPARED_WAVE_DOMAIN,
+                {
+                    "schema_version": 1,
+                    "request_sha256": self.wave.selection_request.request_sha256,
+                    "decision_sha256": self.selection.decision.decision_sha256,
+                    "selection_telemetry_sha256": (
+                        self.selection_telemetry_sha256
+                    ),
+                    "parent_candidate_id": self.wave.parent.candidate_id.value,
+                    "parent_configuration_sha256": (
+                        self.wave.parent.occurrence.configuration_hash
+                    ),
+                    "generation": self.wave.generation,
+                    "materialization_receipt_sha256s": [
+                        value.receipt_sha256 for value in self.materializations
+                    ],
+                    "evaluation_performed": False,
+                },
+            ),
+        )
+
+    def to_record(self) -> dict[str, object]:
+        self.__post_init__()
+        return {
+            "schema_version": 1,
+            "request_sha256": self.wave.selection_request.request_sha256,
+            "decision_sha256": self.selection.decision.decision_sha256,
+            "selection_telemetry_sha256": self.selection_telemetry_sha256,
+            "parent_candidate_id": self.wave.parent.candidate_id.value,
+            "parent_configuration_sha256": (
+                self.wave.parent.occurrence.configuration_hash
+            ),
+            "generation": self.wave.generation,
+            "materializations": [
+                value.to_record() for value in self.materializations
+            ],
+            "preparation_sha256": self.preparation_sha256,
+            "evaluation_performed": False,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluatedPreparedPortfolioMember:
+    """A broker-selected prepared member joined to one exact engine outcome."""
+
+    selected: RankedPortfolioMember
+    invocation: MaterializedInvocation
+    materialization: PortfolioMemberMaterializationReceipt
+    outcome: InvocationOutcome
+    receipt: PortfolioVariationMemberReceipt
+
+    def __post_init__(self) -> None:
+        if type(self.selected) is not RankedPortfolioMember:
+            raise TypeError("selected must be an exact ranked member")
+        RankedPortfolioMember.__post_init__(self.selected)
+        if type(self.invocation) is not MaterializedInvocation:
+            raise TypeError("invocation must be exact")
+        MaterializedInvocation.__post_init__(self.invocation)
+        if type(self.materialization) is not PortfolioMemberMaterializationReceipt:
+            raise TypeError("materialization must be exact")
+        PortfolioMemberMaterializationReceipt.__post_init__(self.materialization)
+        if type(self.outcome) is not InvocationOutcome:
+            raise TypeError("outcome must be exact")
+        InvocationOutcome.__post_init__(self.outcome)
+        if type(self.receipt) is not PortfolioVariationMemberReceipt:
+            raise TypeError("receipt must be an exact variation-member receipt")
+        PortfolioVariationMemberReceipt.__post_init__(self.receipt)
+        if (
+            self.selected.rank != self.materialization.rank
+            or self.invocation.candidate_id != self.materialization.candidate_id
+            or self.receipt.materialization != self.materialization
+            or self.outcome.candidate is None
+            or self.outcome.candidate.candidate_id
+            != self.materialization.candidate_id
+        ):
+            raise ValueError("evaluated prepared member has a broken exact join")
+
 
 @dataclass(slots=True)
 class PortfolioEvolution:
@@ -2123,6 +2307,155 @@ class PortfolioEvolution:
             materialization_receipt_hash=receipt.receipt_sha256,
         )
         return invocation, receipt
+
+    async def prepare(
+        self,
+        wave: PortfolioVariationWaveRequest,
+    ) -> PreparedPortfolioVariationWave:
+        """Select once and materialize every member without evaluating it."""
+
+        if type(wave) is not PortfolioVariationWaveRequest:
+            raise TypeError("wave must be an exact PortfolioVariationWaveRequest")
+        PortfolioVariationWaveRequest.__post_init__(wave)
+        request_sha256 = wave.selection_request.request_sha256
+        contract_sha256 = (
+            wave.selection_request.finite_variation_contract.identity_sha256
+        )
+        parent_sha256 = wave.parent.occurrence.configuration_hash
+        observed_before = (
+            self.provider_traffic_witness.observed_provider_calls()
+            if self.provider_traffic_witness is not None
+            else None
+        )
+        result = await self.selector.select(wave.selection_request)
+        if type(result) is not PortfolioSelectionResult:
+            raise TypeError("selector must return an exact PortfolioSelectionResult")
+        PortfolioSelectionResult.__post_init__(result)
+        if result.provider_free:
+            # The assertion is not taken on trust. A provider-free selection is
+            # a measured zero over the selection window, and a selector that
+            # claims one while reaching the provider fails here rather than
+            # sealing a receipt that contradicts the journals.
+            if self.provider_traffic_witness is None:
+                raise ValueError(
+                    "a provider-free selection requires a provider traffic "
+                    "witness; an unverified claim is not evidence"
+                )
+            observed_after = self.provider_traffic_witness.observed_provider_calls()
+            if observed_after != observed_before:
+                raise ValueError(
+                    "selector asserted provider_free but "
+                    f"{observed_after - observed_before} provider call(s) were "
+                    "observed during the selection window"
+                )
+            telemetry_sha256 = PROVIDER_FREE_SELECTION_TELEMETRY_SHA256
+        else:
+            if result.telemetry is None:
+                raise ValueError("portfolio selection requires exact call telemetry")
+            telemetry_sha256 = portfolio_selection_telemetry_sha256(result.telemetry)
+        validate_ranked_portfolio_decision(wave.selection_request, result.decision)
+        if (
+            wave.selection_request.request_sha256 != request_sha256
+            or wave.selection_request.finite_variation_contract.identity_sha256
+            != contract_sha256
+            or wave.parent.occurrence.configuration_hash != parent_sha256
+            or not typed_json_equal(
+                wave.parent.configuration,
+                wave.selection_request.finite_variation_contract.parent_configuration,
+            )
+        ):
+            raise ValueError(
+                "portfolio parent or request contract drifted during selection"
+            )
+        materialized_pairs = tuple(
+            self._materialize_member(
+                wave,
+                result.decision,
+                telemetry_sha256,
+                member,
+            )
+            for member in result.decision.members
+        )
+        return PreparedPortfolioVariationWave(
+            wave=wave,
+            selection=result,
+            selection_telemetry_sha256=telemetry_sha256,
+            invocations=tuple(value[0] for value in materialized_pairs),
+            materializations=tuple(value[1] for value in materialized_pairs),
+        )
+
+    async def evaluate_prepared_members(
+        self,
+        prepared: PreparedPortfolioVariationWave,
+        candidate_ids: tuple[CandidateId, ...],
+        *,
+        reward_binding: RewardPolicyBinding | None = None,
+    ) -> tuple[EvaluatedPreparedPortfolioMember, ...]:
+        """Evaluate exactly the requested subset of one prepared portfolio."""
+
+        if type(prepared) is not PreparedPortfolioVariationWave:
+            raise TypeError("prepared must be an exact prepared portfolio")
+        PreparedPortfolioVariationWave.__post_init__(prepared)
+        if (
+            type(candidate_ids) is not tuple
+            or not candidate_ids
+            or any(type(value) is not CandidateId for value in candidate_ids)
+        ):
+            raise TypeError("candidate_ids must be a non-empty exact tuple")
+        for value in candidate_ids:
+            CandidateId.__post_init__(value)
+        if len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("candidate_ids must be unique")
+        if reward_binding is not None:
+            if type(reward_binding) is not RewardPolicyBinding:
+                raise TypeError("reward_binding must be exact or None")
+            RewardPolicyBinding.__post_init__(reward_binding)
+        index = {
+            invocation.candidate_id: (
+                selected,
+                invocation,
+                materialization,
+            )
+            for selected, invocation, materialization in zip(
+                prepared.selection.decision.members,
+                prepared.invocations,
+                prepared.materializations,
+                strict=True,
+            )
+        }
+        try:
+            selected_rows = tuple(index[value] for value in candidate_ids)
+        except KeyError as error:
+            raise ValueError(
+                "requested evaluation is outside the prepared portfolio"
+            ) from error
+        outcomes = await self.engine.run_materialized_invocations(
+            tuple(value[1] for value in selected_rows),
+            reward_binding=reward_binding,
+        )
+        if type(outcomes) is not tuple or len(outcomes) != len(selected_rows):
+            raise ValueError("engine returned a partial portfolio outcome wave")
+        evaluated: list[EvaluatedPreparedPortfolioMember] = []
+        for (selected, invocation, materialization), outcome in zip(
+            selected_rows,
+            outcomes,
+            strict=True,
+        ):
+            receipt = self._join_outcome(
+                invocation,
+                materialization,
+                outcome,
+            )
+            evaluated.append(
+                EvaluatedPreparedPortfolioMember(
+                    selected=selected,
+                    invocation=invocation,
+                    materialization=materialization,
+                    outcome=outcome,
+                    receipt=receipt,
+                )
+            )
+        return tuple(evaluated)
 
     @staticmethod
     def _join_outcome(
@@ -2484,91 +2817,21 @@ class PortfolioEvolution:
                 raise ValueError("memory credit eligible set contains deprecated insight")
 
         request_sha256 = wave.selection_request.request_sha256
-        contract_sha256 = (
-            wave.selection_request.finite_variation_contract.identity_sha256
-        )
         parent_sha256 = wave.parent.occurrence.configuration_hash
-        observed_before = (
-            self.provider_traffic_witness.observed_provider_calls()
-            if self.provider_traffic_witness is not None
-            else None
+        prepared = await self.prepare(wave)
+        result = prepared.selection
+        telemetry = result.telemetry
+        telemetry_sha256 = prepared.selection_telemetry_sha256
+        candidate_ids = tuple(
+            value.candidate_id for value in prepared.invocations
         )
-        result = await self.selector.select(wave.selection_request)
-        if type(result) is not PortfolioSelectionResult:
-            raise TypeError("selector must return an exact PortfolioSelectionResult")
-        PortfolioSelectionResult.__post_init__(result)
-        if result.provider_free:
-            # The assertion is not taken on trust. A provider-free selection is
-            # a measured zero over the selection window, and a selector that
-            # claims one while reaching the provider fails here rather than
-            # sealing a receipt that contradicts the journals.
-            if self.provider_traffic_witness is None:
-                raise ValueError(
-                    "a provider-free selection requires a provider traffic "
-                    "witness; an unverified claim is not evidence"
-                )
-            observed_after = self.provider_traffic_witness.observed_provider_calls()
-            if observed_after != observed_before:
-                raise ValueError(
-                    "selector asserted provider_free but "
-                    f"{observed_after - observed_before} provider call(s) were "
-                    "observed during the selection window"
-                )
-            telemetry = None
-            telemetry_sha256 = PROVIDER_FREE_SELECTION_TELEMETRY_SHA256
-        else:
-            telemetry = result.telemetry
-            telemetry_sha256 = portfolio_selection_telemetry_sha256(telemetry)
-        validate_ranked_portfolio_decision(wave.selection_request, result.decision)
-        if (
-            wave.selection_request.request_sha256 != request_sha256
-            or wave.selection_request.finite_variation_contract.identity_sha256
-            != contract_sha256
-            or wave.parent.occurrence.configuration_hash != parent_sha256
-            or not typed_json_equal(
-                wave.parent.configuration,
-                wave.selection_request.finite_variation_contract.parent_configuration,
-            )
-        ):
-            raise ValueError(
-                "portfolio parent or request contract drifted during selection"
-            )
-
-        materialized_pairs = tuple(
-            self._materialize_member(
-                wave,
-                result.decision,
-                telemetry_sha256,
-                member,
-            )
-            for member in result.decision.members
-        )
-        invocations = tuple(value[0] for value in materialized_pairs)
-        materializations = tuple(value[1] for value in materialized_pairs)
-        candidate_ids = tuple(value.candidate_id for value in invocations)
-        child_sha256s = tuple(
-            value.child_configuration_sha256 for value in materializations
-        )
-        if len(set(candidate_ids)) != len(candidate_ids) or len(
-            set(child_sha256s)
-        ) != len(child_sha256s):
-            raise ValueError("portfolio materialization contains colliding members")
-
-        outcomes = await self.engine.run_materialized_invocations(
-            invocations,
+        evaluated = await self.evaluate_prepared_members(
+            prepared,
+            candidate_ids,
             reward_binding=reward_binding,
         )
-        if type(outcomes) is not tuple or len(outcomes) != len(invocations):
-            raise ValueError("engine returned a partial portfolio outcome wave")
-        members = tuple(
-            self._join_outcome(invocation, materialization, outcome)
-            for invocation, materialization, outcome in zip(
-                invocations,
-                materializations,
-                outcomes,
-                strict=True,
-            )
-        )
+        outcomes = tuple(value.outcome for value in evaluated)
+        members = tuple(value.receipt for value in evaluated)
         if len({member.operator_invocation_id for member in members}) != len(members):
             raise ValueError("portfolio outcomes contain colliding invocations")
         action_attributions = tuple(
@@ -2662,7 +2925,9 @@ __all__ = [
     "MEMORY_ESTIMAND_SUBTREE_PROJECTION_DEFINITION_SHA256",
     "PORTFOLIO_MATERIALIZATION_POLICY_ID",
     "PORTFOLIO_MATERIALIZATION_POLICY_VERSION",
+    "EvaluatedPreparedPortfolioMember",
     "MaterializedPortfolioEngine",
+    "PreparedPortfolioVariationWave",
     "PortfolioActionAttributionReceipt",
     "PortfolioActionCardAttribution",
     "PortfolioCandidateFailureEvidence",

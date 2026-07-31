@@ -15,6 +15,8 @@ from typing import Any
 from agent_evolve.application.portfolio_evolution import PortfolioVariationWaveResult
 from agent_evolve.integrations.pydantic_ai.calibrated_portfolio_selection import (
     CalibratedPortfolioAllocator,
+    PydanticAIAcquisitionCertifiedResidualPortfolioSelectionPolicy,
+    PydanticAIRegretBoundedInformationPortfolioSelectionPolicy,
     PydanticAICalibratedPortfolioSelectionPolicy,
     PydanticAIConstraintDecoupledHorizonPortfolioSelectionPolicy,
     PydanticAIConstraintDecoupledTargetConditionedPortfolioSelectionPolicy,
@@ -59,6 +61,13 @@ from agent_evolve.policies.selection.target_conditioned_allocator import (
 )
 from agent_evolve.policies.selection.target_conditioned_prequential import (
     TargetConditionedSlateDecision,
+)
+from agent_evolve.policies.selection.acquisition_certified_slate import (
+    AcquisitionCertifiedSlateContextProvider,
+    AcquisitionCertifiedSlatePolicy,
+)
+from agent_evolve.policies.selection.regret_bounded_slate import (
+    RegretBoundedSlatePolicy,
 )
 from agent_evolve.policies.selection.calibrated_portfolio_binding import (
     CalibratedPortfolioInputBinding,
@@ -160,10 +169,13 @@ class CalibratedPortfolioCampaignCoordinator:
         if self.constraint_decoupled and type(self.allocator) not in {
             HorizonBoundedStructuralPosteriorSlatePolicy,
             TargetConditionedSlateAllocatorAdapter,
+            AcquisitionCertifiedSlatePolicy,
+            RegretBoundedSlatePolicy,
         }:
             raise TypeError(
                 "constraint-decoupled acquisition requires the horizon-bounded "
-                "or target-conditioned allocator"
+                "target-conditioned, acquisition-certified, or regret-bounded "
+                "allocator"
             )
         if (
             type(self.allocator) is TargetConditionedSlateAllocatorAdapter
@@ -212,6 +224,19 @@ class CalibratedPortfolioCampaignCoordinator:
                     "append-only registration"
                 )
             return
+        if type(self.allocator) in {
+            AcquisitionCertifiedSlatePolicy,
+            RegretBoundedSlatePolicy,
+        }:
+            self.allocator.__post_init__()
+            if not isinstance(
+                self.allocator.context_provider,
+                AcquisitionCertifiedSlateContextProvider,
+            ):
+                raise TypeError(
+                    "campaign acquisition-certified provider must expose contexts"
+                )
+            return
         raise TypeError("allocator must be an exact supported calibrated policy")
 
     def build_selector(
@@ -231,11 +256,25 @@ class CalibratedPortfolioCampaignCoordinator:
         | PydanticAIFrontierProbeCalibratedPortfolioSelectionPolicy
         | PydanticAIFullSupportCalibratedPortfolioSelectionPolicy
         | PydanticAITargetConditionedCalibratedPortfolioSelectionPolicy
+        | PydanticAIAcquisitionCertifiedResidualPortfolioSelectionPolicy
+        | PydanticAIRegretBoundedInformationPortfolioSelectionPolicy
     ):
         """Build a selector sharing this coordinator's trusted allocator."""
 
         self.__post_init__()
         if self.constraint_decoupled:
+            if type(self.allocator) is AcquisitionCertifiedSlatePolicy:
+                return PydanticAIAcquisitionCertifiedResidualPortfolioSelectionPolicy(
+                    generate_once=generate_once,
+                    binding_for=self.binding_for,
+                    allocator=self.allocator,
+                )
+            if type(self.allocator) is RegretBoundedSlatePolicy:
+                return PydanticAIRegretBoundedInformationPortfolioSelectionPolicy(
+                    generate_once=generate_once,
+                    binding_for=self.binding_for,
+                    allocator=self.allocator,
+                )
             if type(self.allocator) is TargetConditionedSlateAllocatorAdapter:
                 return (
                     PydanticAIConstraintDecoupledTargetConditionedPortfolioSelectionPolicy(
@@ -576,25 +615,31 @@ class CalibratedPortfolioCampaignCoordinator:
         if type(payload) is not dict:
             raise AssertionError("calibrated audit payload did not thaw to an object")
         reconciliation = payload.get("semantic_reconciliation")
-        if type(reconciliation) is not dict:
-            raise ValueError("contextual source decode requires reconciliation")
-        members = reconciliation.get("members")
-        if type(members) is not list:
-            raise TypeError("semantic reconciliation omitted members")
-        reconciled_option_ids = tuple(
-            member.get("option_id")
-            for member in members
-            if type(member) is dict and type(member.get("option_id")) is str
-        )
-        if len(reconciled_option_ids) != len(members) or len(
-            set(reconciled_option_ids)
-        ) != len(reconciled_option_ids):
-            raise ValueError("semantic reconciliation option identities are invalid")
         selected = tuple(
             member.materialization.option_id for member in result.receipt.members
         )
-        if not set(selected).issubset(reconciled_option_ids):
-            raise ValueError("selected portfolio escapes semantic reconciliation")
+        if reconciliation is None:
+            if self.constraint_decoupled:
+                raise ValueError("constraint-decoupled source decode needs reconciliation")
+        elif type(reconciliation) is not dict:
+            raise TypeError("semantic reconciliation must be an exact object")
+        else:
+            members = reconciliation.get("members")
+            if type(members) is not list:
+                raise TypeError("semantic reconciliation omitted members")
+            reconciled_option_ids = tuple(
+                member.get("option_id")
+                for member in members
+                if type(member) is dict and type(member.get("option_id")) is str
+            )
+            if len(reconciled_option_ids) != len(members) or len(
+                set(reconciled_option_ids)
+            ) != len(reconciled_option_ids):
+                raise ValueError(
+                    "semantic reconciliation option identities are invalid"
+                )
+            if not set(selected).issubset(reconciled_option_ids):
+                raise ValueError("selected portfolio escapes semantic reconciliation")
         source_by_option = finite_variation_source_by_option(
             entry.request.finite_variation_contract
         )
@@ -673,6 +718,18 @@ class CalibratedPortfolioCampaignCoordinator:
             requested_operator_target_counts=counts("requested_operator_target_counts"),
             realized_source_target_counts=counts("realized_source_target_counts"),
             realized_operator_target_counts=counts("realized_operator_target_counts"),
+            requested_minimum_single_path_interventions=(
+                contract.minimum_single_path_interventions
+            ),
+            realized_single_path_interventions=(
+                projection.get("realized_single_path_interventions", 0)
+            ),
+            requested_minimum_disjoint_parent_patch_pairs=(
+                contract.minimum_disjoint_parent_patch_pairs
+            ),
+            realized_disjoint_parent_patch_pairs=(
+                projection.get("realized_disjoint_parent_patch_pairs", 0)
+            ),
         )
         realization.require_contract(contract)
         if projection.get("source_l1_deviation") != realization.source_l1_deviation:

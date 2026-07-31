@@ -133,18 +133,49 @@ EQUAL_60_OFFSPRING_SCALE_SHAPES = {
 }
 
 
-# Frozen M24 -> model K8 -> evaluator k4 developmental reference shape.  The
-# two campaign seeds are outside the 36 offspring opportunities, giving the
-# currently used 38 terminal-candidate budget.  Naming this once prevents each
-# workload runner from silently rebuilding the same schedule with local
-# constants.
-REFERENCE_36_OFFSPRING_SCALE_SHAPE = PortfolioScaleShape(
-    "g6_k4_r2",
-    6,
-    2,
-    4,
-    2,
-)
+# Equal-budget B38 shapes.  The two campaign seeds are outside the 36
+# offspring opportunities.  Keeping the alternatives in one workload-neutral
+# registry prevents benchmark runners from silently rebuilding different
+# schedules with local constants.
+#
+# ``g6_k5_r1`` is the anchor-heavy successor: for two parent lanes it preserves
+# the reference shape's eighteen semantic portfolio positions, doubles the
+# capacity available to a four-member protected numerical batch (six to twelve
+# evaluated positions over the campaign), and halves compulsory
+# recombination from twelve to six positions.  It changes allocation
+# opportunity, not the total real-evaluation budget.
+EQUAL_36_OFFSPRING_SCALE_SHAPES = {
+    value.shape_id: value
+    for value in (
+        PortfolioScaleShape("g6_k4_r2", 6, 2, 4, 2),
+        PortfolioScaleShape("g6_k5_r1", 6, 2, 5, 1),
+    )
+}
+
+
+# Truthfully separate near-reference-budget successors from the exactly B38
+# registry. Both successors stay inside the already-qualified K8-to-K4
+# selector. ``g6_k4_r1`` is a B32 screening rung (24 portfolio + 6
+# recombination occurrences); ``g7_k4_r1`` is the B40 expansion rung (32 + 6).
+SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES = {
+    **EQUAL_36_OFFSPRING_SCALE_SHAPES,
+    "g6_k4_r1": PortfolioScaleShape("g6_k4_r1", 6, 2, 4, 1),
+    "g7_k4_r1": PortfolioScaleShape("g7_k4_r1", 7, 2, 4, 1),
+}
+
+
+REFERENCE_36_OFFSPRING_SCALE_SHAPE = EQUAL_36_OFFSPRING_SCALE_SHAPES[
+    "g6_k4_r2"
+]
+ANCHOR_HEAVY_36_OFFSPRING_SCALE_SHAPE = EQUAL_36_OFFSPRING_SCALE_SHAPES[
+    "g6_k5_r1"
+]
+REFERENCE_HEAVY_B40_SCALE_SHAPE = SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES[
+    "g7_k4_r1"
+]
+REFERENCE_HEAVY_B32_SCALE_SHAPE = SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES[
+    "g6_k4_r1"
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,7 +455,9 @@ class DelayedPortfolioCampaignPreset:
 
 
 __all__ = [
+    "ANCHOR_HEAVY_36_OFFSPRING_SCALE_SHAPE",
     "DelayedPortfolioCampaignPreset",
+    "EQUAL_36_OFFSPRING_SCALE_SHAPES",
     "EQUAL_60_OFFSPRING_SCALE_SHAPES",
     "PortfolioCampaignBehavior",
     "PortfolioScaleShape",

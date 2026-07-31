@@ -14,7 +14,17 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class CampaignEvaluationAccounting:
-    """Exact occurrence/physical-call partition for one completed campaign."""
+    """Exact occurrence/physical-call partition for one completed campaign.
+
+    ``planned_candidate_occurrences`` is an exact commitment by default.  A
+    campaign whose evolutionary operators may *typed-abstain* (for example,
+    when no legal crossover pair exists) can additionally publish a
+    ``minimum_candidate_occurrences``.  In that mode the frozen plan is a hard
+    capacity ceiling and the minimum is the mandatory work floor.  This keeps
+    legal operator abstention distinct from both silent budget loss and cache
+    reuse: every realized occurrence is still partitioned exactly, while the
+    unfilled capacity is reported explicitly.
+    """
 
     planned_candidate_occurrences: int
     seed_occurrences: int
@@ -23,6 +33,7 @@ class CampaignEvaluationAccounting:
     stage_unique_evaluations: tuple[int, ...]
     candidate_occurrences: int
     unique_evaluations: int
+    minimum_candidate_occurrences: int | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -35,6 +46,14 @@ class CampaignEvaluationAccounting:
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a non-negative exact integer")
+        if self.minimum_candidate_occurrences is not None and (
+            type(self.minimum_candidate_occurrences) is not int
+            or self.minimum_candidate_occurrences < 0
+        ):
+            raise ValueError(
+                "minimum_candidate_occurrences must be a non-negative exact "
+                "integer or None"
+            )
         for name in ("stage_occurrences", "stage_unique_evaluations"):
             values = getattr(self, name)
             if type(values) is not tuple or any(
@@ -62,8 +81,29 @@ class CampaignEvaluationAccounting:
             self.seed_unique_evaluations + sum(self.stage_unique_evaluations)
         ):
             raise ValueError("unique evaluations do not equal the stage partition")
-        if self.candidate_occurrences != self.planned_candidate_occurrences:
-            raise ValueError("completed occurrences differ from the frozen plan")
+        if self.minimum_candidate_occurrences is None:
+            if self.candidate_occurrences != self.planned_candidate_occurrences:
+                raise ValueError("completed occurrences differ from the frozen plan")
+        elif not (
+            self.minimum_candidate_occurrences
+            <= self.candidate_occurrences
+            <= self.planned_candidate_occurrences
+        ):
+            raise ValueError(
+                "completed occurrences escape the frozen capacity envelope"
+            )
+
+    @property
+    def planned_underfill_occurrences(self) -> int:
+        self.__post_init__()
+        return self.planned_candidate_occurrences - self.candidate_occurrences
+
+    @property
+    def candidate_capacity_utilization(self) -> float:
+        self.__post_init__()
+        if self.planned_candidate_occurrences == 0:
+            return 1.0
+        return self.candidate_occurrences / self.planned_candidate_occurrences
 
     @property
     def cache_reuse_occurrences(self) -> int:
@@ -88,12 +128,22 @@ class CampaignEvaluationAccounting:
         return {
             "schema_version": 1,
             "planned_candidate_occurrences": self.planned_candidate_occurrences,
+            "minimum_candidate_occurrences": self.minimum_candidate_occurrences,
+            "candidate_plan_mode": (
+                "exact"
+                if self.minimum_candidate_occurrences is None
+                else "typed_operator_abstention_capacity_envelope"
+            ),
             "seed_occurrences": self.seed_occurrences,
             "seed_unique_evaluations": self.seed_unique_evaluations,
             "stage_occurrences": list(self.stage_occurrences),
             "stage_unique_evaluations": list(self.stage_unique_evaluations),
             "candidate_occurrences": self.candidate_occurrences,
             "unique_evaluations": self.unique_evaluations,
+            "planned_underfill_occurrences": self.planned_underfill_occurrences,
+            "candidate_capacity_utilization_hex": (
+                self.candidate_capacity_utilization.hex()
+            ),
             "cache_reuse_occurrences": self.cache_reuse_occurrences,
             "physical_evaluation_utilization_hex": (
                 self.physical_evaluation_utilization.hex()

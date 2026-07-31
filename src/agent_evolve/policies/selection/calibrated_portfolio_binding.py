@@ -47,6 +47,9 @@ from agent_evolve.ports.portfolio_selection import PortfolioSelectionRequest
 from agent_evolve.ports.contextual_search_allocation import (
     ContextualPortfolioAllocationContract,
 )
+from agent_evolve.ports.variation_source import (
+    finite_variation_candidate_pool_required_option_ids,
+)
 
 
 _TOKEN = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
@@ -147,6 +150,9 @@ def common_pool_required_option_ids(
         sorted(
             {
                 *request.candidate_pool_required_option_ids,
+                *finite_variation_candidate_pool_required_option_ids(
+                    request.finite_variation_contract
+                ),
                 *topology_support,
                 *required_source_evaluation_option_ids(
                     request.finite_variation_contract
@@ -476,6 +482,9 @@ class CalibratedPortfolioInputBinding:
                     request.require_pairwise_disjoint_parent_patches
                 ),
                 required_option_ids=common_pool_required_option_ids(request),
+                certified_feasibility_witness_option_ids=(
+                    self.common_candidate_pool.certified_feasibility_witness_option_ids
+                ),
             )
         if self.proposal_support is not None:
             assert self.common_candidate_pool is not None

@@ -6,12 +6,13 @@ metadata.  Sources (for example model, restart, global coverage, or memory) and
 operators (for example atomic or recombination families) share the same typed
 posterior machinery.
 
-The controller is intentionally deterministic.  It uses Beta posteriors and a
-small finite-horizon exploration slot instead of stochastic Thompson sampling,
-which makes every decision exactly replayable while the empirical calibration
-base is still small.  Immediate marginal utility, post-stage frontier survival,
-final-front persistence, descendant yield, and allocation realizability remain
-separate evidence channels in every trace.
+The controller is intentionally deterministic.  It uses the empirical mean of
+bounded normalized archive return and one distribution-free uncertainty slot
+instead of stochastic Thompson sampling, which makes every decision exactly
+replayable while preserving the scale of small but real archive improvements.
+Feasibility, persistence, descendant yield, and allocation realizability remain
+separate diagnostic channels, but are not added to return with arbitrary
+weights.
 """
 
 from __future__ import annotations
@@ -36,27 +37,30 @@ from agent_evolve.ports.contextual_search_allocation import (
 
 _TOKEN = re.compile(r"^[a-z][a-z0-9_.:-]{0,255}$")
 CONTEXTUAL_SEARCH_CONTROLLER_ID = "phase_aware_contextual_source_operator"
-CONTEXTUAL_SEARCH_CONTROLLER_VERSION = 6
+CONTEXTUAL_SEARCH_CONTROLLER_VERSION = 9
 CONTEXTUAL_SEARCH_CONTROLLER_DEFINITION_SHA256 = hashlib.sha256(
-    b"agent-evolve:phase-aware-contextual-source-operator:v6;"
+    b"agent-evolve:phase-aware-contextual-source-operator:v9;"
     b"evidence=authenticated-prior-only-normalized-outcomes;"
-    b"channels=positive-marginal,normalized-utility,utility-share,feasibility,"
+    b"selection-currency=normalized-archive-return;"
+    b"diagnostics=positive-marginal,utility-share,feasibility,"
     b"stage-front-survival,final-persistence,descendant,allocation-realizability;"
     b"delayed-credit=append-only-source-joined-prior-cutoff;"
     b"allocation-realization=objective-workload-blind-request-overlap;"
-    b"posterior=beta-bernoulli-1-1;deterministic=true;"
+    b"return-estimator=bounded-empirical-mean;"
+    b"uncertainty=distribution-free-maximum-standard-error;deterministic=true;"
     b"phases=basin-acquisition,basin-expansion,composition,terminal-conversion;"
     b"terminal-information-bonus=zero;one-nonterminal-exploration-slot=true;"
-    b"allocation=phase-tempered-prior-mixture-deficit-rounding;"
+    b"allocation=posterior-mean-proportional-plus-one-uncertainty-slot;"
     b"cold-start=prior-proportional-plus-one-exploration;"
     b"source-axis=sealed-finite-variation-source-not-reconciliation-origin;"
     b"source-incumbent-prior-mass=0.50;operator-incumbent-prior-mass=0.75;"
-    b"prior-equivalent-observations-per-arm=4;"
     b"empirical-capability=prior-realized-stage-count-witnesses;"
     b"capability-projection=minimum-l1-then-maximum-posterior-score;"
     b"capability-is-witness-not-current-guarantee=true;"
     b"prospective-joint-capability=finite-contract-lane-product;"
-    b"joint-projection=minimum-source-operator-l1-then-posterior-score;"
+    b"joint-projection=maximum-feasible-exploration-retention-then-minimum-"
+    b"source-operator-l1-then-posterior-score;"
+    b"joint-exploration-recourse=deterministic-realizable-challenger;"
     b"joint-slicing=exact-witnessed-lane-vector;"
     b"durable-evidence=expanded-authenticated-query-and-prior-snapshot;"
     b"workload-model-provider-identifiers=false"
@@ -381,6 +385,29 @@ class ContextualArmPosterior:
         )
 
     @property
+    def return_probability(self) -> float:
+        """Empirical mean of bounded normalized archive return.
+
+        Infeasible evaluated actions already contribute zero utility, so
+        feasibility is a return gate rather than an independently rewarded
+        feature.  An unseen arm receives the neutral cold-start value only
+        until its first real observation; no unit pseudo-count is allowed to
+        dwarf the small archive gains common in expensive optimization.
+        """
+
+        if self.observation_count == 0:
+            return 0.5
+        return self.normalized_marginal_utility_sum / self.observation_count
+
+    @property
+    def return_uncertainty(self) -> float:
+        # A variable bounded in [0, 1] has standard deviation at most 1/2.
+        # This conservative standard-error bound is scale free and, because
+        # only one explicit exploration slot consumes it, cannot inflate the
+        # entire exploitation allocation.
+        return 0.5 / math.sqrt(max(1, self.observation_count))
+
+    @property
     def feasibility_probability(self) -> float:
         return self._beta_mean(self.feasible_count, self.observation_count)
 
@@ -465,6 +492,8 @@ class ContextualArmPosterior:
                 "mean_normalized_marginal_utility_hex": (
                     self.mean_normalized_marginal_utility.hex()
                 ),
+                "return_probability_hex": self.return_probability.hex(),
+                "return_uncertainty_hex": self.return_uncertainty.hex(),
                 "mean_marginal_utility_share_hex": (
                     self.mean_marginal_utility_share.hex()
                 ),
@@ -1266,6 +1295,7 @@ class ContextualArmAllocation:
     unconstrained_target_slots: int
     empirical_capability_projected: bool
     prospective_joint_capability_projected: bool = False
+    prospective_joint_exploration_projected: bool = False
 
     def __post_init__(self) -> None:
         if type(self.kind) is not SearchArmKind:
@@ -1296,6 +1326,17 @@ class ContextualArmAllocation:
             raise TypeError(
                 "prospective_joint_capability_projected must be an exact bool"
             )
+        if type(self.prospective_joint_exploration_projected) is not bool:
+            raise TypeError(
+                "prospective_joint_exploration_projected must be an exact bool"
+            )
+        if (
+            self.prospective_joint_exploration_projected
+            and not self.prospective_joint_capability_projected
+        ):
+            raise ValueError(
+                "exploration projection requires joint-capability projection"
+            )
         if not (
             self.empirical_capability_projected
             or self.prospective_joint_capability_projected
@@ -1317,6 +1358,9 @@ class ContextualArmAllocation:
             "empirical_capability_projected": self.empirical_capability_projected,
             "prospective_joint_capability_projected": (
                 self.prospective_joint_capability_projected
+            ),
+            "prospective_joint_exploration_projected": (
+                self.prospective_joint_exploration_projected
             ),
         }
 
@@ -1512,6 +1556,9 @@ class ContextualPortfolioAllocationSlice:
     evaluation_slots: int
     source_target_counts: tuple[tuple[str, int], ...]
     operator_target_counts: tuple[tuple[str, int], ...]
+    minimum_single_path_interventions: int = 0
+    minimum_disjoint_parent_patch_pairs: int = 0
+    feasibility_witness_option_identity_sha256s: tuple[str, ...] = ()
     slice_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1528,6 +1575,25 @@ class ContextualPortfolioAllocationSlice:
         _require_token(self.slice_id, name="slice_id")
         if type(self.evaluation_slots) is not int or self.evaluation_slots <= 0:
             raise ValueError("evaluation_slots must be positive")
+        if (
+            type(self.minimum_single_path_interventions) is not int
+            or not 0
+            <= self.minimum_single_path_interventions
+            <= self.evaluation_slots
+        ):
+            raise ValueError(
+                "minimum_single_path_interventions must lie in slice capacity"
+            )
+        maximum_pairs = self.evaluation_slots * (self.evaluation_slots - 1) // 2
+        if (
+            type(self.minimum_disjoint_parent_patch_pairs) is not int
+            or not 0
+            <= self.minimum_disjoint_parent_patch_pairs
+            <= maximum_pairs
+        ):
+            raise ValueError(
+                "minimum_disjoint_parent_patch_pairs must lie in slice pair capacity"
+            )
         for name in ("source_target_counts", "operator_target_counts"):
             values = getattr(self, name)
             if type(values) is not tuple or not values:
@@ -1542,6 +1608,21 @@ class ContextualPortfolioAllocationSlice:
                 raise ValueError(f"{name} must use canonical unique arms")
             if sum(count for _, count in values) != self.evaluation_slots:
                 raise ValueError(f"{name} must allocate every slice slot")
+        witnesses = self.feasibility_witness_option_identity_sha256s
+        if type(witnesses) is not tuple:
+            raise TypeError(
+                "feasibility_witness_option_identity_sha256s must be an exact tuple"
+            )
+        if witnesses:
+            if len(witnesses) != self.evaluation_slots or witnesses != tuple(
+                sorted(set(witnesses))
+            ):
+                raise ValueError(
+                    "allocation-slice feasibility witness must contain one canonical "
+                    "unique option identity per evaluation slot"
+                )
+            for value in witnesses:
+                require_sha256(value, "feasibility_witness_option_identity_sha256")
         object.__setattr__(
             self,
             "slice_sha256",
@@ -1549,8 +1630,16 @@ class ContextualPortfolioAllocationSlice:
         )
 
     def _unsigned_record(self) -> dict[str, object]:
-        return {
-            "schema_version": 1,
+        record: dict[str, object] = {
+            "schema_version": (
+                4
+                if self.feasibility_witness_option_identity_sha256s
+                else 3
+                if self.minimum_disjoint_parent_patch_pairs
+                else 2
+                if self.minimum_single_path_interventions
+                else 1
+            ),
             "campaign_scope_sha256": self.campaign_scope_sha256,
             "query_sha256": self.query_sha256,
             "decision_sha256": self.decision_sha256,
@@ -1565,6 +1654,28 @@ class ContextualPortfolioAllocationSlice:
                 list(value) for value in self.operator_target_counts
             ],
         }
+        if self.minimum_single_path_interventions:
+            record["minimum_single_path_interventions"] = (
+                self.minimum_single_path_interventions
+            )
+            record["intervention_axis"] = (
+                "exact_parent_relative_changed_json_path_count"
+            )
+        if self.minimum_disjoint_parent_patch_pairs:
+            record["minimum_disjoint_parent_patch_pairs"] = (
+                self.minimum_disjoint_parent_patch_pairs
+            )
+            record["offspring_opportunity_axis"] = (
+                "pairwise_disjoint_parent_relative_patch_pairs"
+            )
+        if self.feasibility_witness_option_identity_sha256s:
+            record["feasibility_witness_option_identity_sha256s"] = list(
+                self.feasibility_witness_option_identity_sha256s
+            )
+            record["feasibility_witness_semantics"] = (
+                "current_finite_contract_exact_joint_count_and_structural_witness"
+            )
+        return record
 
     def to_record(self) -> dict[str, object]:
         self.__post_init__()
@@ -1602,6 +1713,15 @@ class ContextualPortfolioAllocationSlice:
             evaluation_slots=self.evaluation_slots,
             source_target_counts=self.source_target_counts,
             operator_target_counts=self.operator_target_counts,
+            minimum_single_path_interventions=(
+                self.minimum_single_path_interventions
+            ),
+            minimum_disjoint_parent_patch_pairs=(
+                self.minimum_disjoint_parent_patch_pairs
+            ),
+            feasibility_witness_option_identity_sha256s=(
+                self.feasibility_witness_option_identity_sha256s
+            ),
         )
 
 
@@ -1640,6 +1760,35 @@ class ContextualSearchStageAllocation:
             sorted({value.slice_id for value in self.slices})
         ):
             raise ValueError("allocation slices must be unique and canonical")
+        if self.decision.joint_capability_selection:
+            selected_vectors = tuple(
+                capability.resolve_vector(vector_sha256)
+                for capability, (slice_id, vector_sha256) in zip(
+                    self.decision.query.joint_count_capabilities,
+                    self.decision.joint_capability_selection,
+                    strict=True,
+                )
+                if capability.slice_id == slice_id
+            )
+            if len(selected_vectors) != len(self.slices) or any(
+                allocation.feasibility_witness_option_identity_sha256s
+                != vector.feasibility_witness_option_identity_sha256s
+                for allocation, vector in zip(
+                    self.slices,
+                    selected_vectors,
+                    strict=True,
+                )
+            ):
+                raise ValueError(
+                    "allocation slices differ from their selected joint witnesses"
+                )
+        elif any(
+            value.feasibility_witness_option_identity_sha256s
+            for value in self.slices
+        ):
+            raise ValueError(
+                "allocation slice carries a witness without joint capability selection"
+            )
         if sum(value.evaluation_slots for value in self.slices) != (
             self.decision.query.real_evaluation_slots
         ):
@@ -1759,12 +1908,24 @@ def slice_contextual_search_decision(
             raise ValueError("joint capability selection has a foreign slice")
         source_rows = tuple(value.source_target_counts for value in vectors)
         operator_rows = tuple(value.operator_target_counts for value in vectors)
+        minimum_single_path_rows = tuple(
+            value.minimum_single_path_interventions for value in capabilities
+        )
+        minimum_disjoint_pair_rows = tuple(
+            value.minimum_disjoint_parent_patch_pairs for value in capabilities
+        )
+        feasibility_witness_rows = tuple(
+            value.feasibility_witness_option_identity_sha256s for value in vectors
+        )
     else:
         source_rows = _slice_arm_counts(decision.source_allocations, evaluation_slots)
         operator_rows = _slice_arm_counts(
             decision.operator_allocations,
             evaluation_slots,
         )
+        minimum_single_path_rows = tuple(0 for _ in slice_ids)
+        minimum_disjoint_pair_rows = tuple(0 for _ in slice_ids)
+        feasibility_witness_rows = tuple(() for _ in slice_ids)
     return ContextualSearchStageAllocation(
         decision=decision,
         slices=tuple(
@@ -1778,12 +1939,32 @@ def slice_contextual_search_decision(
                 evaluation_slots=slots,
                 source_target_counts=source_counts,
                 operator_target_counts=operator_counts,
+                minimum_single_path_interventions=(
+                    minimum_single_path_interventions
+                ),
+                minimum_disjoint_parent_patch_pairs=(
+                    minimum_disjoint_parent_patch_pairs
+                ),
+                feasibility_witness_option_identity_sha256s=(
+                    feasibility_witness_option_identity_sha256s
+                ),
             )
-            for slice_id, slots, source_counts, operator_counts in zip(
+            for (
+                slice_id,
+                slots,
+                source_counts,
+                operator_counts,
+                minimum_single_path_interventions,
+                minimum_disjoint_parent_patch_pairs,
+                feasibility_witness_option_identity_sha256s,
+            ) in zip(
                 slice_ids,
                 evaluation_slots,
                 source_rows,
                 operator_rows,
+                minimum_single_path_rows,
+                minimum_disjoint_pair_rows,
+                feasibility_witness_rows,
                 strict=True,
             )
         ),
@@ -1804,64 +1985,19 @@ def _phase(
 
 
 def _score(posterior: ContextualArmPosterior, phase: SearchPhase) -> float:
-    # Preserve both absolute fixed-reference magnitude and within-wave
-    # contribution. Share alone makes a microscopic singleton gain look like
-    # a decisive stage; magnitude alone can hide a rare arm in a strong wave.
-    immediate = 0.5 * (
-        posterior.mean_normalized_marginal_utility
-        + posterior.mean_marginal_utility_share
-    )
-    opportunity = posterior.positive_probability
-    feasibility = posterior.feasibility_probability
-    stage_persistence = (
-        0.0
-        if posterior.stage_persistence_observation_count == 0
-        else posterior.stage_persistence_probability
-    )
-    final_persistence = (
-        0.0
-        if posterior.persistence_observation_count == 0
-        else posterior.persistence_probability
-    )
-    descendant = (
-        0.0
-        if posterior.descendant_observation_count == 0
-        else posterior.descendant_probability
-    )
-    realizability = (
-        0.0
-        if posterior.allocation_requested_slot_count == 0
-        else posterior.allocation_realizability_probability
-    )
-    realizability_weight = (
-        0.0 if posterior.allocation_requested_slot_count == 0 else 0.10
-    )
-    uncertainty = posterior.positive_uncertainty
-    distance_penalty = 0.25 * posterior.mean_source_distance
-    if phase is SearchPhase.TERMINAL_CONVERSION:
-        return (
-            0.25 * opportunity
-            + 0.25 * immediate
-            + 0.15 * stage_persistence
-            + 0.10 * descendant
-            + 0.05 * final_persistence
-            + 0.10 * feasibility
-            + realizability_weight * realizability
-            - 0.50 * uncertainty
-            - distance_penalty
-        )
-    descendant_weight = 0.20 if phase is SearchPhase.COMPOSITION else 0.15
-    information_weight = 0.05 if phase is SearchPhase.COMPOSITION else 0.10
-    return (
-        0.25 * opportunity
-        + 0.25 * immediate
-        + 0.15 * feasibility
-        + 0.10 * stage_persistence
-        + descendant_weight * descendant
-        + information_weight * uncertainty
-        + realizability_weight * realizability
-        - distance_penalty
-    )
+    """Return the exploitation value in the single archive-return currency.
+
+    Every evaluated infeasible or zero-yield action is already a zero in the
+    fractional-Beta return posterior.  Persistence, descendant incidence,
+    source distance, and allocation overlap remain available for diagnosis and
+    future resolved-return construction; rewarding them separately would count
+    the same causal outcome more than once.  Nonterminal uncertainty receives
+    exactly one separately marked exploration slot in ``_allocate``.  Folding
+    it into every proportional target as well would pay for information twice.
+    """
+
+    del phase
+    return posterior.return_probability
 
 
 def _allocate(
@@ -1916,7 +2052,7 @@ def _allocate(
         exploration_id = sorted(
             (value for value in posteriors if value.arm_id != leader_id),
             key=lambda value: (
-                -value.positive_uncertainty,
+                -value.return_uncertainty,
                 value.observation_count,
                 value.arm_id,
             ),
@@ -1930,36 +2066,16 @@ def _allocate(
     if cold_start:
         probabilities = incumbent_prior
     else:
-        # Tempered proportional allocation prevents one or two lucky outcomes
-        # from monopolizing a finite generation.  Temperature falls with the
-        # horizon: broad early support, sharper terminal conversion.
-        temperature = {
-            SearchPhase.BASIN_ACQUISITION: 0.20,
-            SearchPhase.BASIN_EXPANSION: 0.10,
-            SearchPhase.COMPOSITION: 0.10,
-            SearchPhase.TERMINAL_CONVERSION: 0.06,
-        }[phase]
-        maximum = max(scores.values())
-        weights = {
-            value.arm_id: math.exp((scores[value.arm_id] - maximum) / temperature)
-            for value in posteriors
-        }
-        total_weight = sum(weights.values())
-        evidence_probabilities = {
-            value.arm_id: weights[value.arm_id] / total_weight for value in posteriors
-        }
-        observation_count = sum(value.observation_count for value in posteriors)
-        prior_equivalent_observations = 4 * len(posteriors)
-        evidence_weight = observation_count / (
-            observation_count + prior_equivalent_observations
-        )
-        probabilities = {
-            value.arm_id: (
-                evidence_weight * evidence_probabilities[value.arm_id]
-                + (1.0 - evidence_weight) * incumbent_prior[value.arm_id]
-            )
-            for value in posteriors
-        }
+        # Beta(1,1) is already the explicit cold-start prior.  A second
+        # temperature or hand-sized prior mixture would count prior mass twice.
+        total_score = sum(scores.values())
+        if total_score <= 0.0:  # Defensive only: fractional-Beta means are > 0.
+            probabilities = incumbent_prior
+        else:
+            probabilities = {
+                value.arm_id: scores[value.arm_id] / total_score
+                for value in posteriors
+            }
     desired = {
         value.arm_id: slots * probabilities[value.arm_id] for value in posteriors
     }
@@ -2076,10 +2192,12 @@ def _project_joint_capability_product(
             )
             for arm_id in operator_ids
         }
-        if any(source_counts[value] == 0 for value in source_exploration) or any(
+        source_exploration_loss = sum(
+            source_counts[value] == 0 for value in source_exploration
+        )
+        operator_exploration_loss = sum(
             operator_counts[value] == 0 for value in operator_exploration
-        ):
-            continue
+        )
         source_l1 = sum(
             abs(source_counts[value] - preferred_source[value]) for value in source_ids
         )
@@ -2093,6 +2211,9 @@ def _project_joint_capability_product(
             operator_scores[value] * operator_counts[value] for value in operator_ids
         )
         key: tuple[object, ...] = (
+            source_exploration_loss + operator_exploration_loss,
+            source_exploration_loss,
+            operator_exploration_loss,
             source_l1 + operator_l1,
             source_l1,
             operator_l1,
@@ -2100,10 +2221,8 @@ def _project_joint_capability_product(
             tuple(value.vector_sha256 for value in vectors),
         )
         candidates.append((key, vectors, source_counts, operator_counts))
-    if not candidates:
-        raise ValueError(
-            "no joint lane capability assignment preserves protected exploration"
-        )
+    if not candidates:  # pragma: no cover - lane capability constructors close this.
+        raise ValueError("joint lane capabilities have no feasible product")
     _, vectors, selected_source, selected_operator = min(
         candidates,
         key=lambda value: value[0],
@@ -2113,13 +2232,59 @@ def _project_joint_capability_product(
         allocations: tuple[ContextualArmAllocation, ...],
         selected: dict[str, int],
     ) -> tuple[ContextualArmAllocation, ...]:
+        requested_exploration = tuple(
+            value.arm_id for value in allocations if value.exploration_slot
+        )
+        realized_exploration: str | None = None
+        if requested_exploration:
+            requested = requested_exploration[0]
+            if selected[requested] > 0:
+                realized_exploration = requested
+            else:
+                eligible = tuple(
+                    value for value in allocations if selected[value.arm_id] > 0
+                )
+                if not eligible:  # pragma: no cover - selected counts sum positive.
+                    raise AssertionError("joint projection selected no realized arm")
+                # Infer the exploitation leader from the unconstrained dose, then
+                # move the information marker to the least-entitled realizable
+                # challenger.  This is deterministic and consumes no workload,
+                # model, provider, or outcome identifier.
+                leader = sorted(
+                    allocations,
+                    key=lambda value: (
+                        -value.unconstrained_target_slots,
+                        -value.allocation_probability,
+                        -value.score,
+                        value.arm_id,
+                    ),
+                )[0]
+                challengers = tuple(
+                    value for value in eligible if value.arm_id != leader.arm_id
+                )
+                realized_exploration = sorted(
+                    challengers if challengers else eligible,
+                    key=lambda value: (
+                        value.unconstrained_target_slots,
+                        value.allocation_probability,
+                        value.score,
+                        value.arm_id,
+                    ),
+                )[0].arm_id
         return tuple(
             replace(
                 value,
                 target_slots=selected[value.arm_id],
+                exploration_slot=value.arm_id == realized_exploration,
                 prospective_joint_capability_projected=(
                     value.prospective_joint_capability_projected
                     or selected[value.arm_id] != value.target_slots
+                    or value.exploration_slot
+                    != (value.arm_id == realized_exploration)
+                ),
+                prospective_joint_exploration_projected=(
+                    value.exploration_slot
+                    != (value.arm_id == realized_exploration)
                 ),
             )
             for value in allocations

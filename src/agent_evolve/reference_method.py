@@ -1200,7 +1200,7 @@ def reference_campaign_experiment_profile(
         agent_concurrency=agent_concurrency,
         agent_queue_capacity=agent_queue_capacity,
         reflection_supervision=CampaignReflectionSupervisionPolicy(
-            ReflectionFailureMode.FAIL_AT_NEXT_STAGE_BOUNDARY
+            ReflectionFailureMode.BEST_EFFORT_DEGRADED
         ),
     )
 

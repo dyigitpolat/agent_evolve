@@ -22,13 +22,16 @@ from agent_evolve.ports.action_forecast import (
 )
 from agent_evolve.ports.portfolio_selection import (
     finite_option_ids_have_pairwise_disjoint_parent_patch_subset,
+    pairwise_disjoint_parent_patch_pairs,
     pairwise_disjoint_parent_patch_witness,
+    single_path_parent_patch_option_ids,
 )
 
 
 _TOKEN = re.compile(r"^[a-z][a-z0-9_.-]{0,95}$")
 _OPTION_ID = re.compile(r"^[a-z][a-z0-9_.-]{0,255}$")
-_REQUEST_DOMAIN = b"agent-evolve:action-allocation-request:v3\x00"
+_ARM_ID = re.compile(r"^[a-z][a-z0-9_.:-]{0,255}$")
+_REQUEST_DOMAIN = b"agent-evolve:action-allocation-request:v4\x00"
 _DECISION_DOMAIN = b"agent-evolve:action-portfolio-decision:v1\x00"
 _ELIGIBLE_DOMAIN = b"agent-evolve:eligible-action-set:v1\x00"
 
@@ -73,16 +76,23 @@ class ForecastPortfolioUtilityInput:
         if type(self.optimization_semantics) is not OptimizationSemantics:
             raise TypeError("optimization_semantics must be exact")
         OptimizationSemantics.__post_init__(self.optimization_semantics)
-        if type(self.parent_metric_values) is not tuple or not self.parent_metric_values:
+        if (
+            type(self.parent_metric_values) is not tuple
+            or not self.parent_metric_values
+        ):
             raise ValueError("parent_metric_values must be a non-empty exact tuple")
-        if any(type(value) is not ParentMetricValue for value in self.parent_metric_values):
+        if any(
+            type(value) is not ParentMetricValue for value in self.parent_metric_values
+        ):
             raise TypeError("parent_metric_values must contain exact values")
         if type(self.metric_scales) is not tuple or not self.metric_scales:
             raise ValueError("metric_scales must be a non-empty exact tuple")
         if any(type(value) is not MetricForecastScale for value in self.metric_scales):
             raise TypeError("metric_scales must contain exact values")
-        if type(self.members) is not tuple or not self.members or any(
-            type(value) is not ResolvedActionForecast for value in self.members
+        if (
+            type(self.members) is not tuple
+            or not self.members
+            or any(type(value) is not ResolvedActionForecast for value in self.members)
         ):
             raise ValueError("members must be a non-empty exact resolved tuple")
         for value in self.members:
@@ -128,6 +138,72 @@ class ForecastPortfolioUtilityBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class ExactActionArmCountConstraint:
+    """One objective-blind exact exposure constraint over sealed actions.
+
+    ``constraint_id`` names a generic attribution axis such as proposal source
+    or variation operator.  The allocator sees only option-to-arm labels and
+    exact counts; workload, model, provider, and objective identifiers remain
+    outside this port.
+    """
+
+    constraint_id: str
+    option_arm_ids: tuple[tuple[str, str], ...]
+    target_counts: tuple[tuple[str, int], ...]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.constraint_id) is not str
+            or _TOKEN.fullmatch(self.constraint_id) is None
+        ):
+            raise ValueError("constraint_id must use the closed token grammar")
+        if type(self.option_arm_ids) is not tuple or not self.option_arm_ids:
+            raise ValueError("option_arm_ids must be a non-empty exact tuple")
+        for option_id, arm_id in self.option_arm_ids:
+            if (
+                type(option_id) is not str
+                or _OPTION_ID.fullmatch(option_id) is None
+                or type(arm_id) is not str
+                or _ARM_ID.fullmatch(arm_id) is None
+            ):
+                raise ValueError("option_arm_ids contains an invalid token")
+        if self.option_arm_ids != tuple(sorted(self.option_arm_ids)) or len(
+            {value[0] for value in self.option_arm_ids}
+        ) != len(self.option_arm_ids):
+            raise ValueError("option_arm_ids must be option-unique and canonical")
+        if type(self.target_counts) is not tuple or not self.target_counts:
+            raise ValueError("target_counts must be a non-empty exact tuple")
+        for arm_id, count in self.target_counts:
+            if type(arm_id) is not str or _ARM_ID.fullmatch(arm_id) is None:
+                raise ValueError("target_counts contains an invalid arm token")
+            if type(count) is not int or count < 0:
+                raise ValueError("target_counts must be non-negative exact integers")
+        if self.target_counts != tuple(sorted(self.target_counts)) or len(
+            {value[0] for value in self.target_counts}
+        ) != len(self.target_counts):
+            raise ValueError("target_counts must be arm-unique and canonical")
+        if sum(value[1] for value in self.target_counts) <= 0:
+            raise ValueError("target_counts must allocate positive capacity")
+        attributed_arms = {value[1] for value in self.option_arm_ids}
+        target = dict(self.target_counts)
+        if not attributed_arms.issubset(target) or any(
+            count > 0 and arm_id not in attributed_arms
+            for arm_id, count in target.items()
+        ):
+            raise ValueError(
+                "option attribution cannot realize the positive target arms"
+            )
+
+    def to_record(self) -> dict[str, object]:
+        self.__post_init__()
+        return {
+            "constraint_id": self.constraint_id,
+            "option_arm_ids": [list(value) for value in self.option_arm_ids],
+            "target_counts": [list(value) for value in self.target_counts],
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ActionAllocationRequest:
     """Allocation input with a cache-safe canonical eligible-action subset."""
 
@@ -138,7 +214,10 @@ class ActionAllocationRequest:
     utility: ForecastPortfolioUtilityBinding
     min_distinct_families: int | None = None
     require_pairwise_disjoint_parent_patches: bool = False
+    minimum_single_path_interventions: int = 0
+    minimum_disjoint_parent_patch_pairs: int = 0
     required_option_ids: tuple[str, ...] = ()
+    exact_arm_count_constraints: tuple[ExactActionArmCountConstraint, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.forecast_request) is not ActionForecastRequest:
@@ -178,13 +257,9 @@ class ActionAllocationRequest:
                 type(self.min_distinct_families) is not int
                 or self.min_distinct_families <= 0
             ):
-                raise ValueError(
-                    "min_distinct_families must be positive or None"
-                )
+                raise ValueError("min_distinct_families must be positive or None")
             if self.min_distinct_families > self.portfolio_size:
-                raise ValueError(
-                    "min_distinct_families cannot exceed portfolio_size"
-                )
+                raise ValueError("min_distinct_families cannot exceed portfolio_size")
             if self.min_distinct_families > len(available_families):
                 raise ValueError(
                     "eligible actions cannot satisfy min_distinct_families"
@@ -192,6 +267,39 @@ class ActionAllocationRequest:
         if type(self.require_pairwise_disjoint_parent_patches) is not bool:
             raise TypeError(
                 "require_pairwise_disjoint_parent_patches must be exact bool"
+            )
+        if (
+            type(self.minimum_single_path_interventions) is not int
+            or not 0
+            <= self.minimum_single_path_interventions
+            <= self.portfolio_size
+        ):
+            raise ValueError(
+                "minimum_single_path_interventions must lie in portfolio capacity"
+            )
+        maximum_pairs = self.portfolio_size * (self.portfolio_size - 1) // 2
+        if (
+            type(self.minimum_disjoint_parent_patch_pairs) is not int
+            or not 0
+            <= self.minimum_disjoint_parent_patch_pairs
+            <= maximum_pairs
+        ):
+            raise ValueError(
+                "minimum_disjoint_parent_patch_pairs must lie in portfolio pair "
+                "capacity"
+            )
+        contract = self.forecast_request.finite_variation_contract
+        if self.minimum_single_path_interventions > len(
+            single_path_parent_patch_option_ids(contract, self.eligible_option_ids)
+        ):
+            raise ValueError(
+                "eligible actions cannot satisfy the single-path intervention floor"
+            )
+        if self.minimum_disjoint_parent_patch_pairs > len(
+            pairwise_disjoint_parent_patch_pairs(contract, self.eligible_option_ids)
+        ):
+            raise ValueError(
+                "eligible actions cannot satisfy the disjoint parent-pair floor"
             )
         if type(self.required_option_ids) is not tuple or any(
             type(value) is not str or _OPTION_ID.fullmatch(value) is None
@@ -204,6 +312,45 @@ class ActionAllocationRequest:
             raise ValueError("required_option_ids contains an ineligible option")
         if len(self.required_option_ids) > self.portfolio_size:
             raise ValueError("required_option_ids exceeds the portfolio size")
+        if type(self.exact_arm_count_constraints) is not tuple or any(
+            type(value) is not ExactActionArmCountConstraint
+            for value in self.exact_arm_count_constraints
+        ):
+            raise TypeError(
+                "exact_arm_count_constraints must be an exact constraint tuple"
+            )
+        for constraint in self.exact_arm_count_constraints:
+            constraint.__post_init__()
+        constraint_ids = tuple(
+            value.constraint_id for value in self.exact_arm_count_constraints
+        )
+        if constraint_ids != tuple(sorted(set(constraint_ids))):
+            raise ValueError(
+                "exact_arm_count_constraints must use unique canonical IDs"
+            )
+        for constraint in self.exact_arm_count_constraints:
+            if sum(value[1] for value in constraint.target_counts) != (
+                self.portfolio_size
+            ):
+                raise ValueError(
+                    "exact arm targets must allocate the complete portfolio"
+                )
+            arm_by_option = dict(constraint.option_arm_ids)
+            if set(arm_by_option) != available:
+                raise ValueError(
+                    "exact arm attribution must cover the complete forecast batch"
+                )
+            target = dict(constraint.target_counts)
+            eligible_counts = {arm_id: 0 for arm_id in target}
+            required_counts = {arm_id: 0 for arm_id in target}
+            for option_id in self.eligible_option_ids:
+                eligible_counts[arm_by_option[option_id]] += 1
+            for option_id in self.required_option_ids:
+                required_counts[arm_by_option[option_id]] += 1
+            if any(eligible_counts[arm_id] < count for arm_id, count in target.items()):
+                raise ValueError("eligible actions cannot satisfy exact arm targets")
+            if any(required_counts[arm_id] > count for arm_id, count in target.items()):
+                raise ValueError("required actions exceed an exact arm target")
         if self.require_pairwise_disjoint_parent_patches and not (
             finite_option_ids_have_pairwise_disjoint_parent_patch_subset(
                 self.forecast_request.finite_variation_contract,
@@ -256,8 +403,12 @@ class ActionAllocationRequest:
 
     def to_record(self) -> dict[str, object]:
         self.__post_init__()
-        return {
-            "schema_version": 3,
+        structural_floor_bound = bool(
+            self.minimum_single_path_interventions
+            or self.minimum_disjoint_parent_patch_pairs
+        )
+        record: dict[str, object] = {
+            "schema_version": 5 if structural_floor_bound else 4,
             "forecast_request_sha256": self.forecast_request.request_sha256,
             "forecast_receipt_sha256": self.forecasts.receipt_sha256,
             "eligible_option_ids": list(self.eligible_option_ids),
@@ -269,7 +420,19 @@ class ActionAllocationRequest:
                 self.require_pairwise_disjoint_parent_patches
             ),
             "required_option_ids": list(self.required_option_ids),
+            "exact_arm_count_constraints": [
+                value.to_record() for value in self.exact_arm_count_constraints
+            ],
         }
+        if self.minimum_single_path_interventions:
+            record["minimum_single_path_interventions"] = (
+                self.minimum_single_path_interventions
+            )
+        if self.minimum_disjoint_parent_patch_pairs:
+            record["minimum_disjoint_parent_patch_pairs"] = (
+                self.minimum_disjoint_parent_patch_pairs
+            )
+        return record
 
     @property
     def request_sha256(self) -> str:
@@ -335,7 +498,10 @@ class AllocatedActionMember:
     def __post_init__(self) -> None:
         if type(self.rank) is not int or self.rank <= 0:
             raise ValueError("rank must be a positive exact integer")
-        if type(self.option_id) is not str or _OPTION_ID.fullmatch(self.option_id) is None:
+        if (
+            type(self.option_id) is not str
+            or _OPTION_ID.fullmatch(self.option_id) is None
+        ):
             raise ValueError("option_id must use the finite-option grammar")
         if type(self.family) is not str or _TOKEN.fullmatch(self.family) is None:
             raise ValueError("family must use the closed token grammar")
@@ -392,8 +558,10 @@ class ActionPortfolioDecision:
             "allocator_configuration_sha256",
         ):
             require_sha256(getattr(self, name), name)
-        if type(self.members) is not tuple or not self.members or any(
-            type(value) is not AllocatedActionMember for value in self.members
+        if (
+            type(self.members) is not tuple
+            or not self.members
+            or any(type(value) is not AllocatedActionMember for value in self.members)
         ):
             raise ValueError("members must be a non-empty exact allocated tuple")
         for value in self.members:
@@ -409,7 +577,10 @@ class ActionPortfolioDecision:
         self.final_score.__post_init__()
         if self.final_score != self.members[-1].greedy_step_score:
             raise ValueError("final_score must equal the last greedy step score")
-        if type(self.candidate_evaluations) is not int or self.candidate_evaluations <= 0:
+        if (
+            type(self.candidate_evaluations) is not int
+            or self.candidate_evaluations <= 0
+        ):
             raise ValueError("candidate_evaluations must be a positive exact integer")
         for prefix in ("utility", "allocator"):
             policy_id = getattr(self, f"{prefix}_policy_id")
@@ -510,8 +681,7 @@ def validate_action_portfolio_decision(
         forecast = forecasts[member.option_id]
         if (
             member.option_identity_sha256 != forecast.option_identity_sha256
-            or member.child_configuration_sha256
-            != forecast.child_configuration_sha256
+            or member.child_configuration_sha256 != forecast.child_configuration_sha256
             or member.family != forecast.family
         ):
             raise ValueError("allocation member differs from its resolved forecast")
@@ -519,6 +689,32 @@ def validate_action_portfolio_decision(
         member.option_id for member in decision.members
     ):
         raise ValueError("allocation decision omitted a required option")
+    selected_ids = tuple(member.option_id for member in decision.members)
+    if len(
+        single_path_parent_patch_option_ids(
+            request.forecast_request.finite_variation_contract,
+            selected_ids,
+        )
+    ) < request.minimum_single_path_interventions:
+        raise ValueError(
+            "allocation decision violated its single-path intervention floor"
+        )
+    if len(
+        pairwise_disjoint_parent_patch_pairs(
+            request.forecast_request.finite_variation_contract,
+            selected_ids,
+        )
+    ) < request.minimum_disjoint_parent_patch_pairs:
+        raise ValueError(
+            "allocation decision violated its disjoint parent-pair floor"
+        )
+    for constraint in request.exact_arm_count_constraints:
+        arm_by_option = dict(constraint.option_arm_ids)
+        realized = {arm_id: 0 for arm_id, _ in constraint.target_counts}
+        for option_id in selected_ids:
+            realized[arm_by_option[option_id]] += 1
+        if tuple(sorted(realized.items())) != constraint.target_counts:
+            raise ValueError("allocation decision violated an exact arm target")
 
 
 __all__ = [
@@ -526,6 +722,7 @@ __all__ = [
     "ActionAllocationResult",
     "ActionPortfolioDecision",
     "AllocatedActionMember",
+    "ExactActionArmCountConstraint",
     "DeterministicActionAllocator",
     "ForecastPortfolioUtility",
     "ForecastPortfolioUtilityBinding",

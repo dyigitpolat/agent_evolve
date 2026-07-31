@@ -8,10 +8,14 @@ the same method name to different K8-to-K4 behavior.
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping
 
 from agent_evolve.integrations.pydantic_ai.calibrated_portfolio_selection import (
+    ACQUISITION_CERTIFIED_RESIDUAL_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256,
+    REGRET_BOUNDED_INFORMATION_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256,
     CONSTRAINT_DECOUPLED_HORIZON_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256,
     CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256,
     CONTEXTUAL_SEARCH_ALLOCATION_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256,
@@ -24,6 +28,16 @@ from agent_evolve.integrations.pydantic_ai.calibrated_portfolio_selection import
     STRUCTURAL_POSTERIOR_CALIBRATED_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256,
     TARGET_CONDITIONED_CALIBRATED_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256,
     CalibratedPortfolioAllocator,
+)
+from agent_evolve.policies.selection.acquisition_certified_slate import (
+    AcquisitionCertifiedSlateContextProvider,
+    AcquisitionCertifiedSlatePolicy,
+)
+from agent_evolve.policies.selection.regret_bounded_slate import (
+    RegretBoundedSlatePolicy,
+    ResidualInformationAssayValuePolicy,
+    SlateFutureValuePolicy,
+    ZeroSlateFutureValuePolicy,
 )
 from agent_evolve.policies.selection.full_support_slate import FullSupportSlatePolicy
 from agent_evolve.policies.selection.model_anchored_slate import (
@@ -49,6 +63,9 @@ from agent_evolve.policies.selection.target_conditioned_prequential import (
 from agent_evolve.policies.variation.compositional_finite_catalog import (
     COMPOSITE_OPTION_FAMILY,
 )
+from agent_evolve.ports.finite_acquisition_batch import (
+    FiniteAcquisitionBatchScorePolicy,
+)
 
 
 class CampaignAcquisitionMode(str, Enum):
@@ -61,6 +78,8 @@ class CampaignAcquisitionMode(str, Enum):
     OPERATOR_STRATIFIED = "operator_stratified"
     HORIZON_BOUNDED = "horizon_bounded"
     TARGET_CONDITIONED = "target_conditioned"
+    ACQUISITION_CERTIFIED = "acquisition_certified"
+    REGRET_BOUNDED_INFORMATION = "regret_bounded_information"
 
 
 OPERATOR_ASSAY_MINIMUM_ENV = "AGENT_EVOLVE_OPERATOR_ASSAY_MINIMUM"
@@ -75,6 +94,130 @@ EVIDENCE_CALIBRATED_SOURCE_MIX_ENV = (
 )
 CONTEXTUAL_SEARCH_ALLOCATION_ENV = "AGENT_EVOLVE_CONTEXTUAL_SEARCH_ALLOCATION"
 RESIDUAL_FRONTIER_PLANNING_ENV = "AGENT_EVOLVE_RESIDUAL_FRONTIER_PLANNING"
+REGRET_MINIMUM_ACQUISITION_RETENTION_RATIO_ENV = (
+    "AGENT_EVOLVE_REGRET_MINIMUM_ACQUISITION_RETENTION_RATIO"
+)
+REGRET_MINIMUM_RESIDUAL_AUDIT_MEMBERS_ENV = (
+    "AGENT_EVOLVE_REGRET_MINIMUM_RESIDUAL_AUDIT_MEMBERS"
+)
+REGRET_RESIDUAL_ASSAY_VALUE_ENV = "AGENT_EVOLVE_REGRET_RESIDUAL_ASSAY_VALUE"
+REGRET_ALLOW_DEVELOPMENT_ASSAY_ENV = (
+    "AGENT_EVOLVE_REGRET_ALLOW_DEVELOPMENT_ASSAY"
+)
+REGRET_CALIBRATION_ERROR_BOUND_ENV = (
+    "AGENT_EVOLVE_REGRET_CALIBRATION_ERROR_BOUND"
+)
+
+
+def _finite_environment_float(
+    environ: Mapping[str, str],
+    name: str,
+    *,
+    default: float | None,
+) -> float | None:
+    raw = environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a finite decimal number") from error
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite decimal number")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class RegretBoundedInformationControls:
+    """Workload-neutral, explicit authority for one RBIE treatment arm."""
+
+    minimum_acquisition_retention_ratio: float
+    minimum_residual_audit_members: int
+    future_value_policy: SlateFutureValuePolicy
+    calibration_error_bound: float | None
+    allow_development_assay: bool
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.minimum_acquisition_retention_ratio) is not float
+            or not math.isfinite(self.minimum_acquisition_retention_ratio)
+            or not 0.0 < self.minimum_acquisition_retention_ratio <= 1.0
+        ):
+            raise ValueError("regret retention ratio must lie in (0, 1]")
+        if (
+            type(self.minimum_residual_audit_members) is not int
+            or self.minimum_residual_audit_members < 0
+        ):
+            raise ValueError("minimum residual audit members must be non-negative")
+        if not isinstance(self.future_value_policy, SlateFutureValuePolicy):
+            raise TypeError("future_value_policy must implement its exact port")
+        if self.calibration_error_bound is not None and (
+            type(self.calibration_error_bound) is not float
+            or not math.isfinite(self.calibration_error_bound)
+            or self.calibration_error_bound < 0.0
+        ):
+            raise ValueError("regret calibration error must be non-negative")
+        if type(self.allow_development_assay) is not bool:
+            raise TypeError("allow_development_assay must be exact")
+        is_assay = type(self.future_value_policy) is ResidualInformationAssayValuePolicy
+        if is_assay != self.allow_development_assay:
+            raise ValueError(
+                "development assay authority and assay future-value policy must agree"
+            )
+
+
+def campaign_regret_bounded_information_controls_from_environment(
+    environ: Mapping[str, str],
+) -> RegretBoundedInformationControls:
+    """Read a safe-by-default RBIE arm without workload-specific knowledge."""
+
+    ratio = _finite_environment_float(
+        environ,
+        REGRET_MINIMUM_ACQUISITION_RETENTION_RATIO_ENV,
+        default=1.0,
+    )
+    assert ratio is not None
+    residual_audit_raw = environ.get(
+        REGRET_MINIMUM_RESIDUAL_AUDIT_MEMBERS_ENV,
+        "0",
+    )
+    if not residual_audit_raw.isascii() or not residual_audit_raw.isdigit():
+        raise ValueError(
+            f"{REGRET_MINIMUM_RESIDUAL_AUDIT_MEMBERS_ENV} must contain decimal digits"
+        )
+    residual_audit_members = int(residual_audit_raw)
+    assay_value = _finite_environment_float(
+        environ,
+        REGRET_RESIDUAL_ASSAY_VALUE_ENV,
+        default=None,
+    )
+    calibration_error = _finite_environment_float(
+        environ,
+        REGRET_CALIBRATION_ERROR_BOUND_ENV,
+        default=None,
+    )
+    allow_raw = environ.get(REGRET_ALLOW_DEVELOPMENT_ASSAY_ENV, "0")
+    if allow_raw not in {"0", "1"}:
+        raise ValueError(
+            f"{REGRET_ALLOW_DEVELOPMENT_ASSAY_ENV} must be exactly 0 or 1"
+        )
+    allow_assay = allow_raw == "1"
+    if assay_value is not None and assay_value <= 0.0:
+        raise ValueError(f"{REGRET_RESIDUAL_ASSAY_VALUE_ENV} must be positive")
+    future_value_policy: SlateFutureValuePolicy = (
+        ZeroSlateFutureValuePolicy()
+        if assay_value is None
+        else ResidualInformationAssayValuePolicy(float(assay_value))
+    )
+    return RegretBoundedInformationControls(
+        minimum_acquisition_retention_ratio=float(ratio),
+        minimum_residual_audit_members=residual_audit_members,
+        future_value_policy=future_value_policy,
+        calibration_error_bound=(
+            None if calibration_error is None else float(calibration_error)
+        ),
+        allow_development_assay=allow_assay,
+    )
 
 
 def campaign_constraint_decoupled_acquisition_from_environment(
@@ -166,6 +309,15 @@ def build_campaign_acquisition_allocator(
     target_conditioned_context_provider: (
         TargetConditionedAllocationContextProvider | None
     ) = None,
+    acquisition_certification_context_provider: (
+        AcquisitionCertifiedSlateContextProvider | None
+    ) = None,
+    acquisition_batch_scorer: FiniteAcquisitionBatchScorePolicy | None = None,
+    regret_minimum_acquisition_retention_ratio: float = 1.0,
+    regret_minimum_residual_audit_members: int = 0,
+    regret_future_value_policy: SlateFutureValuePolicy | None = None,
+    regret_calibration_error_bound: float | None = None,
+    regret_allow_development_assay: bool = False,
 ) -> CalibratedPortfolioAllocator:
     """Build one exact allocator without benchmark-specific parameters."""
 
@@ -214,6 +366,53 @@ def build_campaign_acquisition_allocator(
             context_provider=target_conditioned_context_provider,
             profile=target_conditioned_profile,
         )
+    if mode in {
+        CampaignAcquisitionMode.ACQUISITION_CERTIFIED,
+        CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION,
+    }:
+        if not common_pool_enabled:
+            raise ValueError(
+                "acquisition-certified K8-to-K4 allocation requires a common pool"
+            )
+        if not isinstance(
+            acquisition_certification_context_provider,
+            AcquisitionCertifiedSlateContextProvider,
+        ):
+            raise TypeError(
+                "acquisition-certified mode requires its context provider"
+            )
+        if not isinstance(acquisition_batch_scorer, FiniteAcquisitionBatchScorePolicy):
+            raise TypeError("acquisition-certified mode requires its batch scorer")
+        if mode is CampaignAcquisitionMode.ACQUISITION_CERTIFIED:
+            if (
+                regret_minimum_acquisition_retention_ratio != 1.0
+                or regret_minimum_residual_audit_members != 0
+                or regret_future_value_policy is not None
+                or regret_calibration_error_bound is not None
+                or regret_allow_development_assay
+            ):
+                raise ValueError("regret controls require regret-bounded mode")
+            return AcquisitionCertifiedSlatePolicy(
+                context_provider=acquisition_certification_context_provider,
+                scorer=acquisition_batch_scorer,
+            )
+        return RegretBoundedSlatePolicy(
+            context_provider=acquisition_certification_context_provider,
+            scorer=acquisition_batch_scorer,
+            future_value_policy=(
+                ZeroSlateFutureValuePolicy()
+                if regret_future_value_policy is None
+                else regret_future_value_policy
+            ),
+            minimum_acquisition_retention_ratio=(
+                regret_minimum_acquisition_retention_ratio
+            ),
+            minimum_residual_audit_members=(
+                regret_minimum_residual_audit_members
+            ),
+            calibration_error_bound=regret_calibration_error_bound,
+            allow_development_assay=regret_allow_development_assay,
+        )
     if (
         target_conditioned_profile is not None
         or target_conditioned_context_provider is not None
@@ -221,6 +420,21 @@ def build_campaign_acquisition_allocator(
         raise ValueError(
             "target-conditioned components are valid only for their exact mode"
         )
+    if (
+        acquisition_certification_context_provider is not None
+        or acquisition_batch_scorer is not None
+    ):
+        raise ValueError(
+            "certified-acquisition components are valid only for their exact mode"
+        )
+    if (
+        regret_minimum_acquisition_retention_ratio != 1.0
+        or regret_minimum_residual_audit_members != 0
+        or regret_future_value_policy is not None
+        or regret_calibration_error_bound is not None
+        or regret_allow_development_assay
+    ):
+        raise ValueError("regret controls require regret-bounded mode")
     if not common_pool_enabled:
         if mode is not CampaignAcquisitionMode.FULL_SUPPORT:
             raise ValueError(
@@ -325,6 +539,14 @@ def campaign_selector_policy_definition_sha256(
             MINIMUM_INTERVENTION_HORIZON_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256
         )
     if constraint_decoupled:
+        if type(allocator) is AcquisitionCertifiedSlatePolicy:
+            return (
+                ACQUISITION_CERTIFIED_RESIDUAL_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256
+            )
+        if type(allocator) is RegretBoundedSlatePolicy:
+            return (
+                REGRET_BOUNDED_INFORMATION_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256
+            )
         if type(allocator) is TargetConditionedSlateAllocatorAdapter:
             return (
                 CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256
@@ -369,6 +591,11 @@ __all__ = [
     "MINIMUM_INTERVENTION_PROJECTION_ENV",
     "OPERATOR_ASSAY_MINIMUM_ENV",
     "RESIDUAL_FRONTIER_PLANNING_ENV",
+    "REGRET_ALLOW_DEVELOPMENT_ASSAY_ENV",
+    "REGRET_CALIBRATION_ERROR_BOUND_ENV",
+    "REGRET_MINIMUM_ACQUISITION_RETENTION_RATIO_ENV",
+    "REGRET_RESIDUAL_ASSAY_VALUE_ENV",
+    "RegretBoundedInformationControls",
     "build_campaign_acquisition_allocator",
     "build_campaign_proposal_support_policy",
     "campaign_constraint_decoupled_acquisition_from_environment",
@@ -377,5 +604,6 @@ __all__ = [
     "campaign_minimum_intervention_projection_from_environment",
     "campaign_operator_assay_minimum_from_environment",
     "campaign_residual_frontier_planning_from_environment",
+    "campaign_regret_bounded_information_controls_from_environment",
     "campaign_selector_policy_definition_sha256",
 ]

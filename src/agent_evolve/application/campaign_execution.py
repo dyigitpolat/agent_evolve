@@ -15,9 +15,11 @@ bridged by one stateful ``CampaignStageRuntimePort`` implementation.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import re
+import zlib
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol, runtime_checkable
@@ -76,6 +78,9 @@ _CLEANUP_REQUEST_DOMAIN = b"agent-evolve:campaign-runtime-cleanup-request:v1\x00
 _CLEANUP_RECEIPT_DOMAIN = b"agent-evolve:campaign-runtime-cleanup-receipt:v1\x00"
 _EVENT_DOMAIN = b"agent-evolve:campaign-execution-event:v1\x00"
 _RESULT_DOMAIN = b"agent-evolve:campaign-execution-result:v1\x00"
+_AUDIT_TEXT_INLINE_UTF8_BYTES = 1_000_000
+_AUDIT_TEXT_BASE64_CHUNK_CHARACTERS = 500_000
+_AUDIT_TEXT_MAX_DECOMPRESSED_UTF8_BYTES = 64 * 1024 * 1024
 
 
 class CampaignExecutionContractError(ValueError):
@@ -94,6 +99,117 @@ def _canonical_json(value: object) -> bytes:
 
 def _hash(domain: bytes, record: object) -> str:
     return hashlib.sha256(domain + _canonical_json(record)).hexdigest()
+
+
+def encode_selector_audit_text(name: str, value: str) -> dict[str, object]:
+    """Represent exact audit text without violating typed-JSON scalar limits.
+
+    Ordinary traces retain the original single-string representation byte for
+    byte. Large structured decisions are losslessly compressed and split into
+    bounded ASCII chunks; the receipt authenticates both compressed and
+    decompressed bytes. This is representation-only and has no optimizer or
+    model authority.
+    """
+
+    if name not in {"request_text", "response_text"}:
+        raise ValueError("selector audit text name is unsupported")
+    if type(value) is not str or not value:
+        raise ValueError("selector audit text must be a non-empty exact string")
+    raw = value.encode("utf-8", errors="strict")
+    if len(raw) <= _AUDIT_TEXT_INLINE_UTF8_BYTES:
+        return {name: value}
+    if len(raw) > _AUDIT_TEXT_MAX_DECOMPRESSED_UTF8_BYTES:
+        raise ValueError("selector audit text exceeds the lossless audit ceiling")
+    compressed = zlib.compress(raw, level=9)
+    encoded = base64.b64encode(compressed).decode("ascii")
+    chunks = [
+        encoded[offset : offset + _AUDIT_TEXT_BASE64_CHUNK_CHARACTERS]
+        for offset in range(0, len(encoded), _AUDIT_TEXT_BASE64_CHUNK_CHARACTERS)
+    ]
+    return {
+        f"{name}_encoding": "zlib_base64_chunks_v1",
+        f"{name}_base64_chunks": chunks,
+        f"{name}_utf8_bytes": len(raw),
+        f"{name}_sha256": hashlib.sha256(raw).hexdigest(),
+        f"{name}_compressed_bytes": len(compressed),
+        f"{name}_compressed_sha256": hashlib.sha256(compressed).hexdigest(),
+    }
+
+
+def decode_selector_audit_text(audit: dict[str, object], name: str) -> str:
+    """Validate and recover one inline or losslessly chunked audit field."""
+
+    if type(audit) is not dict:
+        raise TypeError("selector audit must be an exact object")
+    if name not in {"request_text", "response_text"}:
+        raise ValueError("selector audit text name is unsupported")
+    inline = audit.get(name)
+    if inline is not None:
+        if type(inline) is not str or not inline:
+            raise ValueError(f"plaintext audit requires non-empty {name}")
+        encoded_keys = {
+            f"{name}_encoding",
+            f"{name}_base64_chunks",
+            f"{name}_utf8_bytes",
+            f"{name}_sha256",
+            f"{name}_compressed_bytes",
+            f"{name}_compressed_sha256",
+        }
+        if any(key in audit for key in encoded_keys):
+            raise ValueError("inline selector audit text cannot also be encoded")
+        return inline
+    if audit.get(f"{name}_encoding") != "zlib_base64_chunks_v1":
+        raise ValueError(f"plaintext audit requires non-empty {name}")
+    chunks = audit.get(f"{name}_base64_chunks")
+    if (
+        type(chunks) is not list
+        or not chunks
+        or any(type(value) is not str or not value for value in chunks)
+    ):
+        raise ValueError("selector audit chunks must be non-empty exact strings")
+    expected_utf8_bytes = audit.get(f"{name}_utf8_bytes")
+    expected_compressed_bytes = audit.get(f"{name}_compressed_bytes")
+    if (
+        type(expected_utf8_bytes) is not int
+        or not _AUDIT_TEXT_INLINE_UTF8_BYTES
+        < expected_utf8_bytes
+        <= _AUDIT_TEXT_MAX_DECOMPRESSED_UTF8_BYTES
+        or type(expected_compressed_bytes) is not int
+        or expected_compressed_bytes <= 0
+    ):
+        raise ValueError("selector audit encoded byte counts are invalid")
+    try:
+        compressed = base64.b64decode("".join(chunks), validate=True)
+    except (ValueError, UnicodeEncodeError) as error:
+        raise ValueError("selector audit chunks are not canonical base64") from error
+    if len(compressed) != expected_compressed_bytes:
+        raise ValueError("selector audit compressed byte count disagrees")
+    if hashlib.sha256(compressed).hexdigest() != audit.get(
+        f"{name}_compressed_sha256"
+    ):
+        raise ValueError("selector audit compressed digest disagrees")
+    decompressor = zlib.decompressobj()
+    try:
+        raw = decompressor.decompress(compressed, expected_utf8_bytes + 1)
+        raw += decompressor.flush()
+    except zlib.error as error:
+        raise ValueError("selector audit compressed text is invalid") from error
+    if (
+        not decompressor.eof
+        or decompressor.unused_data
+        or decompressor.unconsumed_tail
+        or len(raw) != expected_utf8_bytes
+    ):
+        raise ValueError("selector audit decompressed byte count disagrees")
+    if hashlib.sha256(raw).hexdigest() != audit.get(f"{name}_sha256"):
+        raise ValueError("selector audit decompressed digest disagrees")
+    try:
+        value = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ValueError("selector audit text is not valid UTF-8") from error
+    if not value:
+        raise ValueError(f"plaintext audit requires non-empty {name}")
+    return value
 
 
 def _token(value: str, *, name: str) -> None:
@@ -172,9 +288,7 @@ class CampaignSelectorAuditReceipt:
                 "plaintext audit request/decision/call join is inconsistent"
             )
         for name in ("request_text", "response_text"):
-            value = audit.get(name)
-            if type(value) is not str or not value:
-                raise ValueError(f"plaintext audit requires non-empty {name}")
+            decode_selector_audit_text(audit, name)
         if self.execution_mode is not SelectorAuditExecutionMode.FRESH:
             raise ValueError("portfolio selector audit must record fresh execution")
 
@@ -614,6 +728,7 @@ class CampaignReflectionRequest:
 
 class CampaignReflectionStatus(str, Enum):
     COMPLETED = "completed"
+    ABSTAINED = "abstained"
     FAILED = "failed"
 
 
@@ -647,6 +762,18 @@ class CampaignReflectionReceipt:
         if self.status is CampaignReflectionStatus.COMPLETED:
             if self.failure_type is not None:
                 raise ValueError("completed reflection cannot carry failure_type")
+        elif self.status is CampaignReflectionStatus.ABSTAINED:
+            if self.failure_type is not None:
+                raise ValueError("abstained reflection cannot carry failure_type")
+            abstention = thaw_json(self.quarantined_result)
+            if (
+                abstention.get("status")
+                != "abstained_no_identifiable_mutation_evidence"
+                or abstention.get("evidence_tier") != "e0"
+                or abstention.get("provider_calls") != 0
+                or abstention.get("publishable_reflection_content") is not False
+            ):
+                raise ValueError("abstained reflection requires typed E0 evidence")
         elif type(self.failure_type) is not str or not self.failure_type:
             raise ValueError("failed reflection requires failure_type")
         _frozen(self.quarantined_result, name="quarantined_result")
@@ -965,6 +1092,7 @@ class CampaignExecutionCounters:
     logical_agent_calls: int
     logical_agent_calls_dispatched_to_runtime: int = 0
     logical_agent_calls_succeeded: int = 0
+    logical_agent_calls_abstained: int = 0
     logical_agent_calls_failed: int = 0
     logical_agent_calls_cancelled_before_dispatch: int = 0
     logical_agent_calls_cancelled_after_dispatch: int = 0
@@ -977,6 +1105,7 @@ class CampaignExecutionCounters:
             "logical_agent_calls",
             "logical_agent_calls_dispatched_to_runtime",
             "logical_agent_calls_succeeded",
+            "logical_agent_calls_abstained",
             "logical_agent_calls_failed",
             "logical_agent_calls_cancelled_before_dispatch",
             "logical_agent_calls_cancelled_after_dispatch",
@@ -996,6 +1125,7 @@ class CampaignExecutionCounters:
             )
         if (
             self.logical_agent_calls_succeeded
+            + self.logical_agent_calls_abstained
             + self.logical_agent_calls_failed
             + self.logical_agent_calls_cancelled_after_dispatch
             > self.logical_agent_calls_dispatched_to_runtime
@@ -1014,6 +1144,7 @@ class CampaignExecutionCounters:
                 self.logical_agent_calls_dispatched_to_runtime
             ),
             "logical_agent_calls_succeeded": self.logical_agent_calls_succeeded,
+            "logical_agent_calls_abstained": self.logical_agent_calls_abstained,
             "logical_agent_calls_failed": self.logical_agent_calls_failed,
             "logical_agent_calls_cancelled_before_dispatch": (
                 self.logical_agent_calls_cancelled_before_dispatch
@@ -1218,6 +1349,7 @@ class CampaignExecutionEventKind(str, Enum):
     STAGE_SEALED = "stage_sealed"
     REFLECTION_LAUNCHED = "reflection_launched"
     REFLECTION_COMPLETED = "reflection_completed"
+    REFLECTION_ABSTAINED = "reflection_abstained"
     REFLECTION_FAILED = "reflection_failed"
     REFLECTION_CANCELLED = "reflection_cancelled"
     REFLECTION_ADMITTED_FOR_TESTING = "reflection_admitted_for_testing"
@@ -1525,6 +1657,7 @@ class EvolutionCampaignScheduler:
         reflection_requests: dict[int, CampaignReflectionRequest] = {}
         reflection_runtime_dispatched: set[int] = set()
         degraded_reflection_sources: set[int] = set()
+        abstained_reflection_sources: set[int] = set()
         finalization: CampaignFinalizationReceipt | None = None
         cleanup: CampaignCleanupReceipt | None = None
         primary_error: BaseException | None = None
@@ -1539,6 +1672,7 @@ class EvolutionCampaignScheduler:
             reserved: int = 0,
             dispatched: int = 0,
             succeeded: int = 0,
+            abstained: int = 0,
             failed: int = 0,
             cancelled_before_dispatch: int = 0,
             cancelled_after_dispatch: int = 0,
@@ -1554,6 +1688,9 @@ class EvolutionCampaignScheduler:
                 ),
                 logical_agent_calls_succeeded=(
                     counters.logical_agent_calls_succeeded + succeeded
+                ),
+                logical_agent_calls_abstained=(
+                    counters.logical_agent_calls_abstained + abstained
                 ),
                 logical_agent_calls_failed=(
                     counters.logical_agent_calls_failed + failed
@@ -1647,6 +1784,10 @@ class EvolutionCampaignScheduler:
             if receipt.status is CampaignReflectionStatus.COMPLETED:
                 update_call_counters(succeeded=receipt.logical_agent_calls)
                 kind = CampaignExecutionEventKind.REFLECTION_COMPLETED
+            elif receipt.status is CampaignReflectionStatus.ABSTAINED:
+                update_call_counters(abstained=receipt.logical_agent_calls)
+                abstained_reflection_sources.add(source_generation)
+                kind = CampaignExecutionEventKind.REFLECTION_ABSTAINED
             else:
                 update_call_counters(failed=receipt.logical_agent_calls)
                 kind = CampaignExecutionEventKind.REFLECTION_FAILED
@@ -1729,6 +1870,15 @@ class EvolutionCampaignScheduler:
                 is CampaignReflectionStatus.FAILED
             )
 
+        def abstained_sources(sources: tuple[int, ...]) -> tuple[int, ...]:
+            return tuple(
+                source
+                for source in sources
+                if source in reflection_receipts
+                and reflection_receipts[source].status
+                is CampaignReflectionStatus.ABSTAINED
+            )
+
         async def settle_stage_boundary() -> None:
             # Give callbacks made runnable by the just-sealed stage one turn to
             # publish their terminal task state before the next expensive stage.
@@ -1768,6 +1918,16 @@ class EvolutionCampaignScheduler:
                 raise CampaignExecutionContractError(
                     "reflection block closed with one or more failed receipts"
                 )
+            abstentions = abstained_sources(sources)
+            if abstentions:
+                # A block containing E0 evidence has no publishable reflection
+                # content.  Preserve every receipt, but do not manufacture a
+                # partial admission whose estimand differs from the prepared
+                # barrier.
+                for source in sources:
+                    reflection_tasks.pop(source, None)
+                    reflection_requests.pop(source, None)
+                return
             request = CampaignReflectionTestAdmissionRequest(
                 preparation_sha256=preparation_sha256,
                 runtime_start_receipt_sha256=start.receipt_sha256,
@@ -2053,6 +2213,9 @@ class EvolutionCampaignScheduler:
                     logical_agent_calls_succeeded=(
                         counters.logical_agent_calls_succeeded
                         + expected_stage_agent_calls
+                    ),
+                    logical_agent_calls_abstained=(
+                        counters.logical_agent_calls_abstained
                     ),
                     logical_agent_calls_failed=(counters.logical_agent_calls_failed),
                     logical_agent_calls_cancelled_before_dispatch=(
@@ -2368,5 +2531,7 @@ __all__ = [
     "EvolutionCampaignScheduler",
     "SelectorAuditExecutionMode",
     "campaign_step_sha256",
+    "decode_selector_audit_text",
+    "encode_selector_audit_text",
     "selector_audit_set_sha256",
 ]

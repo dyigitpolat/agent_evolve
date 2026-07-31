@@ -302,6 +302,8 @@ class ContextualLaneJointCountCapability:
     source_arm_ids: tuple[str, ...]
     operator_arm_ids: tuple[str, ...]
     feasible_vectors: tuple[ContextualJointCountVector, ...]
+    minimum_single_path_interventions: int = 0
+    minimum_disjoint_parent_patch_pairs: int = 0
     capability_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -316,6 +318,25 @@ class ContextualLaneJointCountCapability:
         )
         if type(self.evaluation_slots) is not int or self.evaluation_slots <= 0:
             raise ValueError("evaluation_slots must be positive")
+        if (
+            type(self.minimum_single_path_interventions) is not int
+            or not 0
+            <= self.minimum_single_path_interventions
+            <= self.evaluation_slots
+        ):
+            raise ValueError(
+                "minimum_single_path_interventions must lie in lane capacity"
+            )
+        maximum_pairs = self.evaluation_slots * (self.evaluation_slots - 1) // 2
+        if (
+            type(self.minimum_disjoint_parent_patch_pairs) is not int
+            or not 0
+            <= self.minimum_disjoint_parent_patch_pairs
+            <= maximum_pairs
+        ):
+            raise ValueError(
+                "minimum_disjoint_parent_patch_pairs must lie in lane pair capacity"
+            )
         for name in ("source_arm_ids", "operator_arm_ids"):
             values = getattr(self, name)
             if type(values) is not tuple or not values:
@@ -377,8 +398,14 @@ class ContextualLaneJointCountCapability:
             ) from error
 
     def _unsigned_record(self) -> dict[str, object]:
-        return {
-            "schema_version": 1,
+        record: dict[str, object] = {
+            "schema_version": (
+                3
+                if self.minimum_disjoint_parent_patch_pairs
+                else 2
+                if self.minimum_single_path_interventions
+                else 1
+            ),
             "slice_id": self.slice_id,
             "finite_contract_identity_sha256": self.finite_contract_identity_sha256,
             "structural_constraint_sha256": self.structural_constraint_sha256,
@@ -390,6 +417,21 @@ class ContextualLaneJointCountCapability:
             "objective_values_consulted": False,
             "workload_identifiers_consulted": False,
         }
+        if self.minimum_single_path_interventions:
+            record["minimum_single_path_interventions"] = (
+                self.minimum_single_path_interventions
+            )
+            record["intervention_axis"] = (
+                "exact_parent_relative_changed_json_path_count"
+            )
+        if self.minimum_disjoint_parent_patch_pairs:
+            record["minimum_disjoint_parent_patch_pairs"] = (
+                self.minimum_disjoint_parent_patch_pairs
+            )
+            record["offspring_opportunity_axis"] = (
+                "pairwise_disjoint_parent_relative_patch_pairs"
+            )
+        return record
 
     def to_record(self) -> dict[str, object]:
         self.__post_init__()
@@ -410,6 +452,9 @@ class ContextualPortfolioAllocationContract:
     evaluation_slots: int
     source_target_counts: tuple[tuple[str, int], ...]
     operator_target_counts: tuple[tuple[str, int], ...]
+    minimum_single_path_interventions: int = 0
+    minimum_disjoint_parent_patch_pairs: int = 0
+    feasibility_witness_option_identity_sha256s: tuple[str, ...] = ()
     contract_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -427,6 +472,26 @@ class ContextualPortfolioAllocationContract:
         _require_token(self.slice_id, name="slice_id")
         if type(self.evaluation_slots) is not int or self.evaluation_slots <= 0:
             raise ValueError("evaluation_slots must be positive")
+        if (
+            type(self.minimum_single_path_interventions) is not int
+            or not 0
+            <= self.minimum_single_path_interventions
+            <= self.evaluation_slots
+        ):
+            raise ValueError(
+                "minimum_single_path_interventions must lie in allocation capacity"
+            )
+        maximum_pairs = self.evaluation_slots * (self.evaluation_slots - 1) // 2
+        if (
+            type(self.minimum_disjoint_parent_patch_pairs) is not int
+            or not 0
+            <= self.minimum_disjoint_parent_patch_pairs
+            <= maximum_pairs
+        ):
+            raise ValueError(
+                "minimum_disjoint_parent_patch_pairs must lie in allocation pair "
+                "capacity"
+            )
         _validate_counts(
             self.source_target_counts,
             name="source_target_counts",
@@ -437,6 +502,21 @@ class ContextualPortfolioAllocationContract:
             name="operator_target_counts",
             expected_slots=self.evaluation_slots,
         )
+        witnesses = self.feasibility_witness_option_identity_sha256s
+        if type(witnesses) is not tuple:
+            raise TypeError(
+                "feasibility_witness_option_identity_sha256s must be an exact tuple"
+            )
+        if witnesses:
+            if len(witnesses) != self.evaluation_slots or witnesses != tuple(
+                sorted(set(witnesses))
+            ):
+                raise ValueError(
+                    "allocation feasibility witness must contain one canonical "
+                    "unique option identity per evaluation slot"
+                )
+            for value in witnesses:
+                require_sha256(value, "feasibility_witness_option_identity_sha256")
         object.__setattr__(
             self,
             "contract_sha256",
@@ -446,8 +526,16 @@ class ContextualPortfolioAllocationContract:
         )
 
     def _unsigned_record(self) -> dict[str, object]:
-        return {
-            "schema_version": 1,
+        record: dict[str, object] = {
+            "schema_version": (
+                4
+                if self.feasibility_witness_option_identity_sha256s
+                else 3
+                if self.minimum_disjoint_parent_patch_pairs
+                else 2
+                if self.minimum_single_path_interventions
+                else 1
+            ),
             "campaign_scope_sha256": self.campaign_scope_sha256,
             "query_sha256": self.query_sha256,
             "decision_sha256": self.decision_sha256,
@@ -463,6 +551,28 @@ class ContextualPortfolioAllocationContract:
                 list(value) for value in self.operator_target_counts
             ],
         }
+        if self.minimum_single_path_interventions:
+            record["minimum_single_path_interventions"] = (
+                self.minimum_single_path_interventions
+            )
+            record["intervention_axis"] = (
+                "exact_parent_relative_changed_json_path_count"
+            )
+        if self.minimum_disjoint_parent_patch_pairs:
+            record["minimum_disjoint_parent_patch_pairs"] = (
+                self.minimum_disjoint_parent_patch_pairs
+            )
+            record["offspring_opportunity_axis"] = (
+                "pairwise_disjoint_parent_relative_patch_pairs"
+            )
+        if self.feasibility_witness_option_identity_sha256s:
+            record["feasibility_witness_option_identity_sha256s"] = list(
+                self.feasibility_witness_option_identity_sha256s
+            )
+            record["feasibility_witness_semantics"] = (
+                "current_finite_contract_exact_joint_count_and_structural_witness"
+            )
+        return record
 
     def to_record(self) -> dict[str, object]:
         self.__post_init__()
@@ -504,6 +614,10 @@ class ContextualPortfolioAllocationRealization:
     requested_operator_target_counts: tuple[tuple[str, int], ...]
     realized_source_target_counts: tuple[tuple[str, int], ...]
     realized_operator_target_counts: tuple[tuple[str, int], ...]
+    requested_minimum_single_path_interventions: int = 0
+    realized_single_path_interventions: int = 0
+    requested_minimum_disjoint_parent_patch_pairs: int = 0
+    realized_disjoint_parent_patch_pairs: int = 0
     realization_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -542,6 +656,45 @@ class ContextualPortfolioAllocationRealization:
             value[0] for value in self.realized_operator_target_counts
         ):
             raise ValueError("realized operator arms differ from requested arms")
+        if (
+            type(self.requested_minimum_single_path_interventions) is not int
+            or not 0
+            <= self.requested_minimum_single_path_interventions
+            <= slots
+        ):
+            raise ValueError(
+                "requested minimum single-path interventions is invalid"
+            )
+        if (
+            type(self.realized_single_path_interventions) is not int
+            or not 0 <= self.realized_single_path_interventions <= slots
+        ):
+            raise ValueError("realized single-path interventions is invalid")
+        if self.realized_single_path_interventions < (
+            self.requested_minimum_single_path_interventions
+        ):
+            raise ValueError("realized portfolio violated its single-path floor")
+        maximum_pairs = slots * (slots - 1) // 2
+        if (
+            type(self.requested_minimum_disjoint_parent_patch_pairs) is not int
+            or not 0
+            <= self.requested_minimum_disjoint_parent_patch_pairs
+            <= maximum_pairs
+        ):
+            raise ValueError(
+                "requested minimum disjoint parent-patch pairs is invalid"
+            )
+        if (
+            type(self.realized_disjoint_parent_patch_pairs) is not int
+            or not 0 <= self.realized_disjoint_parent_patch_pairs <= maximum_pairs
+        ):
+            raise ValueError("realized disjoint parent-patch pair count is invalid")
+        if self.realized_disjoint_parent_patch_pairs < (
+            self.requested_minimum_disjoint_parent_patch_pairs
+        ):
+            raise ValueError(
+                "realized portfolio violated its disjoint parent-pair floor"
+            )
         object.__setattr__(
             self,
             "realization_sha256",
@@ -579,8 +732,14 @@ class ContextualPortfolioAllocationRealization:
         return self.source_l1_deviation == 0 and self.operator_l1_deviation == 0
 
     def _unsigned_record(self) -> dict[str, object]:
-        return {
-            "schema_version": 1,
+        intervention_bound = self.requested_minimum_single_path_interventions > 0
+        offspring_opportunity_bound = (
+            self.requested_minimum_disjoint_parent_patch_pairs > 0
+        )
+        record: dict[str, object] = {
+            "schema_version": (
+                3 if offspring_opportunity_bound else 2 if intervention_bound else 1
+            ),
             "campaign_scope_sha256": self.campaign_scope_sha256,
             "query_sha256": self.query_sha256,
             "decision_sha256": self.decision_sha256,
@@ -605,6 +764,27 @@ class ContextualPortfolioAllocationRealization:
             "objective_values_consulted": False,
             "workload_identifiers_consulted": False,
         }
+        if intervention_bound:
+            record["requested_minimum_single_path_interventions"] = (
+                self.requested_minimum_single_path_interventions
+            )
+            record["realized_single_path_interventions"] = (
+                self.realized_single_path_interventions
+            )
+            record["intervention_axis"] = (
+                "exact_parent_relative_changed_json_path_count"
+            )
+        if offspring_opportunity_bound:
+            record["requested_minimum_disjoint_parent_patch_pairs"] = (
+                self.requested_minimum_disjoint_parent_patch_pairs
+            )
+            record["realized_disjoint_parent_patch_pairs"] = (
+                self.realized_disjoint_parent_patch_pairs
+            )
+            record["offspring_opportunity_axis"] = (
+                "pairwise_disjoint_parent_relative_patch_pairs"
+            )
+        return record
 
     def to_record(self) -> dict[str, object]:
         self.__post_init__()
@@ -629,6 +809,10 @@ class ContextualPortfolioAllocationRealization:
             or self.slice_id != contract.slice_id
             or self.requested_source_target_counts != contract.source_target_counts
             or self.requested_operator_target_counts != contract.operator_target_counts
+            or self.requested_minimum_single_path_interventions
+            != contract.minimum_single_path_interventions
+            or self.requested_minimum_disjoint_parent_patch_pairs
+            != contract.minimum_disjoint_parent_patch_pairs
         ):
             raise ValueError("allocation realization differs from its contract")
 

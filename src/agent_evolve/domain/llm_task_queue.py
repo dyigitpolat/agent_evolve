@@ -380,16 +380,32 @@ class ValidationIssueReasonCode(str, Enum):
     REFLECTION_DIRECTION_OR_ANCHOR_VIOLATION = (
         "reflection_direction_or_anchor_violation"
     )
+    RESIDUAL_RADIUS_CONTRACT_VIOLATION = (
+        "residual_radius_contract_violation"
+    )
+    RESIDUAL_OPTION_CONTRACT_VIOLATION = (
+        "residual_option_contract_violation"
+    )
+    RESIDUAL_METRIC_CONTRACT_VIOLATION = (
+        "residual_metric_contract_violation"
+    )
+    RESIDUAL_QUANTILE_ORDER_VIOLATION = (
+        "residual_quantile_order_violation"
+    )
+    RESIDUAL_PLAN_DIVERSITY_VIOLATION = (
+        "residual_plan_diversity_violation"
+    )
 
 
 class AttemptRequestVariant(str, Enum):
     """Closed variants for the exact prompt used by one provider attempt."""
 
     ORIGINAL = "original"
-    # Retained so historical telemetry remains decodable. New attempts use v3.
+    # Retained so historical telemetry remains decodable. New attempts use v4.
     SCHEMA_REPAIR_V1 = "schema_repair_v1"
     SCHEMA_REPAIR_V2 = "schema_repair_v2"
     SCHEMA_REPAIR_V3 = "schema_repair_v3"
+    SCHEMA_REPAIR_V4 = "schema_repair_v4"
 
 
 @dataclass(frozen=True, slots=True)

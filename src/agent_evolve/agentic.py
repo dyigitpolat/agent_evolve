@@ -266,8 +266,22 @@ from agent_evolve.policies.variation.source_union_finite_catalog import (
     EVALUATION_SOURCE_MINIMUM_METADATA_KEY,
     SOURCE_UNION_POLICY_ID,
     SOURCE_UNION_POLICY_VERSION,
+    SourceExposureFiniteVariationCatalog,
     SourceUnionFiniteVariationCatalog,
+    required_ranked_source_evaluation_option_ids,
+    required_source_evaluation_counts,
     required_source_evaluation_option_ids,
+)
+from agent_evolve.policies.variation.multiscale_restart_catalog import (
+    DEFAULT_RESTART_RADII,
+    DEFAULT_RESTARTS_PER_RADIUS,
+    GENERIC_MULTISCALE_RESTART_CATALOG_ID,
+    GENERIC_MULTISCALE_RESTART_CATALOG_VERSION,
+    GENERIC_MULTISCALE_RESTART_FAMILY,
+    GENERIC_MULTISCALE_RESTART_POLICY_ID,
+    GENERIC_MULTISCALE_RESTART_POLICY_VERSION,
+    GENERIC_MULTISCALE_RESTART_SOURCE_ID,
+    GenericMultiscaleRestartFiniteVariationCatalog,
 )
 from agent_evolve.application.executable_hypothesis import (
     CompiledHypothesisTreatment,
@@ -704,6 +718,7 @@ from agent_evolve.ports.action_allocation import (
     ActionPortfolioDecision,
     AllocatedActionMember,
     DeterministicActionAllocator,
+    ExactActionArmCountConstraint,
     ForecastPortfolioUtility,
     ForecastPortfolioUtilityBinding,
     ForecastPortfolioUtilityInput,
@@ -801,6 +816,10 @@ from agent_evolve.ports.objective_resolution import (
     resolve_objectives,
 )
 from agent_evolve.ports.id_factory import IdFactory
+from agent_evolve.ports.hard_feasibility import (
+    HardFeasibilityPort,
+    validate_hard_feasibility_port,
+)
 from agent_evolve.ports.contextual_search_allocation import (
     ContextualArmCountCapability,
     ContextualArmCountCapabilityWitness,
@@ -858,11 +877,13 @@ from agent_evolve.ports.variation_source import (
     VARIATION_OPERATOR_METADATA_KEY,
     VARIATION_SOURCE_METADATA_KEY,
     VARIATION_SOURCE_MINIMUM_METADATA_KEY,
+    VARIATION_SOURCE_RANK_METADATA_KEY,
     finite_variation_diversity_signature,
     finite_variation_operator_id,
     finite_variation_source_by_option,
     finite_variation_source_id,
     finite_variation_source_ids,
+    finite_variation_source_minimum_counts,
 )
 
 
@@ -946,6 +967,7 @@ class AgenticBenchmark:
     hypothesis_compiler: HypothesisApplicabilityPort | None = None
     finite_action_set_compiler: FiniteActionSetCompiler | None = None
     objective_resolution: ObjectiveResolutionPort | None = None
+    hard_feasibility: HardFeasibilityPort | None = None
     _objectives: tuple[ObjectiveSpec, ...] = field(init=False, repr=False)
     _catalog_identities: tuple[tuple[str, int, str], ...] = field(
         init=False,
@@ -974,6 +996,10 @@ class AgenticBenchmark:
         repr=False,
     )
     _finite_action_set_compiler_identity: tuple[str, int, str] | None = field(
+        init=False,
+        repr=False,
+    )
+    _hard_feasibility_identity: tuple[str, int, str] | None = field(
         init=False,
         repr=False,
     )
@@ -1056,6 +1082,11 @@ class AgenticBenchmark:
             None
             if self.objective_resolution is None
             else objective_resolution_policy_metadata(self.objective_resolution)
+        )
+        hard_feasibility_identity = (
+            None
+            if self.hard_feasibility is None
+            else validate_hard_feasibility_port(self.hard_feasibility)
         )
 
         catalogs = self.finite_variation_catalogs
@@ -1165,6 +1196,11 @@ class AgenticBenchmark:
             "_finite_action_set_compiler_identity",
             finite_action_set_compiler_identity,
         )
+        object.__setattr__(
+            self,
+            "_hard_feasibility_identity",
+            hard_feasibility_identity,
+        )
 
     @property
     def objectives(self) -> tuple[ObjectiveSpec, ...]:
@@ -1214,6 +1250,13 @@ class AgenticBenchmark:
             raise ValueError(
                 "objective-resolution policy identity changed after binding"
             )
+        current_hard_feasibility_identity = (
+            None
+            if self.hard_feasibility is None
+            else validate_hard_feasibility_port(self.hard_feasibility)
+        )
+        if current_hard_feasibility_identity != self._hard_feasibility_identity:
+            raise ValueError("hard-feasibility policy identity changed after binding")
         current_action_semantics_identity = (
             None if self.action_semantics is None else self.action_semantics.identity
         )
@@ -2192,6 +2235,7 @@ __all__ = [
     "EvolutionCandidate",
     "ExactActionMetricProjection",
     "ExactActionMetricProjectionBatch",
+    "ExactActionArmCountConstraint",
     "FailureCategory",
     "FailureCode",
     "FailureRecord",
@@ -2219,20 +2263,34 @@ __all__ = [
     "FiniteVariationSelectionDraft",
     "BoundedCompositionalFiniteVariationCatalog",
     "CompositionSelectionExposure",
+    "SourceExposureFiniteVariationCatalog",
     "SourceUnionFiniteVariationCatalog",
+    "GenericMultiscaleRestartFiniteVariationCatalog",
+    "DEFAULT_RESTART_RADII",
+    "DEFAULT_RESTARTS_PER_RADIUS",
+    "GENERIC_MULTISCALE_RESTART_CATALOG_ID",
+    "GENERIC_MULTISCALE_RESTART_CATALOG_VERSION",
+    "GENERIC_MULTISCALE_RESTART_FAMILY",
+    "GENERIC_MULTISCALE_RESTART_POLICY_ID",
+    "GENERIC_MULTISCALE_RESTART_POLICY_VERSION",
+    "GENERIC_MULTISCALE_RESTART_SOURCE_ID",
     "PRIMARY_VARIATION_SOURCE_ID",
     "VARIATION_DIVERSITY_SIGNATURE_METADATA_KEY",
     "VARIATION_OPERATOR_METADATA_KEY",
     "VARIATION_SOURCE_METADATA_KEY",
     "VARIATION_SOURCE_MINIMUM_METADATA_KEY",
+    "VARIATION_SOURCE_RANK_METADATA_KEY",
     "EVALUATION_SOURCE_METADATA_KEY",
     "EVALUATION_SOURCE_MINIMUM_METADATA_KEY",
     "SOURCE_UNION_POLICY_ID",
     "SOURCE_UNION_POLICY_VERSION",
+    "required_ranked_source_evaluation_option_ids",
+    "required_source_evaluation_counts",
     "required_source_evaluation_option_ids",
     "finite_variation_source_by_option",
     "finite_variation_source_id",
     "finite_variation_source_ids",
+    "finite_variation_source_minimum_counts",
     "finite_variation_diversity_signature",
     "finite_variation_operator_id",
     "COMPOSITION_LEFT_OPTION_METADATA_KEY",

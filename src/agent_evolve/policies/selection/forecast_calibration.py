@@ -123,6 +123,33 @@ class ForecastCalibrationScope:
     def scope_sha256(self) -> str:
         return _hash(_SCOPE_DOMAIN, self._unsigned_record())
 
+    def for_policy_frame(
+        self,
+        *,
+        prompt_definition_sha256: str,
+        selector_policy_definition_sha256: str,
+    ) -> "ForecastCalibrationScope":
+        """Preserve the experiment stratum while changing policy provenance.
+
+        One campaign can legitimately contain more than one predictor: for
+        example, an engine-owned calibrated slate policy and a runtime
+        outcome-conditioned consequence expert.  Their observations must not
+        share prompt/policy identity, while model, benchmark, and session
+        identity must remain exact.  This immutable operation makes that
+        separation explicit at the generic calibration boundary.
+        """
+
+        self.revalidate()
+        return ForecastCalibrationScope(
+            model_profile_sha256=self.model_profile_sha256,
+            prompt_definition_sha256=prompt_definition_sha256,
+            selector_policy_definition_sha256=(
+                selector_policy_definition_sha256
+            ),
+            benchmark_sha256=self.benchmark_sha256,
+            session_sha256=self.session_sha256,
+        )
+
     def to_record(self) -> dict[str, object]:
         return {**self._unsigned_record(), "scope_sha256": self.scope_sha256}
 

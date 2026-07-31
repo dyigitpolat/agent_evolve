@@ -20,9 +20,9 @@ from agent_evolve.ports.action_allocation import (
 from agent_evolve.ports.action_forecast import ResolvedActionForecast
 from agent_evolve.ports.portfolio_selection import (
     pairwise_disjoint_parent_patch_pairs,
+    single_path_parent_patch_option_ids,
     validate_pairwise_disjoint_parent_patch_selection,
 )
-
 
 GREEDY_RISK_DIVERSITY_ALLOCATOR_ID = "greedy_risk_diversity"
 GREEDY_RISK_DIVERSITY_ALLOCATOR_VERSION = 2
@@ -36,12 +36,22 @@ GREEDY_RISK_DIVERSITY_ALLOCATOR_DEFINITION_SHA256 = hashlib.sha256(
 ).hexdigest()
 _CONFIGURATION_DOMAIN = b"agent-evolve:greedy-risk-diversity-config:v1\x00"
 FEASIBLE_BEAM_RISK_DIVERSITY_ALLOCATOR_ID = "feasible_beam_risk_diversity"
-FEASIBLE_BEAM_RISK_DIVERSITY_ALLOCATOR_VERSION = 1
+FEASIBLE_BEAM_RISK_DIVERSITY_ALLOCATOR_VERSION = 3
 FEASIBLE_BEAM_RISK_DIVERSITY_ALLOCATOR_DEFINITION_SHA256 = hashlib.sha256(
-    b"agent-evolve:feasible-beam-risk-diversity:v1:"
+    b"agent-evolve:feasible-beam-risk-diversity:v3:"
     b"canonical-combination-beam;every-retained-prefix-has-a-hard-feasible-"
     b"completion;pairwise-parent-patch-disjointness-and-minimum-distinct-"
-    b"families-are-trusted-code-constraints;score=p50-minus-quantile-downside-"
+    b"families-and-exact-generic-arm-counts-and-minimum-single-path-actions-"
+    b"and-minimum-disjoint-parent-patch-pairs-are-trusted-code-constraints;"
+    b"score=p50-minus-quantile-downside-"
+    b"risk-plus-family-diversity;canonical-content-identity-tie-break"
+).hexdigest()
+_FEASIBLE_BEAM_RISK_DIVERSITY_ALLOCATOR_V2_DEFINITION_SHA256 = hashlib.sha256(
+    b"agent-evolve:feasible-beam-risk-diversity:v2:"
+    b"canonical-combination-beam;every-retained-prefix-has-a-hard-feasible-"
+    b"completion;pairwise-parent-patch-disjointness-and-minimum-distinct-"
+    b"families-and-exact-generic-arm-counts-are-trusted-code-constraints;"
+    b"score=p50-minus-quantile-downside-"
     b"risk-plus-family-diversity;canonical-content-identity-tie-break"
 ).hexdigest()
 _FEASIBLE_BEAM_CONFIGURATION_DOMAIN = (
@@ -106,9 +116,7 @@ class GreedyRiskAdjustedDiversityAllocator:
                 optimization_semantics=(
                     request.forecast_request.optimization_semantics
                 ),
-                parent_metric_values=(
-                    request.forecast_request.parent_metric_values
-                ),
+                parent_metric_values=(request.forecast_request.parent_metric_values),
                 metric_scales=request.forecast_request.metric_scales,
                 members=canonical_members,
                 quantile=quantile,
@@ -150,15 +158,23 @@ class GreedyRiskAdjustedDiversityAllocator:
             raise TypeError("request must be an exact ActionAllocationRequest")
         request.__post_init__()
         self.__post_init__()
+        if request.exact_arm_count_constraints:
+            raise ValueError(
+                "GreedyRiskAdjustedDiversityAllocator does not implement exact "
+                "arm-count constraints; use FeasibleBeamActionAllocator"
+            )
+        if (
+            request.minimum_single_path_interventions
+            or request.minimum_disjoint_parent_patch_pairs
+        ):
+            raise ValueError(
+                "GreedyRiskAdjustedDiversityAllocator does not implement minimum "
+                "structural floors; use FeasibleBeamActionAllocator"
+            )
         by_id = {value.option_id: value for value in request.forecasts.forecasts}
         attainable_diversity = min(
             request.portfolio_size,
-            len(
-                {
-                    by_id[option_id].family
-                    for option_id in request.eligible_option_ids
-                }
-            ),
+            len({by_id[option_id].family for option_id in request.eligible_option_ids}),
         )
         remaining = sorted(
             (by_id[option_id] for option_id in request.eligible_option_ids),
@@ -178,7 +194,7 @@ class GreedyRiskAdjustedDiversityAllocator:
                 best_forecast = required[rank - 1]
                 best_score = self._score(
                     request,
-                    tuple((*selected, best_forecast)),
+                    (*selected, best_forecast),
                     attainable_diversity=attainable_diversity,
                 )
                 best_marginal = best_score.total_utility - previous_total
@@ -188,7 +204,7 @@ class GreedyRiskAdjustedDiversityAllocator:
                 best_score = None
                 best_marginal = None
                 for candidate in remaining:
-                    portfolio = tuple((*selected, candidate))
+                    portfolio = (*selected, candidate)
                     score = self._score(
                         request,
                         portfolio,
@@ -282,9 +298,7 @@ class FeasibleBeamRiskAdjustedDiversityAllocator:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("ascii")
-        return hashlib.sha256(
-            _FEASIBLE_BEAM_CONFIGURATION_DOMAIN + payload
-        ).hexdigest()
+        return hashlib.sha256(_FEASIBLE_BEAM_CONFIGURATION_DOMAIN + payload).hexdigest()
 
     @staticmethod
     def _allowed_pairs(
@@ -292,6 +306,23 @@ class FeasibleBeamRiskAdjustedDiversityAllocator:
     ) -> frozenset[frozenset[str]] | None:
         if not request.require_pairwise_disjoint_parent_patches:
             return None
+        return frozenset(
+            frozenset(value)
+            for value in pairwise_disjoint_parent_patch_pairs(
+                request.forecast_request.finite_variation_contract,
+                request.eligible_option_ids,
+            )
+        )
+
+    @staticmethod
+    def _disjoint_pairs(
+        request: ActionAllocationRequest,
+    ) -> frozenset[frozenset[str]]:
+        if (
+            not request.require_pairwise_disjoint_parent_patches
+            and request.minimum_disjoint_parent_patch_pairs == 0
+        ):
+            return frozenset()
         return frozenset(
             frozenset(value)
             for value in pairwise_disjoint_parent_patch_pairs(
@@ -313,6 +344,78 @@ class FeasibleBeamRiskAdjustedDiversityAllocator:
             for right in indices[position + 1 :]
         )
 
+    @staticmethod
+    def _arm_constraints_have_completion(
+        *,
+        selected: tuple[int, ...],
+        remaining: tuple[int, ...],
+        needed: int,
+        arm_constraints: tuple[tuple[dict[str, int], tuple[str, ...]], ...],
+    ) -> bool:
+        """Cheap exact marginal-count bound for every generic arm axis."""
+
+        for target, arm_by_index in arm_constraints:
+            selected_counts = {arm_id: 0 for arm_id in target}
+            for index in selected:
+                selected_counts[arm_by_index[index]] += 1
+            deficits: dict[str, int] = {}
+            for arm_id, count in target.items():
+                deficit = count - selected_counts[arm_id]
+                if deficit < 0:
+                    return False
+                deficits[arm_id] = deficit
+            if sum(deficits.values()) != needed:
+                return False
+            available_counts = {arm_id: 0 for arm_id in target}
+            for index in remaining:
+                available_counts[arm_by_index[index]] += 1
+            if any(
+                available_counts[arm_id] < deficit
+                for arm_id, deficit in deficits.items()
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _structural_floors_have_completion(
+        *,
+        selected: tuple[int, ...],
+        remaining: tuple[int, ...],
+        needed: int,
+        options: tuple[ResolvedActionForecast, ...],
+        single_path_indices: frozenset[int],
+        minimum_single_path_interventions: int,
+        disjoint_pairs: frozenset[frozenset[str]],
+        minimum_disjoint_parent_patch_pairs: int,
+    ) -> bool:
+        """Return a safe upper-bound test, exact when no slots remain."""
+
+        selected_single = sum(value in single_path_indices for value in selected)
+        if selected_single + min(
+            needed,
+            sum(value in single_path_indices for value in remaining),
+        ) < minimum_single_path_interventions:
+            return False
+
+        def pair(left: int, right: int) -> frozenset[str]:
+            return frozenset(
+                (options[left].option_id, options[right].option_id)
+            )
+
+        observed_pairs = sum(
+            pair(left, right) in disjoint_pairs
+            for position, left in enumerate(selected)
+            for right in selected[position + 1 :]
+        )
+        if needed == 0:
+            return observed_pairs >= minimum_disjoint_parent_patch_pairs
+        optimistic_pairs = (
+            observed_pairs
+            + len(selected) * needed
+            + needed * (needed - 1) // 2
+        )
+        return optimistic_pairs >= minimum_disjoint_parent_patch_pairs
+
     @classmethod
     def _has_completion(
         cls,
@@ -322,7 +425,12 @@ class FeasibleBeamRiskAdjustedDiversityAllocator:
         portfolio_size: int,
         min_distinct_families: int | None,
         allowed_pairs: frozenset[frozenset[str]] | None,
+        disjoint_pairs: frozenset[frozenset[str]],
+        single_path_indices: frozenset[int],
+        minimum_single_path_interventions: int,
+        minimum_disjoint_parent_patch_pairs: int,
         required_indices: frozenset[int],
+        arm_constraints: tuple[tuple[dict[str, int], tuple[str, ...]], ...],
     ) -> bool:
         """Exact bounded-depth feasibility oracle for one canonical prefix."""
 
@@ -333,10 +441,35 @@ class FeasibleBeamRiskAdjustedDiversityAllocator:
         if len(missing_required) > slots:
             return False
         families = {options[index].family for index in partial}
+        all_remaining = tuple(range(partial[-1] + 1, len(options))) if partial else (
+            tuple(range(len(options)))
+        )
+        if not cls._structural_floors_have_completion(
+            selected=partial,
+            remaining=all_remaining,
+            needed=slots,
+            options=options,
+            single_path_indices=single_path_indices,
+            minimum_single_path_interventions=minimum_single_path_interventions,
+            disjoint_pairs=disjoint_pairs,
+            minimum_disjoint_parent_patch_pairs=(
+                minimum_disjoint_parent_patch_pairs
+            ),
+        ):
+            return False
         if slots == 0:
-            return not missing_required and (
-                min_distinct_families is None
-                or len(families) >= min_distinct_families
+            return (
+                not missing_required
+                and (
+                    min_distinct_families is None
+                    or len(families) >= min_distinct_families
+                )
+                and cls._arm_constraints_have_completion(
+                    selected=partial,
+                    remaining=(),
+                    needed=0,
+                    arm_constraints=arm_constraints,
+                )
             )
         start = partial[-1] + 1 if partial else 0
         if any(index < start for index in missing_required):
@@ -355,9 +488,18 @@ class FeasibleBeamRiskAdjustedDiversityAllocator:
             return False
         if not missing_required.issubset(compatible):
             return False
-        if min_distinct_families is not None and len(
-            families | {options[index].family for index in compatible}
-        ) < min_distinct_families:
+        if not cls._arm_constraints_have_completion(
+            selected=partial,
+            remaining=compatible,
+            needed=slots,
+            arm_constraints=arm_constraints,
+        ):
+            return False
+        if (
+            min_distinct_families is not None
+            and len(families | {options[index].family for index in compatible})
+            < min_distinct_families
+        ):
             return False
 
         def visit(
@@ -366,13 +508,31 @@ class FeasibleBeamRiskAdjustedDiversityAllocator:
         ) -> bool:
             needed = slots - len(chosen)
             still_required = missing_required.difference(chosen)
-            if len(still_required) > needed or not still_required.issubset(
-                remaining
+            if len(still_required) > needed or not still_required.issubset(remaining):
+                return False
+            if not cls._arm_constraints_have_completion(
+                selected=(*partial, *chosen),
+                remaining=remaining,
+                needed=needed,
+                arm_constraints=arm_constraints,
             ):
                 return False
-            chosen_families = families | {
-                options[index].family for index in chosen
-            }
+            if not cls._structural_floors_have_completion(
+                selected=(*partial, *chosen),
+                remaining=remaining,
+                needed=needed,
+                options=options,
+                single_path_indices=single_path_indices,
+                minimum_single_path_interventions=(
+                    minimum_single_path_interventions
+                ),
+                disjoint_pairs=disjoint_pairs,
+                minimum_disjoint_parent_patch_pairs=(
+                    minimum_disjoint_parent_patch_pairs
+                ),
+            ):
+                return False
+            chosen_families = families | {options[index].family for index in chosen}
             if needed == 0:
                 return not still_required and (
                     min_distinct_families is None
@@ -380,10 +540,13 @@ class FeasibleBeamRiskAdjustedDiversityAllocator:
                 )
             if len(remaining) < needed:
                 return False
-            if min_distinct_families is not None and len(
-                chosen_families
-                | {options[index].family for index in remaining}
-            ) < min_distinct_families:
+            if (
+                min_distinct_families is not None
+                and len(
+                    chosen_families | {options[index].family for index in remaining}
+                )
+                < min_distinct_families
+            ):
                 return False
             for position, candidate in enumerate(remaining):
                 if all(
@@ -415,11 +578,33 @@ class FeasibleBeamRiskAdjustedDiversityAllocator:
             )
         )
         allowed_pairs = self._allowed_pairs(request)
+        disjoint_pairs = self._disjoint_pairs(request)
+        single_path_option_ids = set(
+            single_path_parent_patch_option_ids(
+                request.forecast_request.finite_variation_contract,
+                request.eligible_option_ids,
+            )
+        )
+        single_path_indices = frozenset(
+            index
+            for index, option in enumerate(options)
+            if option.option_id in single_path_option_ids
+        )
         required_option_ids = set(request.required_option_ids)
         required_indices = frozenset(
             index
             for index, option in enumerate(options)
             if option.option_id in required_option_ids
+        )
+        arm_constraints = tuple(
+            (
+                dict(constraint.target_counts),
+                tuple(
+                    dict(constraint.option_arm_ids)[option.option_id]
+                    for option in options
+                ),
+            )
+            for constraint in request.exact_arm_count_constraints
         )
         scorer = GreedyRiskAdjustedDiversityAllocator(
             risk_aversion=self.risk_aversion,
@@ -432,9 +617,7 @@ class FeasibleBeamRiskAdjustedDiversityAllocator:
         beam: list[tuple[tuple[int, ...], PortfolioAllocationScore]] = []
         candidate_evaluations = 0
         for depth in range(1, request.portfolio_size + 1):
-            candidates: list[
-                tuple[tuple[int, ...], PortfolioAllocationScore]
-            ] = []
+            candidates: list[tuple[tuple[int, ...], PortfolioAllocationScore]] = []
             prefixes = (((), None),) if depth == 1 else tuple(beam)
             for prefix, _ in prefixes:
                 start = prefix[-1] + 1 if prefix else 0
@@ -446,7 +629,16 @@ class FeasibleBeamRiskAdjustedDiversityAllocator:
                         portfolio_size=request.portfolio_size,
                         min_distinct_families=request.min_distinct_families,
                         allowed_pairs=allowed_pairs,
+                        disjoint_pairs=disjoint_pairs,
+                        single_path_indices=single_path_indices,
+                        minimum_single_path_interventions=(
+                            request.minimum_single_path_interventions
+                        ),
+                        minimum_disjoint_parent_patch_pairs=(
+                            request.minimum_disjoint_parent_patch_pairs
+                        ),
                         required_indices=required_indices,
+                        arm_constraints=arm_constraints,
                     ):
                         continue
                     score = scorer._score(
@@ -470,18 +662,18 @@ class FeasibleBeamRiskAdjustedDiversityAllocator:
 
         selected_indices, final_score = beam[0]
         selected = tuple(options[index] for index in selected_indices)
-        if request.min_distinct_families is not None and len(
-            {value.family for value in selected}
-        ) < request.min_distinct_families:
+        if (
+            request.min_distinct_families is not None
+            and len({value.family for value in selected})
+            < request.min_distinct_families
+        ):
             raise RuntimeError("beam allocator violated minimum family coverage")
         if request.require_pairwise_disjoint_parent_patches:
             validate_pairwise_disjoint_parent_patch_selection(
                 request.forecast_request.finite_variation_contract,
                 tuple(value.option_id for value in selected),
             )
-        if not required_option_ids.issubset(
-            value.option_id for value in selected
-        ):
+        if not required_option_ids.issubset(value.option_id for value in selected):
             raise RuntimeError("beam allocator omitted a required option")
         prefix_scores = tuple(
             scorer._score(
@@ -501,11 +693,7 @@ class FeasibleBeamRiskAdjustedDiversityAllocator:
                 greedy_step_score=prefix_scores[index - 1],
                 marginal_total_utility=(
                     prefix_scores[index - 1].total_utility
-                    - (
-                        0.0
-                        if index == 1
-                        else prefix_scores[index - 2].total_utility
-                    )
+                    - (0.0 if index == 1 else prefix_scores[index - 2].total_utility)
                 ),
             )
             for index, value in enumerate(selected, start=1)
@@ -528,9 +716,15 @@ class FeasibleBeamRiskAdjustedDiversityAllocator:
             allocator_policy_id=FEASIBLE_BEAM_RISK_DIVERSITY_ALLOCATOR_ID,
             allocator_policy_version=(
                 FEASIBLE_BEAM_RISK_DIVERSITY_ALLOCATOR_VERSION
+                if request.minimum_single_path_interventions
+                or request.minimum_disjoint_parent_patch_pairs
+                else 2
             ),
             allocator_definition_sha256=(
                 FEASIBLE_BEAM_RISK_DIVERSITY_ALLOCATOR_DEFINITION_SHA256
+                if request.minimum_single_path_interventions
+                or request.minimum_disjoint_parent_patch_pairs
+                else _FEASIBLE_BEAM_RISK_DIVERSITY_ALLOCATOR_V2_DEFINITION_SHA256
             ),
             allocator_configuration_sha256=self.configuration_sha256,
         )
@@ -542,9 +736,9 @@ __all__ = [
     "FEASIBLE_BEAM_RISK_DIVERSITY_ALLOCATOR_DEFINITION_SHA256",
     "FEASIBLE_BEAM_RISK_DIVERSITY_ALLOCATOR_ID",
     "FEASIBLE_BEAM_RISK_DIVERSITY_ALLOCATOR_VERSION",
-    "FeasibleBeamRiskAdjustedDiversityAllocator",
     "GREEDY_RISK_DIVERSITY_ALLOCATOR_DEFINITION_SHA256",
     "GREEDY_RISK_DIVERSITY_ALLOCATOR_ID",
     "GREEDY_RISK_DIVERSITY_ALLOCATOR_VERSION",
+    "FeasibleBeamRiskAdjustedDiversityAllocator",
     "GreedyRiskAdjustedDiversityAllocator",
 ]

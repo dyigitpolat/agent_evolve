@@ -28,9 +28,9 @@ from agent_evolve.ports.portfolio_selection import (
 
 
 POLICY_ID = "task_keyed_common_candidate_pool"
-POLICY_VERSION = 6
+POLICY_VERSION = 7
 POLICY_DEFINITION_SHA256 = hashlib.sha256(
-    b"agent-evolve:task-keyed-common-candidate-pool:v6;"
+    b"agent-evolve:task-keyed-common-candidate-pool:v7;"
     b"sampling-state=replicate-seed,benchmark,wave,parent,finite-contract,constraints,"
     b"required-option-ids;"
     b"sampling-state-excludes=universe-size,model-selection-size;"
@@ -41,6 +41,8 @@ POLICY_DEFINITION_SHA256 = hashlib.sha256(
     b"feasible-evaluation-subset=engine-certified;"
     b"certificate-members-not-prefix-positioned;presentation=independently-state-keyed;"
     b"required-options-enter-membership-without-presentation-priority;"
+    b"prospective-joint-feasibility-witness=authenticated-current-contract;"
+    b"screened-pool-preserves-one-exact-controller-slate;"
     b"complete-finite-contract-mode-resolves-universe-size-at-selection"
 ).hexdigest()
 
@@ -79,9 +81,12 @@ def _state_record(
     min_distinct_families: int | None,
     require_pairwise_disjoint_parent_patches: bool,
     required_option_ids: tuple[str, ...],
+    certified_feasibility_witness_option_ids: tuple[str, ...],
 ) -> dict[str, object]:
-    return {
-        "schema_version": 2,
+    record = {
+        "schema_version": (
+            3 if certified_feasibility_witness_option_ids else 2
+        ),
         "replicate_seed": replicate_seed,
         "benchmark_sha256": benchmark_sha256,
         "wave_index": wave_index,
@@ -94,6 +99,11 @@ def _state_record(
         ),
         "required_option_ids": list(required_option_ids),
     }
+    if certified_feasibility_witness_option_ids:
+        record["certified_feasibility_witness_option_ids"] = list(
+            certified_feasibility_witness_option_ids
+        )
+    return record
 
 
 def _task_record(
@@ -109,6 +119,7 @@ def _task_record(
     min_distinct_families: int | None,
     require_pairwise_disjoint_parent_patches: bool,
     required_option_ids: tuple[str, ...],
+    certified_feasibility_witness_option_ids: tuple[str, ...],
 ) -> dict[str, object]:
     state = _state_record(
         replicate_seed=replicate_seed,
@@ -122,10 +133,15 @@ def _task_record(
             require_pairwise_disjoint_parent_patches
         ),
         required_option_ids=required_option_ids,
+        certified_feasibility_witness_option_ids=(
+            certified_feasibility_witness_option_ids
+        ),
     )
     return {
         **state,
-        "schema_version": 3,
+        "schema_version": (
+            4 if certified_feasibility_witness_option_ids else 3
+        ),
         "state_identity_sha256": _hash(_STATE_DOMAIN, state),
         "candidate_pool_size": candidate_pool_size,
         "model_selection_size": model_selection_size,
@@ -145,6 +161,7 @@ def _validate_inputs(
     min_distinct_families: int | None,
     require_pairwise_disjoint_parent_patches: bool,
     required_option_ids: tuple[str, ...],
+    certified_feasibility_witness_option_ids: tuple[str, ...],
 ) -> None:
     if type(replicate_seed) is not int or not 0 <= replicate_seed <= _MAX_SEED:
         raise ValueError("replicate_seed must be an exact non-negative int63")
@@ -193,6 +210,41 @@ def _validate_inputs(
         raise ValueError("required option IDs escape the finite contract")
     if len(required_option_ids) > candidate_pool_size:
         raise ValueError("required option IDs exceed the candidate-pool size")
+    witness = certified_feasibility_witness_option_ids
+    if type(witness) is not tuple:
+        raise TypeError(
+            "certified_feasibility_witness_option_ids must be an exact tuple"
+        )
+    if witness:
+        if len(witness) != evaluation_size or witness != tuple(sorted(set(witness))):
+            raise ValueError(
+                "certified feasibility witness must contain one canonical unique "
+                "option per evaluation slot"
+            )
+        if not set(witness).issubset(available):
+            raise ValueError("certified feasibility witness escapes the finite contract")
+        option_by_id = {value.option_id: value for value in contract.options}
+        if min_distinct_families is not None and len(
+            {option_by_id[value].family for value in witness}
+        ) < min_distinct_families:
+            raise ValueError("certified feasibility witness violates family coverage")
+        if require_pairwise_disjoint_parent_patches and (
+            pairwise_disjoint_parent_patch_witness(
+                contract,
+                witness,
+                portfolio_size=evaluation_size,
+                min_distinct_families=min_distinct_families,
+                ordering_key_sha256=contract.identity_sha256,
+            )
+            is None
+        ):
+            raise ValueError(
+                "certified feasibility witness violates pairwise patch constraints"
+            )
+    if len(set(required_option_ids).union(witness)) > candidate_pool_size:
+        raise ValueError(
+            "candidate pool cannot preserve required options and its certified witness"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +262,7 @@ class CommonCandidatePoolDecision:
     min_distinct_families: int | None
     require_pairwise_disjoint_parent_patches: bool
     required_option_ids: tuple[str, ...]
+    certified_feasibility_witness_option_ids: tuple[str, ...]
     option_ids: tuple[str, ...]
     feasibility_witness_option_ids: tuple[str, ...]
     policy_id: str = POLICY_ID
@@ -262,6 +315,15 @@ class CommonCandidatePoolDecision:
             raise ValueError("required_option_ids must be unique and canonical")
         if not set(self.required_option_ids).issubset(self.option_ids):
             raise ValueError("required options must enter the common pool")
+        certified = self.certified_feasibility_witness_option_ids
+        if type(certified) is not tuple:
+            raise TypeError(
+                "certified_feasibility_witness_option_ids must be an exact tuple"
+            )
+        if certified and certified != self.feasibility_witness_option_ids:
+            raise ValueError(
+                "certified feasibility witness differs from the pool certificate"
+            )
         if type(self.feasibility_witness_option_ids) is not tuple:
             raise TypeError("feasibility_witness_option_ids must be an exact tuple")
         if len(self.feasibility_witness_option_ids) != self.evaluation_size:
@@ -291,6 +353,9 @@ class CommonCandidatePoolDecision:
                 self.require_pairwise_disjoint_parent_patches
             ),
             required_option_ids=self.required_option_ids,
+            certified_feasibility_witness_option_ids=(
+                self.certified_feasibility_witness_option_ids
+            ),
         )
 
     def _task_record(self) -> dict[str, object]:
@@ -308,11 +373,14 @@ class CommonCandidatePoolDecision:
                 self.require_pairwise_disjoint_parent_patches
             ),
             required_option_ids=self.required_option_ids,
+            certified_feasibility_witness_option_ids=(
+                self.certified_feasibility_witness_option_ids
+            ),
         )
 
     def _unsigned_record(self) -> dict[str, object]:
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "state": self._state_record(),
             "state_identity_sha256": _hash(
                 _STATE_DOMAIN,
@@ -322,6 +390,9 @@ class CommonCandidatePoolDecision:
             "task_identity_sha256": _hash(_TASK_DOMAIN, self._task_record()),
             "option_ids": list(self.option_ids),
             "required_option_ids": list(self.required_option_ids),
+            "certified_feasibility_witness_option_ids": list(
+                self.certified_feasibility_witness_option_ids
+            ),
             "feasibility_witness_option_ids": list(
                 self.feasibility_witness_option_ids
             ),
@@ -406,6 +477,7 @@ class TaskKeyedCommonCandidatePoolPolicy:
         min_distinct_families: int | None,
         require_pairwise_disjoint_parent_patches: bool,
         required_option_ids: tuple[str, ...] = (),
+        certified_feasibility_witness_option_ids: tuple[str, ...] = (),
     ) -> CommonCandidatePoolDecision:
         self.__post_init__()
         if type(contract) is not FiniteVariationContract:
@@ -430,6 +502,9 @@ class TaskKeyedCommonCandidatePoolPolicy:
                 require_pairwise_disjoint_parent_patches
             ),
             required_option_ids=required_option_ids,
+            certified_feasibility_witness_option_ids=(
+                certified_feasibility_witness_option_ids
+            ),
         )
         state = _state_record(
             replicate_seed=self.replicate_seed,
@@ -443,6 +518,9 @@ class TaskKeyedCommonCandidatePoolPolicy:
                 require_pairwise_disjoint_parent_patches
             ),
             required_option_ids=required_option_ids,
+            certified_feasibility_witness_option_ids=(
+                certified_feasibility_witness_option_ids
+            ),
         )
         state_identity = _hash(_STATE_DOMAIN, state)
         all_option_ids = tuple(option.option_id for option in contract.options)
@@ -459,7 +537,9 @@ class TaskKeyedCommonCandidatePoolPolicy:
                 ),
             )
         )
-        if require_pairwise_disjoint_parent_patches:
+        if certified_feasibility_witness_option_ids:
+            witness = certified_feasibility_witness_option_ids
+        elif require_pairwise_disjoint_parent_patches:
             witness = pairwise_disjoint_parent_patch_witness(
                 contract,
                 all_option_ids,
@@ -538,6 +618,9 @@ class TaskKeyedCommonCandidatePoolPolicy:
                 require_pairwise_disjoint_parent_patches
             ),
             required_option_ids=required_option_ids,
+            certified_feasibility_witness_option_ids=(
+                certified_feasibility_witness_option_ids
+            ),
             option_ids=option_ids,
             feasibility_witness_option_ids=tuple(witness),
         )
@@ -554,6 +637,7 @@ class TaskKeyedCommonCandidatePoolPolicy:
         min_distinct_families: int | None,
         require_pairwise_disjoint_parent_patches: bool,
         required_option_ids: tuple[str, ...] = (),
+        certified_feasibility_witness_option_ids: tuple[str, ...] = (),
     ) -> None:
         if type(decision) is not CommonCandidatePoolDecision:
             raise TypeError("decision must be an exact CommonCandidatePoolDecision")
@@ -568,6 +652,9 @@ class TaskKeyedCommonCandidatePoolPolicy:
                 require_pairwise_disjoint_parent_patches
             ),
             required_option_ids=required_option_ids,
+            certified_feasibility_witness_option_ids=(
+                certified_feasibility_witness_option_ids
+            ),
         )
         if decision.to_record() != expected.to_record():
             raise ValueError("common candidate pool differs from exact policy replay")

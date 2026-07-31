@@ -47,12 +47,14 @@ from agent_evolve.core.optimization_semantics import (
     MetricSense,
     OptimizationSemantics,
 )
+from agent_evolve.domain.finite_variation import FiniteVariationContract
 from agent_evolve.domain.ids import LLMCallId
 from agent_evolve.domain.typed_json import thaw_json
 from agent_evolve.ports.action_allocation import (
     ActionAllocationRequest,
     ActionAllocationResult,
     ActionPortfolioDecision,
+    ExactActionArmCountConstraint,
     ForecastPortfolioUtilityBinding,
     validate_action_portfolio_decision,
 )
@@ -241,6 +243,7 @@ def build_target_conditioned_action_forecast_plan(
     selection_request: PortfolioSelectionRequest,
     optimization_semantics: OptimizationSemantics,
     call_id: LLMCallId,
+    forecast_contract: FiniteVariationContract | None = None,
     action_semantics: ActionSpaceSemantics | None = None,
     evidence_mode: ActionForecastEvidenceMode = (
         ActionForecastEvidenceMode.CATALOG_ONLY
@@ -259,6 +262,28 @@ def build_target_conditioned_action_forecast_plan(
     optimization_semantics.__post_init__()
     if type(evidence_mode) is not ActionForecastEvidenceMode:
         raise TypeError("evidence_mode must be exact ActionForecastEvidenceMode")
+    resolved_contract = (
+        selection_request.finite_variation_contract
+        if forecast_contract is None
+        else forecast_contract
+    )
+    if type(resolved_contract) is not FiniteVariationContract:
+        raise TypeError("forecast_contract must be an exact contract or None")
+    resolved_contract.__post_init__()
+    source_contract = selection_request.finite_variation_contract
+    if (
+        resolved_contract.parent_configuration_sha256
+        != source_contract.parent_configuration_sha256
+    ):
+        raise ValueError("forecast contract belongs to a foreign parent")
+    source_options = {
+        value.identity_sha256: value for value in source_contract.options
+    }
+    if any(
+        source_options.get(value.identity_sha256) != value
+        for value in resolved_contract.options
+    ):
+        raise ValueError("forecast contract is not an exact source-contract subset")
     campaign_target, objective_target = _target_from_selection_context(
         selection_request
     )
@@ -291,20 +316,17 @@ def build_target_conditioned_action_forecast_plan(
     parent_values.sort(key=lambda value: value.metric_id)
     scales.sort(key=lambda value: value.metric_id)
     resolved_action_semantics = (
-        derive_action_space_semantics(selection_request.finite_variation_contract)
+        derive_action_space_semantics(resolved_contract)
         if action_semantics is None
         else action_semantics
     )
     resolved_action_semantics.validate_contract_binding(
         (
-            selection_request.finite_variation_contract.catalog_id,
-            selection_request.finite_variation_contract.catalog_version,
-            selection_request.finite_variation_contract.catalog_definition_sha256,
+            resolved_contract.catalog_id,
+            resolved_contract.catalog_version,
+            resolved_contract.catalog_definition_sha256,
         ),
-        tuple(
-            value.family
-            for value in selection_request.finite_variation_contract.options
-        ),
+        tuple(value.family for value in resolved_contract.options),
     )
     grounded = evidence_mode is ActionForecastEvidenceMode.GROUNDED
     forecast_request = ActionForecastRequest(
@@ -320,7 +342,7 @@ def build_target_conditioned_action_forecast_plan(
         context=selection_request.context,
         optimization_semantics=optimization_semantics,
         action_semantics=resolved_action_semantics,
-        finite_variation_contract=selection_request.finite_variation_contract,
+        finite_variation_contract=resolved_contract,
         cards=selection_request.cards if grounded else (),
         source_registry=selection_request.source_registry if grounded else None,
         evidence_mode=evidence_mode,
@@ -355,6 +377,7 @@ def build_target_conditioned_action_utility(
     portfolio_size: int,
     eligible_option_ids: tuple[str, ...] | None = None,
     utility_mode: str = "target_closure",
+    role_slots: tuple[int, int, int] | None = None,
 ) -> ForecastPortfolioUtilityBinding:
     """Build one identified, workload-neutral acquisition utility."""
 
@@ -398,10 +421,18 @@ def build_target_conditioned_action_utility(
             raise ValueError(
                 "role_factorized requires residual frontier cell anchors"
             )
-        if portfolio_size < 3:
-            raise ValueError(
-                "role_factorized requires at least one exploit, bridge, and probe"
-            )
+        resolved_role_slots = (
+            (portfolio_size - 2, 1, 1) if role_slots is None else role_slots
+        )
+        if (
+            type(resolved_role_slots) is not tuple
+            or len(resolved_role_slots) != 3
+            or any(type(value) is not int for value in resolved_role_slots)
+        ):
+            raise TypeError("role_slots must be an exact (exploit, bridge, probe) tuple")
+        exploit_slots, bridge_slots, probe_slots = resolved_role_slots
+        if exploit_slots + bridge_slots + probe_slots != portfolio_size:
+            raise ValueError("role_slots must sum to portfolio_size")
         role_utility = build_role_factorized_action_utility(
             forecast_request=plan.request,
             forecasts=forecasts,
@@ -417,7 +448,9 @@ def build_target_conditioned_action_utility(
                 target=plan.objective_target,
                 aliases=plan.aliases,
             ),
-            exploit_slots=portfolio_size - 2,
+            exploit_slots=exploit_slots,
+            bridge_slots=bridge_slots,
+            probe_slots=probe_slots,
         )
         return role_utility.binding()
     raise ValueError(
@@ -437,6 +470,10 @@ def allocate_target_conditioned_actions(
     beam_width: int = 256,
     utility_mode: str = "target_closure",
     required_option_ids: tuple[str, ...] = (),
+    role_slots: tuple[int, int, int] | None = None,
+    exact_arm_count_constraints: tuple[ExactActionArmCountConstraint, ...] = (),
+    minimum_single_path_interventions: int = 0,
+    minimum_disjoint_parent_patch_pairs: int = 0,
 ) -> ActionAllocationResult:
     """Allocate a robust target-closing set from one authenticated forecast."""
 
@@ -455,6 +492,7 @@ def allocate_target_conditioned_actions(
         portfolio_size=portfolio_size,
         eligible_option_ids=eligible,
         utility_mode=utility_mode,
+        role_slots=role_slots,
     )
     request = ActionAllocationRequest(
         forecast_request=plan.request,
@@ -466,7 +504,12 @@ def allocate_target_conditioned_actions(
         require_pairwise_disjoint_parent_patches=(
             plan.require_pairwise_disjoint_parent_patches
         ),
+        minimum_single_path_interventions=minimum_single_path_interventions,
+        minimum_disjoint_parent_patch_pairs=(
+            minimum_disjoint_parent_patch_pairs
+        ),
         required_option_ids=required_option_ids,
+        exact_arm_count_constraints=exact_arm_count_constraints,
     )
     return FeasibleBeamRiskAdjustedDiversityAllocator(
         risk_aversion=risk_aversion,
@@ -481,6 +524,11 @@ def audit_target_conditioned_role_allocation(
     forecasts: ResolvedActionForecastBatch,
     decision: ActionPortfolioDecision,
     eligible_option_ids: tuple[str, ...] | None = None,
+    role_slots: tuple[int, int, int] | None = None,
+    exact_arm_count_constraints: tuple[ExactActionArmCountConstraint, ...] = (),
+    required_option_ids: tuple[str, ...] = (),
+    minimum_single_path_interventions: int = 0,
+    minimum_disjoint_parent_patch_pairs: int = 0,
 ) -> tuple[RoleAssignmentAudit, ...]:
     """Rebuild, validate, and explain a final role-factorized allocation."""
 
@@ -502,6 +550,7 @@ def audit_target_conditioned_role_allocation(
         portfolio_size=len(decision.members),
         eligible_option_ids=eligible,
         utility_mode="role_factorized",
+        role_slots=role_slots,
     )
     request = ActionAllocationRequest(
         forecast_request=plan.request,
@@ -513,6 +562,12 @@ def audit_target_conditioned_role_allocation(
         require_pairwise_disjoint_parent_patches=(
             plan.require_pairwise_disjoint_parent_patches
         ),
+        minimum_single_path_interventions=minimum_single_path_interventions,
+        minimum_disjoint_parent_patch_pairs=(
+            minimum_disjoint_parent_patch_pairs
+        ),
+        required_option_ids=required_option_ids,
+        exact_arm_count_constraints=exact_arm_count_constraints,
     )
     validate_action_portfolio_decision(request, decision)
     role_utility = utility.utility

@@ -32,6 +32,9 @@ from agent_evolve.domain.finite_variation import (
 )
 from agent_evolve.domain.llm_task_queue import ValidationIssueReasonCode
 from agent_evolve.domain.typed_json import FrozenJsonObject, freeze_json, thaw_json
+from agent_evolve.application.action_structural_signature import (
+    parent_relative_changed_paths_by_option,
+)
 from agent_evolve.integrations.pydantic_ai.agentic_generator import (
     AttemptedStructuredGenerationResponse,
     LowLevelRunner,
@@ -44,6 +47,15 @@ from agent_evolve.policies.selection.calibrated_slate import (
     SlateAllocationRequest,
     SlateRoleProposal,
     TraceCalibratedSlatePolicy,
+)
+from agent_evolve.policies.selection.acquisition_certified_slate import (
+    AcquisitionCertifiedSlateContext,
+    AcquisitionCertifiedSlateDecision,
+    AcquisitionCertifiedSlatePolicy,
+)
+from agent_evolve.policies.selection.regret_bounded_slate import (
+    RegretBoundedSlateDecision,
+    RegretBoundedSlatePolicy,
 )
 from agent_evolve.policies.selection.model_anchored_slate import (
     ModelAnchoredCalibratedSlatePolicy,
@@ -90,6 +102,7 @@ from agent_evolve.policies.variation.compositional_finite_catalog import (
     CompositionSelectionExposure,
 )
 from agent_evolve.policies.variation.source_union_finite_catalog import (
+    required_ranked_source_evaluation_option_ids,
     required_source_evaluation_option_ids,
 )
 from agent_evolve.policies.variation.exact_composition_capacity import (
@@ -143,7 +156,12 @@ from agent_evolve.ports.structured_generator import (
     StructuredGenerationResponse,
     StructuredOutputRepairLiteralSet,
 )
-from agent_evolve.ports.variation_source import finite_variation_source_by_option
+from agent_evolve.ports.variation_source import (
+    finite_variation_operator_by_option,
+    finite_variation_operator_id,
+    finite_variation_source_by_option,
+    finite_variation_source_minimum_counts,
+)
 
 
 CALIBRATED_PORTFOLIO_PROPOSAL_SIZE = 8
@@ -615,6 +633,38 @@ CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PORTFOLIO_SELECTION_POLICY_DEFINITION_SH
         b"legacy-target-conditioned-selector-unchanged=true"
     ).hexdigest()
 )
+ACQUISITION_CERTIFIED_RESIDUAL_PORTFOLIO_SELECTION_POLICY_ID = (
+    "pydantic_ai_acquisition_certified_residual_portfolio"
+)
+ACQUISITION_CERTIFIED_RESIDUAL_PORTFOLIO_SELECTION_POLICY_VERSION = 1
+ACQUISITION_CERTIFIED_RESIDUAL_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256 = (
+    hashlib.sha256(
+        b"agent-evolve:pydantic-ai-acquisition-certified-residual-portfolio:v1;"
+        b"model-authority=local-semantic-residual-hypothesis;"
+        b"engine-authority=dedupe-feasibility-reference-reservation;"
+        b"proposal=complete-numerical-reference-plus-model-residuals-k8;"
+        b"allocation=common-realization-qlognehvi-exact-feasible-k4;"
+        b"reference-retained-on-ties=true;strictly-prior-outcomes=true;"
+        b"certificate-scope=acquisition-not-unseen-evaluator-outcome;"
+        b"workload-model-provider-identifiers-consulted=false;"
+        b"legacy-selectors-unchanged=true"
+    ).hexdigest()
+)
+REGRET_BOUNDED_INFORMATION_PORTFOLIO_SELECTION_POLICY_ID = (
+    "pydantic_ai_regret_bounded_information_portfolio"
+)
+REGRET_BOUNDED_INFORMATION_PORTFOLIO_SELECTION_POLICY_VERSION = 1
+REGRET_BOUNDED_INFORMATION_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256 = (
+    hashlib.sha256(
+        b"agent-evolve:pydantic-ai-regret-bounded-information-portfolio:v1;"
+        b"model-authority=local-semantic-residual-hypothesis;"
+        b"engine-authority=dedupe-feasibility-reference-regret-envelope;"
+        b"proposal=complete-numerical-reference-plus-model-residuals-k8;"
+        b"allocation=frozen-acquisition-plus-authenticated-future-value;"
+        b"one-step-retention-envelope=explicit;development-assay=typed;"
+        b"workload-model-provider-identifiers-consulted=false"
+    ).hexdigest()
+)
 
 
 CalibratedPortfolioAllocator: TypeAlias = Union[
@@ -626,6 +676,8 @@ CalibratedPortfolioAllocator: TypeAlias = Union[
     FrontierProbeSlatePolicy,
     FullSupportSlatePolicy,
     TargetConditionedSlateAllocatorAdapter,
+    AcquisitionCertifiedSlatePolicy,
+    RegretBoundedSlatePolicy,
 ]
 CalibratedPortfolioAllocationDecision: TypeAlias = Union[
     SlateAllocationDecision,
@@ -635,6 +687,8 @@ CalibratedPortfolioAllocationDecision: TypeAlias = Union[
     HorizonBoundedStructuralPosteriorSlateDecision,
     FrontierProbeSlateDecision,
     TargetConditionedSlateDecision,
+    AcquisitionCertifiedSlateDecision,
+    RegretBoundedSlateDecision,
 ]
 
 
@@ -650,6 +704,8 @@ class _CalibratedPortfolioSelectionProfile:
     minimum_intervention_projection: bool = False
     evidence_calibrated_source_mix: bool = False
     contextual_search_allocation: bool = False
+    acquisition_certified_residual: bool = False
+    regret_bounded_information: bool = False
 
 
 _FOUR_ROLE_PROFILE = _CalibratedPortfolioSelectionProfile(
@@ -780,22 +836,45 @@ _TARGET_CONDITIONED_PROFILE = _CalibratedPortfolioSelectionProfile(
         TARGET_CONDITIONED_CALIBRATED_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256
     ),
 )
-_CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PROFILE = (
-    _CalibratedPortfolioSelectionProfile(
-        audit_kind="constraint_decoupled_target_conditioned_portfolio_k8_to_k4",
-        payload_schema_version=2,
-        event_type="constraint_decoupled_target_conditioned_portfolio_k8_to_k4",
-        policy_id=(
-            CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PORTFOLIO_SELECTION_POLICY_ID
-        ),
-        policy_version=(
-            CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PORTFOLIO_SELECTION_POLICY_VERSION
-        ),
-        policy_definition_sha256=(
-            CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256
-        ),
-        constraint_decoupled=True,
-    )
+_CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PROFILE = _CalibratedPortfolioSelectionProfile(
+    audit_kind="constraint_decoupled_target_conditioned_portfolio_k8_to_k4",
+    payload_schema_version=2,
+    event_type="constraint_decoupled_target_conditioned_portfolio_k8_to_k4",
+    policy_id=(CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PORTFOLIO_SELECTION_POLICY_ID),
+    policy_version=(
+        CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PORTFOLIO_SELECTION_POLICY_VERSION
+    ),
+    policy_definition_sha256=(
+        CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256
+    ),
+    constraint_decoupled=True,
+)
+_ACQUISITION_CERTIFIED_RESIDUAL_PROFILE = _CalibratedPortfolioSelectionProfile(
+    audit_kind="acquisition_certified_residual_portfolio_k8_to_k4",
+    payload_schema_version=1,
+    event_type="acquisition_certified_residual_portfolio_k8_to_k4",
+    policy_id=ACQUISITION_CERTIFIED_RESIDUAL_PORTFOLIO_SELECTION_POLICY_ID,
+    policy_version=(
+        ACQUISITION_CERTIFIED_RESIDUAL_PORTFOLIO_SELECTION_POLICY_VERSION
+    ),
+    policy_definition_sha256=(
+        ACQUISITION_CERTIFIED_RESIDUAL_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256
+    ),
+    constraint_decoupled=True,
+    acquisition_certified_residual=True,
+)
+_REGRET_BOUNDED_INFORMATION_PROFILE = _CalibratedPortfolioSelectionProfile(
+    audit_kind="regret_bounded_information_portfolio_k8_to_k4",
+    payload_schema_version=1,
+    event_type="regret_bounded_information_portfolio_k8_to_k4",
+    policy_id=REGRET_BOUNDED_INFORMATION_PORTFOLIO_SELECTION_POLICY_ID,
+    policy_version=REGRET_BOUNDED_INFORMATION_PORTFOLIO_SELECTION_POLICY_VERSION,
+    policy_definition_sha256=(
+        REGRET_BOUNDED_INFORMATION_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256
+    ),
+    constraint_decoupled=True,
+    acquisition_certified_residual=True,
+    regret_bounded_information=True,
 )
 
 
@@ -1049,6 +1128,12 @@ def _payload_schema_version(
         + (0 if binding.common_candidate_pool is None else 4)
         + (0 if binding.proposal_support is None else 8)
         + (0 if binding.contextual_allocation is None else 16)
+        + (
+            0
+            if profile is _FULL_SUPPORT_PROFILE
+            or request.portfolio_size == CALIBRATED_PORTFOLIO_EVALUATION_SIZE
+            else 32
+        )
     )
 
 
@@ -1080,6 +1165,14 @@ def _profile_for_allocator(
     if type(allocator) is TargetConditionedSlateAllocatorAdapter:
         allocator.__post_init__()
         return _TARGET_CONDITIONED_PROFILE
+    if type(allocator) is AcquisitionCertifiedSlatePolicy:
+        raise ValueError(
+            "acquisition-certified allocation requires constraint-decoupled authority"
+        )
+    if type(allocator) is RegretBoundedSlatePolicy:
+        raise ValueError(
+            "regret-bounded allocation requires constraint-decoupled authority"
+        )
     raise TypeError("allocator must be an exact supported calibrated-slate policy")
 
 
@@ -1109,6 +1202,28 @@ def _profile_for_allocator_authority(
         raise ValueError("minimum intervention requires constraint-decoupled authority")
     if not constraint_decoupled:
         return _profile_for_allocator(allocator)
+    if type(allocator) is AcquisitionCertifiedSlatePolicy:
+        if (
+            minimum_intervention_projection
+            or evidence_calibrated_source_mix
+            or contextual_search_allocation
+        ):
+            raise ValueError(
+                "acquisition certification is one complete allocation authority"
+            )
+        allocator.__post_init__()
+        return _ACQUISITION_CERTIFIED_RESIDUAL_PROFILE
+    if type(allocator) is RegretBoundedSlatePolicy:
+        if (
+            minimum_intervention_projection
+            or evidence_calibrated_source_mix
+            or contextual_search_allocation
+        ):
+            raise ValueError(
+                "regret-bounded information is one complete allocation authority"
+            )
+        allocator.__post_init__()
+        return _REGRET_BOUNDED_INFORMATION_PROFILE
     if type(allocator) is TargetConditionedSlateAllocatorAdapter:
         if (
             minimum_intervention_projection
@@ -1165,6 +1280,10 @@ def _profile_for_audit_kind(
         return _TARGET_CONDITIONED_PROFILE
     if audit_kind == _CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PROFILE.audit_kind:
         return _CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PROFILE
+    if audit_kind == _ACQUISITION_CERTIFIED_RESIDUAL_PROFILE.audit_kind:
+        return _ACQUISITION_CERTIFIED_RESIDUAL_PROFILE
+    if audit_kind == _REGRET_BOUNDED_INFORMATION_PROFILE.audit_kind:
+        return _REGRET_BOUNDED_INFORMATION_PROFILE
     raise ValueError("supplemental audit has a foreign audit kind")
 
 
@@ -1185,6 +1304,8 @@ def _profile_for_policy_definition_sha256(
         _FULL_SUPPORT_PROFILE,
         _TARGET_CONDITIONED_PROFILE,
         _CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PROFILE,
+        _ACQUISITION_CERTIFIED_RESIDUAL_PROFILE,
+        _REGRET_BOUNDED_INFORMATION_PROFILE,
     )
     matches = tuple(
         value
@@ -1295,21 +1416,50 @@ _CONTEXTUAL_ALLOCATION_JOINT_DOSE_PROJECTION_DOMAIN = (
     b"agent-evolve:contextual-allocation-feasibility-projection:v3\x00"
 )
 _CONTEXTUAL_ALLOCATION_JOINT_DOSE_PROJECTION_POLICY_VERSION = 3
-_CONTEXTUAL_ALLOCATION_JOINT_DOSE_PROJECTION_POLICY_DEFINITION_SHA256 = (
-    hashlib.sha256(
-        b"agent-evolve:contextual-allocation-feasibility-projection:v3;"
-        b"input=prospective-requested-source-operator-marginals;"
-        b"source=sealed-finite-variation-source;"
-        b"semantic-model-vs-engine-origin=separate-provenance;"
-        b"constraints=finite-contract,model-slate,portfolio-structure,"
-        b"bounded-memory-dose-attribution;"
-        b"objective=min-total-l1-then-source-l1-then-operator-l1;"
-        b"tie-break=max-retained-model-then-max-atomic-then-canonical-witness;"
-        b"memory-dose-witness=exact-evaluated-subset-card-assignment;"
-        b"objective-values-consulted=false;"
-        b"workload-model-provider-identifiers=false"
-    ).hexdigest()
+_CONTEXTUAL_ALLOCATION_JOINT_DOSE_PROJECTION_POLICY_DEFINITION_SHA256 = hashlib.sha256(
+    b"agent-evolve:contextual-allocation-feasibility-projection:v3;"
+    b"input=prospective-requested-source-operator-marginals;"
+    b"source=sealed-finite-variation-source;"
+    b"semantic-model-vs-engine-origin=separate-provenance;"
+    b"constraints=finite-contract,model-slate,portfolio-structure,"
+    b"bounded-memory-dose-attribution;"
+    b"objective=min-total-l1-then-source-l1-then-operator-l1;"
+    b"tie-break=max-retained-model-then-max-atomic-then-canonical-witness;"
+    b"memory-dose-witness=exact-evaluated-subset-card-assignment;"
+    b"objective-values-consulted=false;"
+    b"workload-model-provider-identifiers=false"
+).hexdigest()
+_CONTEXTUAL_ALLOCATION_ASSAY_PROJECTION_DOMAIN = (
+    b"agent-evolve:contextual-allocation-feasibility-projection:v4\x00"
 )
+_CONTEXTUAL_ALLOCATION_ASSAY_PROJECTION_POLICY_VERSION = 4
+_CONTEXTUAL_ALLOCATION_ASSAY_PROJECTION_POLICY_DEFINITION_SHA256 = hashlib.sha256(
+    b"agent-evolve:contextual-allocation-feasibility-projection:v4;"
+    b"input=prospective-requested-source-operator-marginals;"
+    b"source=sealed-finite-variation-source;"
+    b"proposal-operator-and-intervention-arity=independent-axes;"
+    b"single-path-intervention=exact-parent-relative-json-patch-cardinality-one;"
+    b"constraints=finite-contract,model-slate,portfolio-structure,"
+    b"bounded-memory-dose-attribution,minimum-single-path-interventions;"
+    b"objective=min-total-l1-then-source-l1-then-operator-l1;"
+    b"objective-values-consulted=false;workload-model-provider-identifiers=false"
+).hexdigest()
+_CONTEXTUAL_ALLOCATION_OFFSPRING_OPPORTUNITY_PROJECTION_DOMAIN = (
+    b"agent-evolve:contextual-allocation-feasibility-projection:v5\x00"
+)
+_CONTEXTUAL_ALLOCATION_OFFSPRING_OPPORTUNITY_PROJECTION_POLICY_VERSION = 5
+_CONTEXTUAL_ALLOCATION_OFFSPRING_OPPORTUNITY_PROJECTION_POLICY_DEFINITION_SHA256 = hashlib.sha256(
+    b"agent-evolve:contextual-allocation-feasibility-projection:v5;"
+    b"input=prospective-requested-source-operator-marginals;"
+    b"source=sealed-finite-variation-source;"
+    b"proposal-operator,intervention-arity,offspring-opportunity=independent-axes;"
+    b"offspring-opportunity=pairwise-disjoint-parent-relative-patch-pair;"
+    b"constraints=finite-contract,model-slate,portfolio-structure,"
+    b"bounded-memory-dose-attribution,minimum-single-path-interventions,"
+    b"minimum-disjoint-parent-patch-pairs;"
+    b"objective=min-total-l1-then-source-l1-then-operator-l1;"
+    b"objective-values-consulted=false;workload-model-provider-identifiers=false"
+).hexdigest()
 _HIERARCHICAL_PROMPT_DOMAIN = (
     b"agent-evolve:calibrated-hierarchical-composition-prompt:v1\x00"
 )
@@ -2058,14 +2208,18 @@ def _validate_binding_for_request(
     if (binding.contextual_allocation is not None) != contextual_search_allocation:
         raise ValueError("contextual allocation binding and selector profile disagree")
     context = binding.context
-    expected_evaluation_size = (
-        CALIBRATED_PORTFOLIO_PROPOSAL_SIZE
-        if selector_policy_definition_sha256
+    full_support = (
+        selector_policy_definition_sha256
         == FULL_SUPPORT_CALIBRATED_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256
-        else CALIBRATED_PORTFOLIO_EVALUATION_SIZE
     )
-    if request.portfolio_size != expected_evaluation_size:
-        raise ValueError("calibrated portfolio size differs from the selector profile")
+    if full_support and (
+        request.portfolio_size != CALIBRATED_PORTFOLIO_PROPOSAL_SIZE
+    ):
+        raise ValueError("full-support evaluation must cover all eight proposals")
+    if not full_support and not (
+        1 <= request.portfolio_size <= CALIBRATED_PORTFOLIO_PROPOSAL_SIZE
+    ):
+        raise ValueError("evaluation width must lie inside the proposed slate")
     if (
         len(request.finite_variation_contract.options)
         < CALIBRATED_PORTFOLIO_PROPOSAL_SIZE
@@ -2553,6 +2707,11 @@ def _render_calibrated_portfolio_selection_prompt(
                 "The engine will allocate four evaluations from the slate."
                 if request.portfolio_size == CALIBRATED_PORTFOLIO_EVALUATION_SIZE
                 else "The engine will evaluate all eight proposals in the slate."
+                if request.portfolio_size == CALIBRATED_PORTFOLIO_PROPOSAL_SIZE
+                else (
+                    "The engine will allocate "
+                    f"{request.portfolio_size} evaluations from the slate."
+                )
             )
             + allocation_constraint
             + memory_dose_constraint
@@ -2843,53 +3002,21 @@ class ContextualAllocationFeasibilityProjectionReceipt:
     realized_source_target_counts: tuple[tuple[str, int], ...]
     realized_operator_target_counts: tuple[tuple[str, int], ...]
     evaluation_option_ids: tuple[str, ...]
-    memory_dose_feasibility_witness: (
-        MemoryDoseAttributionFeasibilityWitness | None
-    ) = None
+    minimum_single_path_interventions: int = 0
+    realized_single_path_interventions: int = 0
+    minimum_disjoint_parent_patch_pairs: int = 0
+    realized_disjoint_parent_patch_pairs: int = 0
+    memory_dose_feasibility_witness: MemoryDoseAttributionFeasibilityWitness | None = (
+        None
+    )
 
     def __post_init__(self) -> None:
         require_sha256(self.contract_sha256, "contract_sha256")
-        for name in (
-            "requested_source_target_counts",
-            "realized_source_target_counts",
-            "requested_operator_target_counts",
-            "realized_operator_target_counts",
-        ):
-            values = getattr(self, name)
-            if type(values) is not tuple or not values or any(
-                type(value) is not tuple
-                or len(value) != 2
-                or type(value[0]) is not str
-                or not value[0]
-                or type(value[1]) is not int
-                or value[1] < 0
-                for value in values
-            ):
-                raise TypeError(f"{name} must contain exact non-negative counts")
-            if values != tuple(sorted(values)) or len(
-                {value[0] for value in values}
-            ) != len(values):
-                raise ValueError(f"{name} must use canonical unique arms")
-            if (
-                sum(value[1] for value in values)
-                != CALIBRATED_PORTFOLIO_EVALUATION_SIZE
-            ):
-                raise ValueError(f"{name} must cover the evaluation width")
-        if tuple(
-            value[0] for value in self.requested_source_target_counts
-        ) != tuple(value[0] for value in self.realized_source_target_counts):
-            raise ValueError("realized source arms differ from requested arms")
-        if tuple(
-            value[0] for value in self.requested_operator_target_counts
-        ) != tuple(value[0] for value in self.realized_operator_target_counts):
-            raise ValueError("realized operator arms differ from requested arms")
-        if tuple(
-            value[0] for value in self.requested_operator_target_counts
-        ) != ("atomic", "composite"):
-            raise ValueError("selector supports exactly atomic/composite operators")
         if (
             type(self.evaluation_option_ids) is not tuple
-            or len(self.evaluation_option_ids) != CALIBRATED_PORTFOLIO_EVALUATION_SIZE
+            or not self.evaluation_option_ids
+            or len(self.evaluation_option_ids)
+            > CALIBRATED_PORTFOLIO_PROPOSAL_SIZE
             or any(
                 type(value) is not str or not value
                 for value in self.evaluation_option_ids
@@ -2898,15 +3025,85 @@ class ContextualAllocationFeasibilityProjectionReceipt:
             != tuple(sorted(set(self.evaluation_option_ids)))
         ):
             raise ValueError(
-                "evaluation_option_ids must be a canonical exact K4 witness"
+                "evaluation_option_ids must be a canonical non-empty evaluation "
+                "witness inside the proposed slate"
+            )
+        evaluation_width = len(self.evaluation_option_ids)
+        for name in (
+            "requested_source_target_counts",
+            "realized_source_target_counts",
+            "requested_operator_target_counts",
+            "realized_operator_target_counts",
+        ):
+            values = getattr(self, name)
+            if (
+                type(values) is not tuple
+                or not values
+                or any(
+                    type(value) is not tuple
+                    or len(value) != 2
+                    or type(value[0]) is not str
+                    or not value[0]
+                    or type(value[1]) is not int
+                    or value[1] < 0
+                    for value in values
+                )
+            ):
+                raise TypeError(f"{name} must contain exact non-negative counts")
+            if values != tuple(sorted(values)) or len(
+                {value[0] for value in values}
+            ) != len(values):
+                raise ValueError(f"{name} must use canonical unique arms")
+            if sum(value[1] for value in values) != evaluation_width:
+                raise ValueError(f"{name} must cover the evaluation width")
+        if tuple(value[0] for value in self.requested_source_target_counts) != tuple(
+            value[0] for value in self.realized_source_target_counts
+        ):
+            raise ValueError("realized source arms differ from requested arms")
+        if tuple(value[0] for value in self.requested_operator_target_counts) != tuple(
+            value[0] for value in self.realized_operator_target_counts
+        ):
+            raise ValueError("realized operator arms differ from requested arms")
+        if (
+            type(self.minimum_single_path_interventions) is not int
+            or not 0
+            <= self.minimum_single_path_interventions
+            <= evaluation_width
+        ):
+            raise ValueError("minimum single-path intervention floor is invalid")
+        if (
+            type(self.realized_single_path_interventions) is not int
+            or not 0
+            <= self.realized_single_path_interventions
+            <= evaluation_width
+        ):
+            raise ValueError("realized single-path intervention count is invalid")
+        if self.realized_single_path_interventions < (
+            self.minimum_single_path_interventions
+        ):
+            raise ValueError("contextual witness violated its single-path floor")
+        maximum_pairs = evaluation_width * (evaluation_width - 1) // 2
+        if (
+            type(self.minimum_disjoint_parent_patch_pairs) is not int
+            or not 0 <= self.minimum_disjoint_parent_patch_pairs <= maximum_pairs
+        ):
+            raise ValueError("minimum disjoint parent-patch pair floor is invalid")
+        if (
+            type(self.realized_disjoint_parent_patch_pairs) is not int
+            or not 0 <= self.realized_disjoint_parent_patch_pairs <= maximum_pairs
+        ):
+            raise ValueError("realized disjoint parent-patch pair count is invalid")
+        if self.realized_disjoint_parent_patch_pairs < (
+            self.minimum_disjoint_parent_patch_pairs
+        ):
+            raise ValueError(
+                "contextual witness violated its disjoint parent-pair floor"
             )
         if self.memory_dose_feasibility_witness is not None:
             if type(self.memory_dose_feasibility_witness) is not (
                 MemoryDoseAttributionFeasibilityWitness
             ):
-                raise TypeError(
-                    "memory_dose_feasibility_witness must be exact or None"
-                )
+                raise TypeError("memory_dose_feasibility_witness must be exact or None")
             self.memory_dose_feasibility_witness.__post_init__()
             if self.memory_dose_feasibility_witness.stage is not (
                 PortfolioMemoryDoseStage.EVALUATED_PORTFOLIO
@@ -2914,10 +3111,13 @@ class ContextualAllocationFeasibilityProjectionReceipt:
                 raise ValueError(
                     "contextual projection requires an evaluated-dose witness"
                 )
-            if tuple(
-                value[0]
-                for value in self.memory_dose_feasibility_witness.member_option_identities
-            ) != self.evaluation_option_ids:
+            if (
+                tuple(
+                    value[0]
+                    for value in self.memory_dose_feasibility_witness.member_option_identities
+                )
+                != self.evaluation_option_ids
+            ):
                 raise ValueError(
                     "memory-dose witness differs from the evaluation witness"
                 )
@@ -2953,16 +3153,34 @@ class ContextualAllocationFeasibilityProjectionReceipt:
     def _unsigned_record(self) -> dict[str, object]:
         self.__post_init__()
         joint_memory_dose = self.memory_dose_feasibility_witness is not None
+        assay_bound = self.minimum_single_path_interventions > 0
+        offspring_opportunity_bound = self.minimum_disjoint_parent_patch_pairs > 0
         record: dict[str, object] = {
-            "schema_version": 3 if joint_memory_dose else 2,
+            "schema_version": (
+                5
+                if offspring_opportunity_bound
+                else 4
+                if assay_bound
+                else 3
+                if joint_memory_dose
+                else 2
+            ),
             "policy_id": _CONTEXTUAL_ALLOCATION_PROJECTION_POLICY_ID,
             "policy_version": (
-                _CONTEXTUAL_ALLOCATION_JOINT_DOSE_PROJECTION_POLICY_VERSION
+                _CONTEXTUAL_ALLOCATION_OFFSPRING_OPPORTUNITY_PROJECTION_POLICY_VERSION
+                if offspring_opportunity_bound
+                else _CONTEXTUAL_ALLOCATION_ASSAY_PROJECTION_POLICY_VERSION
+                if assay_bound
+                else _CONTEXTUAL_ALLOCATION_JOINT_DOSE_PROJECTION_POLICY_VERSION
                 if joint_memory_dose
                 else _CONTEXTUAL_ALLOCATION_PROJECTION_POLICY_VERSION
             ),
             "policy_definition_sha256": (
-                _CONTEXTUAL_ALLOCATION_JOINT_DOSE_PROJECTION_POLICY_DEFINITION_SHA256
+                _CONTEXTUAL_ALLOCATION_OFFSPRING_OPPORTUNITY_PROJECTION_POLICY_DEFINITION_SHA256
+                if offspring_opportunity_bound
+                else _CONTEXTUAL_ALLOCATION_ASSAY_PROJECTION_POLICY_DEFINITION_SHA256
+                if assay_bound
+                else _CONTEXTUAL_ALLOCATION_JOINT_DOSE_PROJECTION_POLICY_DEFINITION_SHA256
                 if joint_memory_dose
                 else _CONTEXTUAL_ALLOCATION_PROJECTION_POLICY_DEFINITION_SHA256
             ),
@@ -2986,6 +3204,26 @@ class ContextualAllocationFeasibilityProjectionReceipt:
             "objective_values_consulted": False,
             "workload_identifiers_consulted": False,
         }
+        if assay_bound:
+            record["minimum_single_path_interventions"] = (
+                self.minimum_single_path_interventions
+            )
+            record["realized_single_path_interventions"] = (
+                self.realized_single_path_interventions
+            )
+            record["intervention_axis"] = (
+                "exact_parent_relative_changed_json_path_count"
+            )
+        if offspring_opportunity_bound:
+            record["minimum_disjoint_parent_patch_pairs"] = (
+                self.minimum_disjoint_parent_patch_pairs
+            )
+            record["realized_disjoint_parent_patch_pairs"] = (
+                self.realized_disjoint_parent_patch_pairs
+            )
+            record["offspring_opportunity_axis"] = (
+                "pairwise_disjoint_parent_relative_patch_pairs"
+            )
         if joint_memory_dose:
             assert self.memory_dose_feasibility_witness is not None
             record["memory_dose_feasibility_witness"] = (
@@ -2998,12 +3236,32 @@ class ContextualAllocationFeasibilityProjectionReceipt:
                 "source_operator_marginals",
             ]
             record["workload_model_provider_identifiers_consulted"] = False
+        if assay_bound:
+            record["joint_constraint_families"] = sorted(
+                {
+                    *record.get("joint_constraint_families", []),
+                    "minimum_single_path_interventions",
+                    "source_operator_marginals",
+                }
+            )
+        if offspring_opportunity_bound:
+            record["joint_constraint_families"] = sorted(
+                {
+                    *record.get("joint_constraint_families", []),
+                    "minimum_disjoint_parent_patch_pairs",
+                    "source_operator_marginals",
+                }
+            )
         return record
 
     @property
     def projection_sha256(self) -> str:
         domain = (
-            _CONTEXTUAL_ALLOCATION_JOINT_DOSE_PROJECTION_DOMAIN
+            _CONTEXTUAL_ALLOCATION_OFFSPRING_OPPORTUNITY_PROJECTION_DOMAIN
+            if self.minimum_disjoint_parent_patch_pairs > 0
+            else _CONTEXTUAL_ALLOCATION_ASSAY_PROJECTION_DOMAIN
+            if self.minimum_single_path_interventions > 0
+            else _CONTEXTUAL_ALLOCATION_JOINT_DOSE_PROJECTION_DOMAIN
             if self.memory_dose_feasibility_witness is not None
             else _CONTEXTUAL_ALLOCATION_PROJECTION_DOMAIN
         )
@@ -3542,14 +3800,24 @@ def _contextual_allocation_feasibility_projection(
     requested_operator = contract.operator_target_counts
     source_targets = dict(requested_source)
     operator_targets = dict(requested_operator)
-    if set(operator_targets) != {"atomic", "composite"}:
-        raise ValueError("selector supports exactly atomic/composite operator arms")
     source_arm_ids = tuple(source_targets)
+    operator_arm_ids = tuple(operator_targets)
     if source_arm_ids == ("engine", "model"):
         # Backward-compatible replay for already sealed v3 experiments.  New
         # plans use finite-variation source IDs and never enter this branch.
         source_by_option = {
             value: "model" if value in original_by_option else "engine"
+            for value in option_ids
+        }
+        legacy_required_variation_source_option_ids = set(
+            required_source_evaluation_option_ids(request.finite_variation_contract)
+        )
+        ranked_required_variation_source_option_ids: set[str] = set()
+        required_variation_source_counts: dict[str, int] = {}
+        # Preserve already-sealed v3 experiments whose operator axis predated
+        # explicit finite-option operator metadata.
+        operator_by_option = {
+            value: "composite" if value in composite_option_ids else "atomic"
             for value in option_ids
         }
     else:
@@ -3563,32 +3831,115 @@ def _contextual_allocation_feasibility_projection(
         }
         if not set(source_by_option.values()).issubset(source_targets):
             raise ValueError("contextual contract omits a finite variation source")
+        legacy_required_variation_source_option_ids = set()
+        ranked_required_variation_source_option_ids = set(
+            required_ranked_source_evaluation_option_ids(
+                request.finite_variation_contract
+            )
+        )
+        required_variation_source_counts = dict(
+            finite_variation_source_minimum_counts(request.finite_variation_contract)
+        )
+        contract_operator_by_option = finite_variation_operator_by_option(
+            request.finite_variation_contract
+        )
+        operator_by_option = {
+            value: contract_operator_by_option[value] for value in option_ids
+        }
+    if not set(operator_by_option.values()).issubset(operator_targets):
+        raise ValueError("contextual contract omits a finite variation operator")
+    required_variation_source_option_ids = (
+        legacy_required_variation_source_option_ids
+        | ranked_required_variation_source_option_ids
+    )
     ordered_groups = {
         (source_id, operator_id): tuple(
             value
             for value in option_ids
             if source_by_option[value] == source_id
-            and (value in composite_option_ids) == (operator_id == "composite")
+            and operator_by_option[value] == operator_id
         )
         for source_id in source_arm_ids
-        for operator_id in ("atomic", "composite")
+        for operator_id in operator_arm_ids
     }
     family_by_option = {
         value.option_id: value.family
         for value in request.finite_variation_contract.options
     }
-    identity_by_option = {
-        value.option_id: value.identity_sha256
-        for value in request.finite_variation_contract.options
-    }
-    required_variation_source_option_ids = set(
-        required_source_evaluation_option_ids(request.finite_variation_contract)
+    contract_identity_index = validated_finite_variation_identity_index(
+        request.finite_variation_contract
     )
+    identity_by_option = dict(
+        zip(
+            contract_identity_index.option_ids,
+            contract_identity_index.option_identity_sha256s,
+            strict=True,
+        )
+    )
+    changed_paths_by_option = parent_relative_changed_paths_by_option(
+        request.finite_variation_contract
+    )
+    single_path_option_ids = {
+        option_id
+        for option_id, paths in changed_paths_by_option.items()
+        if len(paths) == 1
+    }
+    if len(single_path_option_ids.intersection(option_ids)) < (
+        contract.minimum_single_path_interventions
+    ):
+        raise ValueError(
+            "contextual universe omitted its single-path intervention floor"
+        )
+    disjoint_parent_patch_pairs = (
+        set()
+        if not (
+            request.require_pairwise_disjoint_parent_patches
+            or contract.minimum_disjoint_parent_patch_pairs
+        )
+        else {
+            frozenset(value)
+            for value in pairwise_disjoint_parent_patch_pairs(
+                request.finite_variation_contract,
+                option_ids,
+            )
+        }
+    )
+    if len(disjoint_parent_patch_pairs) < (
+        contract.minimum_disjoint_parent_patch_pairs
+    ):
+        raise ValueError(
+            "contextual universe omitted its disjoint parent-pair floor"
+        )
+    disjoint_degree = {
+        option_id: sum(
+            option_id in pair for pair in disjoint_parent_patch_pairs
+        )
+        for option_id in option_ids
+    }
+    option_priority = {value: index for index, value in enumerate(option_ids)}
+    ordered_groups = {
+        key: tuple(
+            sorted(
+                values,
+                key=lambda option_id: (
+                    option_id not in required_variation_source_option_ids,
+                    option_id not in single_path_option_ids,
+                    -disjoint_degree[option_id],
+                    option_priority[option_id],
+                ),
+            )
+        )
+        for key, values in ordered_groups.items()
+    }
     if not required_variation_source_option_ids.issubset(option_ids):
+        raise ValueError("contextual universe omitted a required variation source")
+    if any(
+        sum(source_by_option[value] == source_id for value in option_ids) < minimum
+        for source_id, minimum in required_variation_source_counts.items()
+    ):
         raise ValueError("contextual universe omitted a required variation source")
     if request.memory_dose_contract is not None:
         dose = request.memory_dose_contract
-        option_priority = {value: index for index, value in enumerate(option_ids)}
 
         def support_count(option_id: str) -> int:
             return sum(
@@ -3605,7 +3956,10 @@ def _contextual_allocation_feasibility_projection(
                 sorted(
                     values,
                     key=lambda option_id: (
+                        option_id not in required_variation_source_option_ids,
                         -support_count(option_id),
+                        option_id not in single_path_option_ids,
+                        -disjoint_degree[option_id],
                         option_priority[option_id],
                     ),
                 )
@@ -3615,13 +3969,7 @@ def _contextual_allocation_feasibility_projection(
     allowed_pairs = (
         None
         if not request.require_pairwise_disjoint_parent_patches
-        else {
-            frozenset(value)
-            for value in pairwise_disjoint_parent_patch_pairs(
-                request.finite_variation_contract,
-                option_ids,
-            )
-        }
+        else disjoint_parent_patch_pairs
     )
     dose_witness_cache: dict[
         tuple[str, ...], MemoryDoseAttributionFeasibilityWitness | None
@@ -3649,10 +3997,7 @@ def _contextual_allocation_feasibility_projection(
         # Evaluated members retain their exact card attribution in the K8
         # proposal.  An evaluated witness that already exceeds the proposed
         # upper bound cannot be extended into a passing proposal slate.
-        if (
-            witness.supported_member_count
-            > dose.proposed_supported_member_bounds[1]
-        ):
+        if witness.supported_member_count > dose.proposed_supported_member_bounds[1]:
             dose_witness_cache[key] = None
             return None
         dose_witness_cache[key] = witness
@@ -3662,6 +4007,11 @@ def _contextual_allocation_feasibility_projection(
         """Evaluate one K4 against indexes validated once for this search."""
 
         if not required_variation_source_option_ids.issubset(subset):
+            return False
+        if any(
+            sum(source_by_option[value] == source_id for value in subset) < minimum
+            for source_id, minimum in required_variation_source_counts.items()
+        ):
             return False
         families = tuple(family_by_option[value] for value in subset)
         if (
@@ -3673,6 +4023,16 @@ def _contextual_allocation_feasibility_projection(
             not minimum <= families.count(family) <= maximum
             for family, minimum, maximum in required_evaluation_family_bounds
         ):
+            return False
+        if sum(value in single_path_option_ids for value in subset) < (
+            contract.minimum_single_path_interventions
+        ):
+            return False
+        if sum(
+            frozenset((left, right)) in disjoint_parent_patch_pairs
+            for index, left in enumerate(subset)
+            for right in subset[index + 1 :]
+        ) < contract.minimum_disjoint_parent_patch_pairs:
             return False
         structure_passes = allowed_pairs is None or all(
             frozenset((left, right)) in allowed_pairs
@@ -3691,45 +4051,77 @@ def _contextual_allocation_feasibility_projection(
         family: maximum for family, _, maximum in required_evaluation_family_bounds
     }
 
-    def atomic_count_vectors(
-        source_counts: tuple[int, ...],
-        atomic_target: int,
+    def bounded_compositions(
+        total: int,
+        maxima: tuple[int, ...],
     ) -> tuple[tuple[int, ...], ...]:
         rows: list[tuple[int, ...]] = []
 
         def visit(index: int, remaining: int, prefix: tuple[int, ...]) -> None:
-            if index == len(source_counts) - 1:
+            if index == len(maxima) - 1:
                 value = remaining
-                if 0 <= value <= source_counts[index]:
+                if 0 <= value <= maxima[index]:
                     rows.append((*prefix, value))
                 return
-            minimum = max(0, remaining - sum(source_counts[index + 1 :]))
-            maximum = min(source_counts[index], remaining)
+            minimum = max(0, remaining - sum(maxima[index + 1 :]))
+            maximum = min(maxima[index], remaining)
             for value in range(minimum, maximum + 1):
                 visit(index + 1, remaining - value, (*prefix, value))
 
-        visit(0, atomic_target, ())
+        visit(0, total, ())
         return tuple(rows)
+
+    def contingency_tables(
+        row_counts: tuple[int, ...],
+        column_counts: tuple[int, ...],
+    ) -> tuple[tuple[tuple[int, ...], ...], ...]:
+        if sum(row_counts) != sum(column_counts):
+            raise ValueError("contextual source/operator marginals differ in capacity")
+        tables: list[tuple[tuple[int, ...], ...]] = []
+
+        def visit(
+            row_index: int,
+            remaining_columns: tuple[int, ...],
+            rows: tuple[tuple[int, ...], ...],
+        ) -> None:
+            if row_index == len(row_counts) - 1:
+                if sum(remaining_columns) == row_counts[row_index]:
+                    tables.append((*rows, remaining_columns))
+                return
+            for row in bounded_compositions(
+                row_counts[row_index],
+                remaining_columns,
+            ):
+                visit(
+                    row_index + 1,
+                    tuple(
+                        remaining - used
+                        for remaining, used in zip(
+                            remaining_columns,
+                            row,
+                            strict=True,
+                        )
+                    ),
+                    (*rows, row),
+                )
+
+        visit(0, column_counts, ())
+        return tuple(tables)
 
     def first_witness(
         *,
         source_counts: tuple[int, ...],
-        atomic_target: int,
+        operator_counts: tuple[int, ...],
     ) -> tuple[tuple[str, ...], MemoryDoseAttributionFeasibilityWitness | None] | None:
-        for atomic_counts in atomic_count_vectors(source_counts, atomic_target):
+        for table in contingency_tables(source_counts, operator_counts):
             group_rows = tuple(
                 row
-                for source_id, source_count, atomic_count in zip(
-                    source_arm_ids,
-                    source_counts,
-                    atomic_counts,
-                    strict=True,
-                )
+                for source_index, source_id in enumerate(source_arm_ids)
+                for operator_index, operator_id in enumerate(operator_arm_ids)
                 for row in (
-                    (ordered_groups[(source_id, "atomic")], atomic_count),
                     (
-                        ordered_groups[(source_id, "composite")],
-                        source_count - atomic_count,
+                        ordered_groups[(source_id, operator_id)],
+                        table[source_index][operator_index],
                     ),
                 )
             )
@@ -3806,27 +4198,25 @@ def _contextual_allocation_feasibility_projection(
                 return witness
         return None
 
-    requested_atomic = operator_targets["atomic"]
     requested_source_counts = tuple(source_targets[value] for value in source_arm_ids)
+    requested_operator_counts = tuple(
+        operator_targets[value] for value in operator_arm_ids
+    )
 
-    def source_count_vectors() -> tuple[tuple[int, ...], ...]:
-        rows: list[tuple[int, ...]] = []
-
-        def visit(index: int, remaining: int, prefix: tuple[int, ...]) -> None:
-            if index == len(source_arm_ids) - 1:
-                rows.append((*prefix, remaining))
-                return
-            for value in range(remaining + 1):
-                visit(index + 1, remaining - value, (*prefix, value))
-
-        visit(0, request.portfolio_size, ())
-        return tuple(rows)
+    source_count_vectors = bounded_compositions(
+        request.portfolio_size,
+        tuple(request.portfolio_size for _ in source_arm_ids),
+    )
+    operator_count_vectors = bounded_compositions(
+        request.portfolio_size,
+        tuple(request.portfolio_size for _ in operator_arm_ids),
+    )
 
     candidate_marginals = sorted(
         (
-            (source_counts, atomic_target)
-            for source_counts in source_count_vectors()
-            for atomic_target in range(request.portfolio_size + 1)
+            (source_counts, operator_counts)
+            for source_counts in source_count_vectors
+            for operator_counts in operator_count_vectors
         ),
         key=lambda value: (
             sum(
@@ -3835,22 +4225,34 @@ def _contextual_allocation_feasibility_projection(
                     value[0], requested_source_counts, strict=True
                 )
             )
-            + 2 * abs(value[1] - requested_atomic),
+            + 2
+            * sum(
+                abs(observed - requested)
+                for observed, requested in zip(
+                    value[1], requested_operator_counts, strict=True
+                )
+            ),
             sum(
                 abs(observed - requested)
                 for observed, requested in zip(
                     value[0], requested_source_counts, strict=True
                 )
             ),
-            2 * abs(value[1] - requested_atomic),
+            2
+            * sum(
+                abs(observed - requested)
+                for observed, requested in zip(
+                    value[1], requested_operator_counts, strict=True
+                )
+            ),
             value[0],
-            -value[1],
+            value[1],
         ),
     )
-    for realized_sources, realized_atomic in candidate_marginals:
+    for realized_sources, realized_operators in candidate_marginals:
         resolved = first_witness(
             source_counts=realized_sources,
-            atomic_target=realized_atomic,
+            operator_counts=realized_operators,
         )
         if resolved is None:
             continue
@@ -3862,14 +4264,99 @@ def _contextual_allocation_feasibility_projection(
             realized_source_target_counts=tuple(
                 zip(source_arm_ids, realized_sources, strict=True)
             ),
-            realized_operator_target_counts=(
-                ("atomic", realized_atomic),
-                ("composite", request.portfolio_size - realized_atomic),
+            realized_operator_target_counts=tuple(
+                zip(operator_arm_ids, realized_operators, strict=True)
             ),
             evaluation_option_ids=tuple(sorted(witness)),
+            minimum_single_path_interventions=(
+                contract.minimum_single_path_interventions
+            ),
+            realized_single_path_interventions=sum(
+                value in single_path_option_ids for value in witness
+            ),
+            minimum_disjoint_parent_patch_pairs=(
+                contract.minimum_disjoint_parent_patch_pairs
+            ),
+            realized_disjoint_parent_patch_pairs=sum(
+                frozenset((left, right)) in disjoint_parent_patch_pairs
+                for index, left in enumerate(witness)
+                for right in witness[index + 1 :]
+            ),
             memory_dose_feasibility_witness=dose_witness,
         )
-    return None
+    dose_diagnostic = None
+    if request.memory_dose_contract is not None:
+        dose = request.memory_dose_contract
+        dose_diagnostic = {
+            "assigned_card_count": len(dose.assigned_card_keys),
+            "evaluated_supported_member_bounds": list(
+                dose.evaluated_supported_member_bounds
+            ),
+            "minimum_unattributed_evaluated_members": (
+                dose.minimum_unattributed_evaluated_members
+            ),
+            "supportable_option_count": sum(
+                any(
+                    support.supports(option_id, identity_by_option[option_id])
+                    for support in dose.card_supports
+                )
+                for option_id in option_ids
+            ),
+        }
+    raise ValueError(
+        "no jointly feasible contextual allocation: "
+        + json.dumps(
+            {
+                "option_count": len(option_ids),
+                "requested_source_target_counts": list(requested_source),
+                "requested_operator_target_counts": list(requested_operator),
+                "required_ranked_source_option_ids": sorted(
+                    ranked_required_variation_source_option_ids
+                ),
+                "required_legacy_source_option_ids": sorted(
+                    legacy_required_variation_source_option_ids
+                ),
+                "minimum_single_path_interventions": (
+                    contract.minimum_single_path_interventions
+                ),
+                "single_path_option_count": len(
+                    single_path_option_ids.intersection(option_ids)
+                ),
+                "minimum_disjoint_parent_patch_pairs": (
+                    contract.minimum_disjoint_parent_patch_pairs
+                ),
+                "available_disjoint_parent_patch_pairs": len(
+                    disjoint_parent_patch_pairs
+                ),
+                "option_counts_by_source_operator": {
+                    f"{source_id}|{operator_id}": len(
+                        ordered_groups[(source_id, operator_id)]
+                    )
+                    for source_id in source_arm_ids
+                    for operator_id in operator_arm_ids
+                },
+                "single_path_counts_by_source_operator": {
+                    f"{source_id}|{operator_id}": sum(
+                        value in single_path_option_ids
+                        for value in ordered_groups[(source_id, operator_id)]
+                    )
+                    for source_id in source_arm_ids
+                    for operator_id in operator_arm_ids
+                },
+                "minimum_distinct_families": request.min_distinct_families,
+                "required_family_bounds": [
+                    list(value) for value in required_evaluation_family_bounds
+                ],
+                "pairwise_disjoint_parent_patches": (
+                    request.require_pairwise_disjoint_parent_patches
+                ),
+                "memory_dose": dose_diagnostic,
+            },
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
 
 
 def _dose_assignment_for_reconciled_slate(
@@ -4068,6 +4555,7 @@ def _reconcile_semantic_members(
     minimum_intervention_projection: bool = False,
     evidence_calibrated_source_mix: bool = False,
     contextual_search_allocation: bool = False,
+    acquisition_certification_reference_option_ids: tuple[str, ...] = (),
 ) -> tuple[
     tuple[CalibratedPortfolioModelMember, ...],
     SemanticSlateReconciliationReceipt,
@@ -4080,6 +4568,28 @@ def _reconcile_semantic_members(
         raise TypeError("evidence_calibrated_source_mix must be an exact bool")
     if type(contextual_search_allocation) is not bool:
         raise TypeError("contextual_search_allocation must be an exact bool")
+    if (
+        type(acquisition_certification_reference_option_ids) is not tuple
+        or any(
+            type(value) is not str or not value
+            for value in acquisition_certification_reference_option_ids
+        )
+        or acquisition_certification_reference_option_ids
+        != tuple(sorted(set(acquisition_certification_reference_option_ids)))
+    ):
+        raise ValueError(
+            "acquisition certification reference IDs must be canonical and unique"
+        )
+    if acquisition_certification_reference_option_ids and len(
+        acquisition_certification_reference_option_ids
+    ) != request.portfolio_size:
+        raise ValueError("acquisition reference must exactly fill the portfolio")
+    if acquisition_certification_reference_option_ids and (
+        minimum_intervention_projection
+        or evidence_calibrated_source_mix
+        or contextual_search_allocation
+    ):
+        raise ValueError("acquisition certification cannot mix allocation authorities")
     if contextual_search_allocation and not evidence_calibrated_source_mix:
         raise ValueError(
             "contextual allocation requires evidence-calibrated source mix"
@@ -4111,9 +4621,11 @@ def _reconcile_semantic_members(
     )
     required_evaluation_sources = set(required_evaluation_source_order)
     if not required_evaluation_sources.issubset(selectable_set):
-        raise ValueError(
-            "common candidate pool omitted a required evaluation source"
-        )
+        raise ValueError("common candidate pool omitted a required evaluation source")
+    if not set(acquisition_certification_reference_option_ids).issubset(
+        selectable_set
+    ):
+        raise ValueError("selectable pool omitted an acquisition reference option")
     protected_allocation_option_ids: tuple[str, ...] = ()
     contextual_allocation_option_ids: tuple[str, ...] = ()
     contextual_allocation_projection = None
@@ -4126,7 +4638,20 @@ def _reconcile_semantic_members(
         None if hierarchy is None else hierarchy.required_composite_proposals
     )
     pool_witness = None
-    if contextual_search_allocation:
+    if acquisition_certification_reference_option_ids:
+        pool_witness = _first_evaluation_witness(
+            request,
+            priority,
+            required_evaluation_family_bounds=required_evaluation_family_bounds,
+            required_option_ids=acquisition_certification_reference_option_ids,
+        )
+        if pool_witness is None or set(pool_witness) != set(
+            acquisition_certification_reference_option_ids
+        ):
+            raise ValueError(
+                "complete numerical acquisition reference is not evaluator-feasible"
+            )
+    elif contextual_search_allocation:
         if binding.common_candidate_pool is None:
             raise ValueError(
                 "contextual search allocation requires a common candidate pool"
@@ -4205,7 +4730,12 @@ def _reconcile_semantic_members(
         raise ValueError("selectable universe lost its feasible evaluation witness")
     feasibility_ids = set(pool_witness)
     memory_ids: set[str] = set()
-    mandatory = set(feasibility_ids).union(required_evaluation_sources)
+    # A contextual witness already satisfies semantic per-source exposure.
+    # Do not crowd its K8 reconciliation slate with unrelated deterministic
+    # representatives chosen only to keep bounded common pools source-aware.
+    mandatory = set(feasibility_ids)
+    if not contextual_search_allocation:
+        mandatory.update(required_evaluation_sources)
     if not evidence_calibrated_source_mix:
         mandatory.update(required_support)
 
@@ -4347,7 +4877,12 @@ def _reconcile_semantic_members(
                 {
                     *protected_allocation_option_ids,
                     *contextual_allocation_option_ids,
-                    *required_evaluation_sources,
+                    *acquisition_certification_reference_option_ids,
+                    *(
+                        ()
+                        if contextual_search_allocation
+                        else required_evaluation_sources
+                    ),
                 }
             )
         ),
@@ -4643,10 +5178,58 @@ def _allocate_slate(
     elif type(allocator) is TargetConditionedSlateAllocatorAdapter:
         if type(allocation) is not TargetConditionedSlateDecision:
             raise TypeError("target-conditioned allocator returned a foreign decision")
+    elif type(allocator) is AcquisitionCertifiedSlatePolicy:
+        if type(allocation) is not AcquisitionCertifiedSlateDecision:
+            raise TypeError("acquisition-certified allocator returned a foreign decision")
+    elif type(allocator) is RegretBoundedSlatePolicy:
+        if type(allocation) is not RegretBoundedSlateDecision:
+            raise TypeError("regret-bounded allocator returned a foreign decision")
     else:  # Defensive after profile/type validation.
         raise TypeError("allocator must be an exact supported policy")
     allocation.revalidate()
     return allocation
+
+
+def _acquisition_certification_reference_option_ids(
+    request: PortfolioSelectionRequest,
+    allocator: CalibratedPortfolioAllocator,
+) -> tuple[str, ...]:
+    if type(allocator) not in {
+        AcquisitionCertifiedSlatePolicy,
+        RegretBoundedSlatePolicy,
+    }:
+        return ()
+    context = allocator.context_provider.context_for(
+        request.finite_variation_contract.identity_sha256
+    )
+    if type(context) is not AcquisitionCertifiedSlateContext:
+        raise TypeError("acquisition context provider returned a foreign context")
+    context.__post_init__()
+    if context.finite_contract_sha256 != (
+        request.finite_variation_contract.identity_sha256
+    ):
+        raise ValueError("acquisition context names a foreign finite contract")
+    if len(context.reference_option_ids) != request.portfolio_size:
+        raise ValueError("acquisition reference must exactly fill the portfolio")
+    return context.reference_option_ids
+
+
+def _audit_acquisition_certification_reference_option_ids(
+    payload: dict[str, object],
+    profile: _CalibratedPortfolioSelectionProfile,
+) -> tuple[str, ...]:
+    if not profile.acquisition_certified_residual:
+        return ()
+    allocation = payload.get("allocation")
+    if type(allocation) is not dict:
+        raise TypeError("acquisition-certified audit omitted its allocation")
+    raw = allocation.get("reference_option_ids")
+    if type(raw) is not list or any(type(value) is not str for value in raw):
+        raise TypeError("acquisition reference IDs must remain an exact JSON array")
+    reference = tuple(raw)
+    if not reference or reference != tuple(sorted(set(reference))):
+        raise ValueError("acquisition reference IDs are not canonical")
+    return reference
 
 
 def _required_allocation_option_ids(
@@ -4664,6 +5247,13 @@ def _required_allocation_option_ids(
     source_floor = (
         required_source_evaluation_option_ids(request.finite_variation_contract)
         if profile.constraint_decoupled
+        and (
+            reconciliation_receipt is None
+            or not (
+                reconciliation_receipt.evidence_calibrated_source_mix
+                or reconciliation_receipt.contextual_search_allocation
+            )
+        )
         else ()
     )
     required = tuple(sorted({*reconciled, *source_floor}))
@@ -4729,6 +5319,30 @@ def _selected_predictions(
     )
 
 
+def _resolved_decision_payload_key(
+    profile: _CalibratedPortfolioSelectionProfile,
+    request: PortfolioSelectionRequest,
+) -> str:
+    if profile is _FULL_SUPPORT_PROFILE:
+        return "resolved_portfolio_decision"
+    if request.portfolio_size == CALIBRATED_PORTFOLIO_EVALUATION_SIZE:
+        # Preserve already published K4 evidence byte-for-byte.
+        return "resolved_k4_decision"
+    return "resolved_selected_decision"
+
+
+def _evaluation_reachability_invariant_key(
+    profile: _CalibratedPortfolioSelectionProfile,
+    request: PortfolioSelectionRequest,
+) -> str:
+    if profile is _FULL_SUPPORT_PROFILE:
+        return "entire_proposed_slate_reaches_evaluator"
+    if request.portfolio_size == CALIBRATED_PORTFOLIO_EVALUATION_SIZE:
+        # Preserve already published K4 evidence byte-for-byte.
+        return "only_selected_k4_reaches_evaluator"
+    return "only_selected_subset_reaches_evaluator"
+
+
 def _audit_payload_record(
     *,
     request: PortfolioSelectionRequest,
@@ -4775,11 +5389,7 @@ def _audit_payload_record(
         "invariants": {
             "one_low_level_call": True,
             "prior_only": allocation.prior_only,
-            (
-                "entire_proposed_slate_reaches_evaluator"
-                if profile is _FULL_SUPPORT_PROFILE
-                else "only_selected_k4_reaches_evaluator"
-            ): True,
+            _evaluation_reachability_invariant_key(profile, request): True,
             "caller_instruction_rendered": False,
             "input_binding_frozen_before_call": True,
             "administered_card_keys": list(allocation.administered_card_keys),
@@ -4803,11 +5413,7 @@ def _audit_payload_record(
             raise ValueError("reconciliation receipt differs from reconciled proposal")
         record["original_model_response"] = original_model_proposal_record
         record["semantic_reconciliation"] = reconciliation_receipt.to_record()
-    resolved_key = (
-        "resolved_portfolio_decision"
-        if profile is _FULL_SUPPORT_PROFILE
-        else "resolved_k4_decision"
-    )
+    resolved_key = _resolved_decision_payload_key(profile, request)
     join_key = (
         "selected_member_join"
         if profile is _FULL_SUPPORT_PROFILE
@@ -4836,6 +5442,8 @@ def _audit_payload_record(
         _FULL_SUPPORT_PROFILE,
         _TARGET_CONDITIONED_PROFILE,
         _CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PROFILE,
+        _ACQUISITION_CERTIFIED_RESIDUAL_PROFILE,
+        _REGRET_BOUNDED_INFORMATION_PROFILE,
     }:
         allocator_record = allocator.to_record()
         record["allocator_policy"] = allocator_record
@@ -5010,6 +5618,142 @@ def _require_declared_allocator_identity(
     allocator_record = payload.get("allocator_policy")
     if type(allocator_record) is not dict:
         raise TypeError("configured allocator audit omitted allocator_policy")
+    if profile is _ACQUISITION_CERTIFIED_RESIDUAL_PROFILE:
+        if set(allocator_record) != {
+            "policy_id",
+            "policy_version",
+            "definition_sha256",
+            "context_provider",
+            "scorer",
+            "exact_combination_limit",
+            "tie_tolerance_hex",
+        }:
+            raise ValueError("acquisition-certified allocator field set is invalid")
+        if (
+            allocator_record.get("policy_id"),
+            allocator_record.get("policy_version"),
+        ) != ("acquisition_certified_residual_slate", 1):
+            raise ValueError("acquisition-certified allocator identity is invalid")
+        require_sha256(
+            allocator_record.get("definition_sha256"),
+            "acquisition-certified allocator definition_sha256",
+        )
+        for field_name in ("context_provider", "scorer"):
+            identity = allocator_record.get(field_name)
+            if type(identity) is not dict or set(identity) != {
+                "provider_id" if field_name == "context_provider" else "policy_id",
+                "provider_version"
+                if field_name == "context_provider"
+                else "policy_version",
+                "definition_sha256",
+            }:
+                raise TypeError(
+                    f"acquisition-certified {field_name} identity is malformed"
+                )
+            require_sha256(
+                identity.get("definition_sha256"),
+                f"acquisition-certified {field_name}.definition_sha256",
+            )
+        if (
+            allocation.get("policy_id"),
+            allocation.get("policy_version"),
+            allocation.get("policy_definition_sha256"),
+        ) != (
+            allocator_record["policy_id"],
+            allocator_record["policy_version"],
+            allocator_record["definition_sha256"],
+        ):
+            raise ValueError(
+                "acquisition-certified decision and allocator identity disagree"
+            )
+        score_decision = allocation.get("score_decision")
+        scorer = allocator_record["scorer"]
+        if type(score_decision) is not dict or type(scorer) is not dict:
+            raise TypeError("acquisition-certified score decision is malformed")
+        score_policy = score_decision.get("policy")
+        if type(score_policy) is not dict or score_policy != {
+            "policy_id": scorer["policy_id"],
+            "policy_version": scorer["policy_version"],
+            "definition_sha256": scorer["definition_sha256"],
+        }:
+            raise ValueError("acquisition-certified scorer identity disagrees")
+        expected_composition = _composition_identity_sha256(
+            profile,
+            allocator_record,
+        )
+        if payload.get("composition_identity_sha256") != expected_composition:
+            raise ValueError("acquisition-certified composition identity is invalid")
+        return
+    if profile is _REGRET_BOUNDED_INFORMATION_PROFILE:
+        if set(allocator_record) != {
+            "policy_id",
+            "policy_version",
+            "definition_sha256",
+            "context_provider",
+            "scorer",
+            "future_value_policy",
+            "minimum_acquisition_retention_ratio_hex",
+            "minimum_residual_audit_members",
+            "calibration_error_bound_hex",
+            "allow_development_assay",
+            "exact_combination_limit",
+            "tie_tolerance_hex",
+        }:
+            raise ValueError("regret-bounded allocator field set is invalid")
+        if (
+            allocator_record.get("policy_id"),
+            allocator_record.get("policy_version"),
+        ) != ("regret_bounded_information_slate", 2):
+            raise ValueError("regret-bounded allocator identity is invalid")
+        require_sha256(
+            allocator_record.get("definition_sha256"),
+            "regret-bounded allocator definition_sha256",
+        )
+        for field_name in ("context_provider", "scorer", "future_value_policy"):
+            identity = allocator_record.get(field_name)
+            expected_keys = {
+                "provider_id",
+                "provider_version",
+                "definition_sha256",
+            } if field_name == "context_provider" else {
+                "policy_id",
+                "policy_version",
+                "definition_sha256",
+            }
+            if type(identity) is not dict or set(identity) != expected_keys:
+                raise TypeError(f"regret-bounded {field_name} identity is malformed")
+            require_sha256(
+                identity.get("definition_sha256"),
+                f"regret-bounded {field_name}.definition_sha256",
+            )
+        if (
+            allocation.get("policy_id"),
+            allocation.get("policy_version"),
+            allocation.get("policy_definition_sha256"),
+        ) != (
+            allocator_record["policy_id"],
+            allocator_record["policy_version"],
+            allocator_record["definition_sha256"],
+        ):
+            raise ValueError("regret-bounded decision and allocator identity disagree")
+        score_decision = allocation.get("score_decision")
+        scorer = allocator_record["scorer"]
+        if type(score_decision) is not dict or type(scorer) is not dict:
+            raise TypeError("regret-bounded score decision is malformed")
+        score_policy = score_decision.get("policy")
+        if type(score_policy) is not dict or score_policy != {
+            "policy_id": scorer["policy_id"],
+            "policy_version": scorer["policy_version"],
+            "definition_sha256": scorer["definition_sha256"],
+        }:
+            raise ValueError("regret-bounded scorer identity disagrees")
+        expected_composition = _composition_identity_sha256(
+            profile,
+            allocator_record,
+        )
+        if payload.get("composition_identity_sha256") != expected_composition:
+            raise ValueError("regret-bounded composition identity is invalid")
+        return
     if profile in {
         _TARGET_CONDITIONED_PROFILE,
         _CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PROFILE,
@@ -5057,9 +5801,10 @@ def _require_declared_allocator_identity(
                 raise TypeError(
                     f"target-conditioned {provider_field} identity is malformed"
                 )
-            if type(provider.get("provider_id")) is not str or not provider[
-                "provider_id"
-            ]:
+            if (
+                type(provider.get("provider_id")) is not str
+                or not provider["provider_id"]
+            ):
                 raise TypeError(f"target-conditioned {provider_field} id is invalid")
             if (
                 type(provider.get("provider_version")) is not int
@@ -5412,11 +6157,7 @@ def decode_calibrated_portfolio_proposal(
         "selected_prediction_receipt_sha256s",
         "invariants",
     }
-    resolved_key = (
-        "resolved_portfolio_decision"
-        if profile is _FULL_SUPPORT_PROFILE
-        else "resolved_k4_decision"
-    )
+    resolved_key = _resolved_decision_payload_key(profile, request)
     join_key = (
         "selected_member_join"
         if profile is _FULL_SUPPORT_PROFILE
@@ -5438,6 +6179,8 @@ def decode_calibrated_portfolio_proposal(
         _FULL_SUPPORT_PROFILE,
         _TARGET_CONDITIONED_PROFILE,
         _CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PROFILE,
+        _ACQUISITION_CERTIFIED_RESIDUAL_PROFILE,
+        _REGRET_BOUNDED_INFORMATION_PROFILE,
     }:
         expected_keys.update({"allocator_policy", "composition_identity_sha256"})
     if binding.common_candidate_pool is not None:
@@ -5513,7 +6256,12 @@ def decode_calibrated_portfolio_proposal(
         original_model_members = _typed_model_members(original_model_record)
         required_family_bounds = (
             ()
-            if profile is _CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PROFILE
+            if profile
+            in {
+                _CONSTRAINT_DECOUPLED_TARGET_CONDITIONED_PROFILE,
+                _ACQUISITION_CERTIFIED_RESIDUAL_PROFILE,
+                _REGRET_BOUNDED_INFORMATION_PROFILE,
+            }
             else _decoded_horizon_family_bounds(
                 payload,
                 request=request,
@@ -5529,6 +6277,12 @@ def decode_calibrated_portfolio_proposal(
             minimum_intervention_projection=(profile.minimum_intervention_projection),
             evidence_calibrated_source_mix=(profile.evidence_calibrated_source_mix),
             contextual_search_allocation=(profile.contextual_search_allocation),
+            acquisition_certification_reference_option_ids=(
+                _audit_acquisition_certification_reference_option_ids(
+                    payload,
+                    profile,
+                )
+            ),
         )
         expected_reconciled_record = _typed_proposal_record(
             request,
@@ -5655,6 +6409,8 @@ class DecodedCalibratedPortfolioAudit:
             HorizonBoundedStructuralPosteriorSlateDecision,
             FrontierProbeSlateDecision,
             TargetConditionedSlateDecision,
+            AcquisitionCertifiedSlateDecision,
+            RegretBoundedSlateDecision,
         }:
             raise TypeError("allocation must be an exact supported decision")
         self.allocation.revalidate()
@@ -5735,6 +6491,12 @@ def decode_calibrated_portfolio_audit(
             minimum_intervention_projection=(profile.minimum_intervention_projection),
             evidence_calibrated_source_mix=(profile.evidence_calibrated_source_mix),
             contextual_search_allocation=(profile.contextual_search_allocation),
+            acquisition_certification_reference_option_ids=(
+                _acquisition_certification_reference_option_ids(
+                    request,
+                    allocator,
+                )
+            ),
         )
         if expected_members != proposal.model_members:
             raise ValueError("decoded reconciliation members fail exact replay")
@@ -6354,6 +7116,100 @@ class PydanticAIContextualSearchAllocationPortfolioSelectionPolicy:
 
 
 @dataclass(slots=True)
+class PydanticAIAcquisitionCertifiedResidualPortfolioSelectionPolicy:
+    """Reserve an optimizer reference K4 and certify every residual substitution."""
+
+    generate_once: LowLevelRunner
+    binding_for: CalibratedPortfolioBindingProvider
+    allocator: AcquisitionCertifiedSlatePolicy
+
+    policy_id: ClassVar[str] = (
+        ACQUISITION_CERTIFIED_RESIDUAL_PORTFOLIO_SELECTION_POLICY_ID
+    )
+    policy_version: ClassVar[int] = (
+        ACQUISITION_CERTIFIED_RESIDUAL_PORTFOLIO_SELECTION_POLICY_VERSION
+    )
+    policy_definition_sha256: ClassVar[str] = (
+        ACQUISITION_CERTIFIED_RESIDUAL_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256
+    )
+
+    def __post_init__(self) -> None:
+        if not callable(self.generate_once):
+            raise TypeError("generate_once must be callable")
+        if not callable(self.binding_for):
+            raise TypeError("binding_for must be callable")
+        if type(self.allocator) is not AcquisitionCertifiedSlatePolicy:
+            raise TypeError("allocator must be exact acquisition-certified policy")
+        self.allocator.__post_init__()
+
+    @property
+    def composition_identity_sha256(self) -> str:
+        self.__post_init__()
+        return _composition_identity_sha256(
+            _ACQUISITION_CERTIFIED_RESIDUAL_PROFILE,
+            self.allocator.to_record(),
+        )
+
+    async def select(
+        self,
+        request: PortfolioSelectionRequest,
+    ) -> PortfolioSelectionResult:
+        return await _select_calibrated_portfolio(
+            generate_once=self.generate_once,
+            binding_for=self.binding_for,
+            allocator=self.allocator,
+            request=request,
+            constraint_decoupled=True,
+        )
+
+
+@dataclass(slots=True)
+class PydanticAIRegretBoundedInformationPortfolioSelectionPolicy:
+    """Select residuals only inside an authenticated acquisition-regret envelope."""
+
+    generate_once: LowLevelRunner
+    binding_for: CalibratedPortfolioBindingProvider
+    allocator: RegretBoundedSlatePolicy
+
+    policy_id: ClassVar[str] = REGRET_BOUNDED_INFORMATION_PORTFOLIO_SELECTION_POLICY_ID
+    policy_version: ClassVar[int] = (
+        REGRET_BOUNDED_INFORMATION_PORTFOLIO_SELECTION_POLICY_VERSION
+    )
+    policy_definition_sha256: ClassVar[str] = (
+        REGRET_BOUNDED_INFORMATION_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256
+    )
+
+    def __post_init__(self) -> None:
+        if not callable(self.generate_once):
+            raise TypeError("generate_once must be callable")
+        if not callable(self.binding_for):
+            raise TypeError("binding_for must be callable")
+        if type(self.allocator) is not RegretBoundedSlatePolicy:
+            raise TypeError("allocator must be exact regret-bounded policy")
+        self.allocator.__post_init__()
+
+    @property
+    def composition_identity_sha256(self) -> str:
+        self.__post_init__()
+        return _composition_identity_sha256(
+            _REGRET_BOUNDED_INFORMATION_PROFILE,
+            self.allocator.to_record(),
+        )
+
+    async def select(
+        self,
+        request: PortfolioSelectionRequest,
+    ) -> PortfolioSelectionResult:
+        return await _select_calibrated_portfolio(
+            generate_once=self.generate_once,
+            binding_for=self.binding_for,
+            allocator=self.allocator,
+            request=request,
+            constraint_decoupled=True,
+        )
+
+
+@dataclass(slots=True)
 class PydanticAIFrontierProbeCalibratedPortfolioSelectionPolicy:
     """Live adapter for model anchors plus a full-abstention frontier probe."""
 
@@ -6497,6 +7353,9 @@ async def _select_calibrated_portfolio(
         output_members,
     )
     model_members = _typed_model_members(original_model_proposal_record)
+    acquisition_reference_option_ids = (
+        _acquisition_certification_reference_option_ids(request, allocator)
+    )
     reconciliation_receipt = None
     if profile.constraint_decoupled:
         model_members, reconciliation_receipt = _reconcile_semantic_members(
@@ -6510,6 +7369,9 @@ async def _select_calibrated_portfolio(
             minimum_intervention_projection=(profile.minimum_intervention_projection),
             evidence_calibrated_source_mix=(profile.evidence_calibrated_source_mix),
             contextual_search_allocation=(profile.contextual_search_allocation),
+            acquisition_certification_reference_option_ids=(
+                acquisition_reference_option_ids
+            ),
         )
         proposal_record = _typed_proposal_record(
             request,
@@ -6575,6 +7437,12 @@ async def _select_calibrated_portfolio(
 
 
 __all__ = [
+    "ACQUISITION_CERTIFIED_RESIDUAL_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256",
+    "ACQUISITION_CERTIFIED_RESIDUAL_PORTFOLIO_SELECTION_POLICY_ID",
+    "ACQUISITION_CERTIFIED_RESIDUAL_PORTFOLIO_SELECTION_POLICY_VERSION",
+    "REGRET_BOUNDED_INFORMATION_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256",
+    "REGRET_BOUNDED_INFORMATION_PORTFOLIO_SELECTION_POLICY_ID",
+    "REGRET_BOUNDED_INFORMATION_PORTFOLIO_SELECTION_POLICY_VERSION",
     "CALIBRATED_PORTFOLIO_BOUNDED_DOSE_COMMON_POOL_PROMPT_DEFINITION_SHA256",
     "CALIBRATED_PORTFOLIO_BOUNDED_DOSE_HIDDEN_WITNESS_PROMPT_DEFINITION_SHA256",
     "CALIBRATED_PORTFOLIO_BOUNDED_DOSE_PROMPT_DEFINITION_SHA256",
@@ -6643,6 +7511,8 @@ __all__ = [
     "DecodedCalibratedPortfolioAudit",
     "DecodedCalibratedPortfolioProposal",
     "PydanticAICalibratedPortfolioSelectionPolicy",
+    "PydanticAIAcquisitionCertifiedResidualPortfolioSelectionPolicy",
+    "PydanticAIRegretBoundedInformationPortfolioSelectionPolicy",
     "PydanticAIConstraintDecoupledHorizonPortfolioSelectionPolicy",
     "PydanticAIConstraintDecoupledTargetConditionedPortfolioSelectionPolicy",
     "PydanticAIContextualSearchAllocationPortfolioSelectionPolicy",

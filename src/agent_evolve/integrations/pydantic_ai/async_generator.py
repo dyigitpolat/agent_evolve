@@ -780,9 +780,26 @@ def classify_generation_exception(
     except ImportError:  # pragma: no cover - OpenRouter installs HTTPX.
         httpx_timeout_types: tuple[type[BaseException], ...] = ()
         httpx_network_types: tuple[type[BaseException], ...] = ()
+        httpx_remote_protocol_types: tuple[type[BaseException], ...] = ()
     else:
         httpx_timeout_types = (httpx.TimeoutException,)
         httpx_network_types = (httpx.NetworkError,)
+        # ``RemoteProtocolError`` is a sibling of ``NetworkError`` under
+        # HTTPX's ``TransportError`` hierarchy.  A provider/proxy closing an
+        # otherwise valid response stream therefore used to fall through to
+        # UNKNOWN and terminate an entire concurrent forecast wave.  Admit
+        # only the remote subtype: ``LocalProtocolError`` can indicate a bad
+        # request and must continue to fail closed.
+        httpx_remote_protocol_types = (httpx.RemoteProtocolError,)
+
+    try:
+        import httpcore
+    except ImportError:  # pragma: no cover - HTTPX installs HTTPCore.
+        httpcore_remote_protocol_types: tuple[type[BaseException], ...] = ()
+    else:
+        # Preserve the same typed classification when a framework exposes the
+        # transport cause directly instead of translating it to HTTPX.
+        httpcore_remote_protocol_types = (httpcore.RemoteProtocolError,)
 
     nodes = _bounded_exception_nodes(exc)
     if any(isinstance(node, (TimeoutError, *httpx_timeout_types)) for node in nodes):
@@ -790,6 +807,19 @@ def classify_generation_exception(
             kind=GenerationFailureKind.TIMEOUT,
             retryable=True,
             safe_message="provider transport timed out",
+            retry_after_seconds=_retry_after_from_exception(exc),
+        )
+    if any(
+        isinstance(
+            node,
+            (*httpx_remote_protocol_types, *httpcore_remote_protocol_types),
+        )
+        for node in nodes
+    ):
+        return StructuredGenerationError(
+            kind=GenerationFailureKind.PROVIDER_UNAVAILABLE,
+            retryable=True,
+            safe_message="provider response stream was interrupted remotely",
             retry_after_seconds=_retry_after_from_exception(exc),
         )
     if any(isinstance(node, (ConnectionError, *httpx_network_types)) for node in nodes):

@@ -177,9 +177,29 @@ from agent_evolve.policies.selection.target_conditioned_allocator import (
     TargetConditionedAllocationContextRegistrar,
     TargetConditionedSlateAllocatorAdapter,
 )
+from agent_evolve.policies.selection.acquisition_certified_slate import (
+    AcquisitionCertifiedSlateContext,
+    AcquisitionCertifiedSlateContextRegistry,
+    AcquisitionCertifiedSlateDecision,
+    AcquisitionCertifiedSlatePolicy,
+)
+from agent_evolve.policies.selection.regret_bounded_slate import (
+    RegretBoundedSlateAssessment,
+    RegretBoundedSlateDecision,
+    RegretBoundedSlatePolicy,
+    ResidualInformationAssayValuePolicy,
+    SlateFutureValueAuthority,
+    SlateFutureValueEstimate,
+    SlateFutureValuePolicy,
+    ZeroSlateFutureValuePolicy,
+)
 
 __all__ = [
     "AbsoluteToleranceDirectionAdjudicator",
+    "AcquisitionCertifiedSlateContext",
+    "AcquisitionCertifiedSlateContextRegistry",
+    "AcquisitionCertifiedSlateDecision",
+    "AcquisitionCertifiedSlatePolicy",
     "AtomicPaletteDecision",
     "ArchiveAwareDisjointPairScoreRow",
     "ArchiveAwareDisjointPairSelectionDecision",
@@ -298,6 +318,10 @@ __all__ = [
     "TargetConditionedAllocationContextRegistrar",
     "TargetConditionedSlateAllocatorAdapter",
     "RegisteredTargetConditionedAllocationContextProvider",
+    "RegretBoundedSlateAssessment",
+    "RegretBoundedSlateDecision",
+    "RegretBoundedSlatePolicy",
+    "ResidualInformationAssayValuePolicy",
     "TARGET_CONDITIONED_FEATURE_NAMES",
     "PortableTransitionReceipt",
     "BaseRealizablePortfolioProjector",
@@ -307,7 +331,11 @@ __all__ = [
     "PrequentialLinearGaussianHead",
     "RealizablePortfolioSet",
     "SemanticProjectionPhenotypeIdentityPolicy",
+    "SlateFutureValueAuthority",
+    "SlateFutureValueEstimate",
+    "SlateFutureValuePolicy",
     "TypedConfigurationPhenotypeIdentityPolicy",
+    "ZeroSlateFutureValuePolicy",
     "validate_diagnostic_action_sample",
     "affine_frontier_context_projector",
     "enumerate_base_realizable_portfolios",

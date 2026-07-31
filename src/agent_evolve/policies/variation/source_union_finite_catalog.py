@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from agent_evolve.domain.finite_variation import (
     MAX_FINITE_VARIATION_OPTIONS,
@@ -24,6 +24,8 @@ from agent_evolve.ports.variation_catalog import FiniteVariationCatalog
 from agent_evolve.ports.variation_source import (
     VARIATION_SOURCE_METADATA_KEY,
     VARIATION_SOURCE_MINIMUM_METADATA_KEY,
+    VARIATION_SOURCE_RANK_METADATA_KEY,
+    finite_variation_source_minimum_counts,
 )
 
 
@@ -35,6 +37,9 @@ SOURCE_UNION_POLICY_ID = "finite_variation_source_union"
 SOURCE_UNION_POLICY_VERSION = 1
 _DEFINITION_DOMAIN = b"agent-evolve:finite-variation-source-union:def:v1\x00"
 _EXPOSURE_DOMAIN = b"agent-evolve:finite-variation-source-exposure:v1\x00"
+_EXPOSURE_POLICY_DOMAIN = (
+    b"agent-evolve:finite-variation-source-exposure-policy:def:v1\x00"
+)
 
 
 def _canonical_json(value: object) -> bytes:
@@ -162,15 +167,109 @@ class SourceUnionFiniteVariationCatalog:
         return options
 
 
+@dataclass(frozen=True, slots=True)
+class SourceExposureFiniteVariationCatalog:
+    """Set or remove a source's hard evaluator floor without changing actions.
+
+    Source identity is useful for attribution even when its exposure is
+    selected adaptively. This workload-neutral wrapper separates those two
+    concerns while authenticating the policy change in the catalog identity.
+    ``None`` keeps every source-labelled option eligible but removes its hard
+    per-lane minimum; an integer installs that exact minimum.
+    """
+
+    source_catalog: FiniteVariationCatalog
+    evaluation_source_minimum: int | None
+    catalog_id: str = field(init=False)
+    catalog_version: int = field(init=False)
+    definition_sha256: str = field(init=False)
+    option_families: tuple[str, ...] | None = field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        base_id, base_version, base_definition = _catalog_identity(
+            self.source_catalog
+        )
+        if self.evaluation_source_minimum is not None and (
+            type(self.evaluation_source_minimum) is not int
+            or not 1 <= self.evaluation_source_minimum < 8
+        ):
+            raise ValueError("evaluation source minimum must be None or lie in [1, 8)")
+        object.__setattr__(self, "catalog_id", f"{base_id}_source_exposure")
+        object.__setattr__(self, "catalog_version", base_version + 1)
+        object.__setattr__(
+            self,
+            "definition_sha256",
+            hashlib.sha256(
+                _EXPOSURE_POLICY_DOMAIN
+                + _canonical_json(
+                    {
+                        "schema_version": 1,
+                        "base_catalog": {
+                            "catalog_id": base_id,
+                            "catalog_version": base_version,
+                            "definition_sha256": base_definition,
+                        },
+                        "evaluation_source_minimum": (
+                            self.evaluation_source_minimum
+                        ),
+                        "source_identity": "preserved",
+                        "action_set_and_order": "preserved",
+                        "outcomes_consulted": False,
+                        "workload_model_provider_identifiers_consulted": False,
+                    }
+                )
+            ).hexdigest(),
+        )
+        families = getattr(self.source_catalog, "option_families", None)
+        if families is not None:
+            if (
+                type(families) is not tuple
+                or not families
+                or any(type(value) is not str or not value for value in families)
+            ):
+                raise TypeError("source catalog option_families are invalid")
+            object.__setattr__(self, "option_families", families)
+
+    def options(
+        self,
+        parent_configuration: FrozenJsonObject,
+    ) -> tuple[FiniteVariationOption, ...]:
+        self.__post_init__()
+        options = self.source_catalog.options(parent_configuration)
+        if type(options) is not tuple or any(
+            type(value) is not FiniteVariationOption for value in options
+        ):
+            raise TypeError("source catalog returned foreign finite options")
+        rewritten: list[FiniteVariationOption] = []
+        for option in options:
+            option.__post_init__()
+            metadata = dict(option.metadata)
+            source_id = metadata.get(VARIATION_SOURCE_METADATA_KEY)
+            if type(source_id) is not str or not source_id:
+                raise ValueError("source-exposure wrapper requires source-labelled options")
+            metadata.pop(VARIATION_SOURCE_MINIMUM_METADATA_KEY, None)
+            if self.evaluation_source_minimum is not None:
+                metadata[VARIATION_SOURCE_MINIMUM_METADATA_KEY] = str(
+                    self.evaluation_source_minimum
+                )
+            rewritten.append(
+                replace(option, metadata=tuple(sorted(metadata.items())))
+            )
+        return tuple(rewritten)
+
+
 def required_source_evaluation_option_ids(
     contract: FiniteVariationContract,
 ) -> tuple[str, ...]:
     """Select deterministic source-floor witnesses from one sealed contract.
 
     A downstream selector must retain these options in its provider-visible
-    pool *and* its evaluated slate.  This is an exposure contract rather than
-    a quality claim: the witness is selected without current or historical
-    objective values and rotates automatically as the parent contract changes.
+    pool *and* its evaluated slate. A source may publish an authenticated
+    within-batch rank; in that case its smallest ranks define the protected
+    prefix. This preserves a source-native decision (for example, the leading
+    members of one joint numerical-acquisition batch) without teaching the
+    broker source names or objective semantics. Unranked sources retain the
+    historical outcome-blind rotating witness.
     """
 
     if type(contract) is not FiniteVariationContract:
@@ -184,8 +283,12 @@ def required_source_evaluation_option_ids(
         raw_minimum = metadata.get(EVALUATION_SOURCE_MINIMUM_METADATA_KEY)
         if source_id is None and raw_minimum is None:
             continue
-        if source_id is None or raw_minimum is None:
-            raise ValueError("source option metadata must declare ID and minimum")
+        if source_id is None:
+            raise ValueError("source exposure minimum requires a source ID")
+        if raw_minimum is None:
+            # Source-labelled challenger remains attributable without claiming
+            # a compulsory evaluator slot.
+            continue
         if not raw_minimum.isascii() or not raw_minimum.isdigit():
             raise ValueError("evaluation source minimum must be decimal digits")
         minimum = int(raw_minimum)
@@ -203,20 +306,88 @@ def required_source_evaluation_option_ids(
         minimum = minimum_by_source[source_id]
         if len(source_options) < minimum:
             raise ValueError("proposal source cannot satisfy its exposure minimum")
-        ordered = sorted(
-            source_options,
-            key=lambda option: (
-                hashlib.sha256(
-                    _EXPOSURE_DOMAIN
-                    + contract_identity
-                    + source_id.encode("ascii", errors="strict")
-                    + bytes.fromhex(option.identity_sha256)
-                ).digest(),
-                option.option_id,
-            ),
+        raw_ranks = tuple(
+            dict(option.metadata).get(VARIATION_SOURCE_RANK_METADATA_KEY)
+            for option in source_options
         )
+        if any(value is not None for value in raw_ranks):
+            if any(value is None for value in raw_ranks):
+                raise ValueError(
+                    "one ranked proposal source contains an unranked option"
+                )
+            parsed_ranks: list[int] = []
+            for raw_rank in raw_ranks:
+                assert raw_rank is not None
+                if not raw_rank.isascii() or not raw_rank.isdigit():
+                    raise ValueError("evaluation source rank must be decimal digits")
+                rank = int(raw_rank)
+                if rank <= 0:
+                    raise ValueError("evaluation source rank must be positive")
+                parsed_ranks.append(rank)
+            if len(set(parsed_ranks)) != len(parsed_ranks):
+                raise ValueError("evaluation source ranks must be unique per contract")
+            rank_by_option_id = {
+                option.option_id: rank
+                for option, rank in zip(source_options, parsed_ranks, strict=True)
+            }
+            ordered = sorted(
+                source_options,
+                key=lambda option: (
+                    rank_by_option_id[option.option_id],
+                    option.option_id,
+                ),
+            )
+        else:
+            ordered = sorted(
+                source_options,
+                key=lambda option: (
+                    hashlib.sha256(
+                        _EXPOSURE_DOMAIN
+                        + contract_identity
+                        + source_id.encode("ascii", errors="strict")
+                        + bytes.fromhex(option.identity_sha256)
+                    ).digest(),
+                    option.option_id,
+                ),
+            )
         selected.extend(option.option_id for option in ordered[:minimum])
     return tuple(sorted(selected))
+
+
+def required_source_evaluation_counts(
+    contract: FiniteVariationContract,
+) -> tuple[tuple[str, int], ...]:
+    """Return semantic evaluator-exposure floors declared by finite sources.
+
+    Unlike :func:`required_source_evaluation_option_ids`, this projection does
+    not nominate an arbitrary representative action.  It is therefore the
+    correct contract for feasibility solvers: they may choose *any* compatible
+    action from a declared source while satisfying patch, family, operator,
+    and memory-dose constraints jointly.
+    """
+
+    return finite_variation_source_minimum_counts(contract)
+
+
+def required_ranked_source_evaluation_option_ids(
+    contract: FiniteVariationContract,
+) -> tuple[str, ...]:
+    """Return only source-floor witnesses backed by source-native ranks.
+
+    Contextual feasibility solvers normally satisfy an unranked source floor
+    with any compatible member of that source.  A published source rank adds a
+    stronger contract: the selected prefix itself is protected.  Keeping this
+    projection separate lets the generic broker preserve ranked expert advice
+    without turning historical hash witnesses into hard quality preferences.
+    """
+
+    required = required_source_evaluation_option_ids(contract)
+    return tuple(
+        option_id
+        for option_id in required
+        if VARIATION_SOURCE_RANK_METADATA_KEY
+        in dict(contract.resolve(option_id).metadata)
+    )
 
 
 __all__ = [
@@ -224,6 +395,9 @@ __all__ = [
     "EVALUATION_SOURCE_MINIMUM_METADATA_KEY",
     "SOURCE_UNION_POLICY_ID",
     "SOURCE_UNION_POLICY_VERSION",
+    "SourceExposureFiniteVariationCatalog",
     "SourceUnionFiniteVariationCatalog",
+    "required_ranked_source_evaluation_option_ids",
+    "required_source_evaluation_counts",
     "required_source_evaluation_option_ids",
 ]
