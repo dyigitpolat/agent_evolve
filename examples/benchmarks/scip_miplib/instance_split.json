@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "split_id": "scip_miplib_jul27_dev8_heldout4",
+  "provenance": {
+    "source": "MIPLIB 2017 collection, https://miplib.zib.de/WebData/instances/<name>.mps.gz",
+    "manifest": "domain_envs/scip/instances/SHA256SUMS (Gate-A standup, 2026-07-27)",
+    "family_rule": "MIPLIB instance-group name stem; held-out families are disjoint from development families",
+    "note": "held-out set concentrates the budget-bound instances (glass4, supportcase18, ran14x18-disj-8) identified by the Gate-A probes; development retains one budget-sensitive mix via roll3000/tr12-30"
+  },
+  "time_limit_s": 30.0,
+  "development": [
+    {"name": "binkar10_1", "family": "binkar", "file": "binkar10_1.mps.gz", "sha256": "94282c38edd6c83bb6c2d788d823fd82f218218e8e07c98d1d1ab42c1e91039e"},
+    {"name": "eil33-2", "family": "eil", "file": "eil33-2.mps.gz", "sha256": "2d349f8ba12aaf170c9f8bf85327d6592cc0f4d89d300dfb77197acd34a7ffb1"},
+    {"name": "mas76", "family": "mas", "file": "mas76.mps.gz", "sha256": "91f624659e181538020e0c627910f02ffa6b355d6df708ef324e697a69485a74"},
+    {"name": "mik-250-20-75-4", "family": "mik", "file": "mik-250-20-75-4.mps.gz", "sha256": "1fa6126895fa59d1c613787ad19bb10e6080a39207224b018a43b95440dca4ef"},
+    {"name": "pk1", "family": "pk", "file": "pk1.mps.gz", "sha256": "6c64530538b254a8ae648f8f8f188847366ae52da560fdec0ad290c642973ba0"},
+    {"name": "neos17", "family": "neos", "file": "neos17.mps.gz", "sha256": "1d50d129c3cbee9e409399314e5a77626811a46c301a2cf2fa2a2e64f65a8ba9"},
+    {"name": "roll3000", "family": "roll", "file": "roll3000.mps.gz", "sha256": "47a0a827ac2d697b717fb55401afa5de9e042f026d6a462fb97d968a869d282d"},
+    {"name": "tr12-30", "family": "tr", "file": "tr12-30.mps.gz", "sha256": "94f8cf2fd2fc920ed6ea2452b0755aeec110eb8404716554485c25e7a1e06a3d"}
+  ],
+  "held_out": [
+    {"name": "glass4", "family": "glass", "file": "glass4.mps.gz", "sha256": "0d6e6ceaf921e5d5489b9926fdfed2ce0aa25fd9acfa9deb6794669b56b59591"},
+    {"name": "gmu-35-40", "family": "gmu", "file": "gmu-35-40.mps.gz", "sha256": "0c91e71117164becea8109a414127a2223be82215498f243767a7f5f51b1f11d"},
+    {"name": "supportcase18", "family": "supportcase", "file": "supportcase18.mps.gz", "sha256": "72fca441584d5c98df27cd709e752fc65c788f6c6e39a48e2116727d6a3a29cc"},
+    {"name": "ran14x18-disj-8", "family": "ran-disj", "file": "ran14x18-disj-8.mps.gz", "sha256": "2a063d948b69e080e8712c449000bf8f26b05ff4f619552a35b06ca5b6eb38c8"}
+  ]
+}
