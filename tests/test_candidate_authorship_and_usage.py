@@ -95,6 +95,30 @@ def test_unreported_cost_is_none_and_not_zero():
     assert usage.cost_usd is None, "an unreported cost must not read as zero"
 
 
+def test_an_unattributed_figure_is_unrepresentable():
+    """The structural version: a zero nobody measured cannot be constructed."""
+
+    with pytest.raises(ValueError, match="require reported_by"):
+        ProviderUsageSummary(calls=0, cost_usd="0.00")
+    with pytest.raises(ValueError, match="require reported_by"):
+        ProviderUsageSummary(calls=3, input_tokens=0)
+    # a genuinely measured zero is fine, because it names what measured it
+    measured = ProviderUsageSummary(calls=0, cost_usd="0.00", reported_by="RandomHarness")
+    assert measured.cost_is_known and measured.provider_free
+
+
+def test_unreported_tokens_are_none_not_zero():
+    """The bug this fix found: tokens defaulted to 0 when unreported."""
+
+    class _NoUsage:
+        pass
+
+    usage = _provider_usage(_NoUsage(), 4)
+    assert usage.input_tokens is None and usage.output_tokens is None
+    assert usage.reported_by is None
+    assert usage.cost_is_known is False
+
+
 def test_a_reporting_harness_is_passed_through():
     class _Reports:
         def usage(self):
@@ -108,6 +132,7 @@ def test_a_reporting_harness_is_passed_through():
     usage = _provider_usage(_Reports(), 7)
     assert (usage.calls, usage.input_tokens, usage.output_tokens) == (7, 1_200_000, 700_000)
     assert usage.cost_usd == "0.54" and usage.model == "openai/gpt-5.6-luna"
+    assert usage.reported_by == "_Reports", "a figure must name what measured it"
 
 
 def test_a_broken_harness_usage_does_not_lose_the_run():

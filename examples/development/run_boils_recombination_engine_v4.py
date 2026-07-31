@@ -38,7 +38,7 @@ from examples.benchmarks.boils_abc.evaluator import (  # noqa: E402
 from examples.development import run_agentic_probe as support  # noqa: E402
 from examples.development import run_boils_agentic_pilot as v1  # noqa: E402
 from examples.development import run_boils_recombination_v3 as v3  # noqa: E402
-from examples.development.corpus_paths import resolve_corpus_path  # noqa: E402
+from examples.development.corpus_paths import corpus_path_or_none, resolve_corpus_path  # noqa: E402
 
 
 RUN_ID = "boils_recombination_engine_v4_20260714"
@@ -159,7 +159,7 @@ def _read_json_lines(path: Path) -> list[dict[str, object]]:
 
 
 def verify_preregistration(path: Path = PREREGISTRATION_PATH) -> dict[str, object]:
-    if not path.is_file():
+    if not corpus_path_or_none(path) is not None:
         raise RuntimeError("engine-v4 preregistration is missing")
     payload = resolve_corpus_path(path).read_bytes()
     if (
@@ -247,7 +247,7 @@ def scan_unseen_children(
     hits: list[dict[str, object]] = []
     if root.resolve() == ARTIFACT_ROOT.resolve():
         paths = tuple(root / relative for relative in PRE_V4_EVALUATION_LOG_CENSUS)
-        missing = [str(path) for path in paths if not path.is_file()]
+        missing = [str(path) for path in paths if not corpus_path_or_none(path) is not None]
         if missing:
             raise RuntimeError("the frozen pre-v4 evaluation census is incomplete")
         scan_scope = "frozen_pre_v4_evaluation_census"
@@ -296,7 +296,7 @@ def verify_failed_v3_bundle(
     files: dict[str, dict[str, object]] = {}
     for name, expected_hash in FAILED_V3_FILES.items():
         path = run_dir / name
-        if not path.is_file():
+        if not corpus_path_or_none(path) is not None:
             raise RuntimeError(f"failed-v3 source is missing: {name}")
         payload = resolve_corpus_path(path).read_bytes()
         observed_hash = _sha256_bytes(payload)
@@ -1488,7 +1488,7 @@ def _finalize(run_dir: Path, status: str) -> None:
     files: dict[str, dict[str, object]] = {}
     for name in names:
         path = run_dir / name
-        if not path.exists():
+        if not corpus_path_or_none(path) is not None:
             continue
         payload = resolve_corpus_path(path).read_bytes()
         files[name] = {

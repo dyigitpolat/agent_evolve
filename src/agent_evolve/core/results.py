@@ -24,14 +24,44 @@ class ProviderUsageSummary:
     """
 
     calls: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
     cost_usd: Optional[str] = None
     model: Optional[str] = None
+    reported_by: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if type(self.calls) is not int or self.calls < 0:
+            raise ValueError("calls must be a non-negative integer")
+        figures = {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cost_usd": self.cost_usd,
+        }
+        present = {name for name, value in figures.items() if value is not None}
+        if present and not self.reported_by:
+            # A figure with no reporter is a number nobody measured. Zero is the
+            # dangerous case: it reads as "nothing was spent" when it means "no
+            # one looked". Naming the reporter is what makes the difference
+            # unrepresentable rather than merely documented.
+            raise ValueError(
+                f"usage figures {sorted(present)} require reported_by naming "
+                "what measured them"
+            )
+        if self.reported_by is not None and not present:
+            raise ValueError(
+                "reported_by names a reporter that supplied no figure"
+            )
 
     @property
     def provider_free(self) -> bool:
+        """True only when calls were counted and none occurred."""
+
         return self.calls == 0
+
+    @property
+    def cost_is_known(self) -> bool:
+        return self.cost_usd is not None
 
 
 @dataclass(frozen=True)

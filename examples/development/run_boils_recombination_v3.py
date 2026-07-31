@@ -75,7 +75,7 @@ from examples.development import run_agentic_probe as support  # noqa: E402
 from examples.development import run_boils_agentic_pilot as v1  # noqa: E402
 from examples.development import run_boils_agentic_pilot_v2 as v2  # noqa: E402
 from examples.development import run_boils_local_oracle as oracle  # noqa: E402
-from examples.development.corpus_paths import resolve_corpus_path  # noqa: E402
+from examples.development.corpus_paths import corpus_path_or_none, resolve_corpus_path  # noqa: E402
 
 
 MODEL = "deepseek/deepseek-v4-pro"
@@ -471,7 +471,7 @@ def verify_evidence_bundle(
     parsed: dict[str, object] = {}
     for name in EVIDENCE_SOURCES:
         path, expected_hash = sources[name]
-        if not path.is_file():
+        if not corpus_path_or_none(path) is not None:
             raise RuntimeError(f"sealed evidence source is missing: {name}")
         payload = resolve_corpus_path(path).read_bytes()
         observed_hash = _sha256_bytes(payload)
@@ -522,7 +522,7 @@ def verify_deferred_oracle_evidence(
         if name not in sources:
             raise RuntimeError(f"deferred oracle source is missing: {name}")
         path, expected_hash = sources[name]
-        if not path.is_file() or support._sha256(path) != expected_hash:
+        if not corpus_path_or_none(path) is not None or support._sha256(path) != expected_hash:
             raise RuntimeError(f"deferred oracle source hash changed: {name}")
         records[name] = expected_hash
     finalized = loader(sources["oracle_finalized"][0])
@@ -1810,7 +1810,7 @@ def _finalize(run_dir: Path, status: str) -> None:
     files: dict[str, dict[str, object]] = {}
     for name in names:
         path = run_dir / name
-        if not path.exists():
+        if not corpus_path_or_none(path) is not None:
             continue
         payload = resolve_corpus_path(path).read_bytes()
         record: dict[str, object] = {

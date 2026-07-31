@@ -28,6 +28,7 @@ from examples.benchmarks.boils_abc.evaluator import (
     CircuitEvaluation,
 )
 from examples.development import run_boils_recombination_v3 as block
+from examples.development.corpus_paths import resolve_corpus_path
 
 
 NEW_OBJECTIVES = {
@@ -587,7 +588,7 @@ def test_identity_provenance_and_source_binding_fail_closed(tmp_path: Path) -> N
         block.materialize_cube(identities)
 
     corrupted = tmp_path / "preregistration.md"
-    corrupted.write_bytes(block.PREREGISTRATION_PATH.read_bytes() + b"\n")
+    corrupted.write_bytes(resolve_corpus_path(block.PREREGISTRATION_PATH).read_bytes() + b"\n")
     sources = dict(block.EVIDENCE_SOURCES)
     sources["preregistration"] = (
         corrupted,
@@ -597,7 +598,7 @@ def test_identity_provenance_and_source_binding_fail_closed(tmp_path: Path) -> N
         block.verify_evidence_bundle(sources)
 
     corrupted_correction = tmp_path / "protocol_correction.md"
-    corrupted_correction.write_bytes(block.CORRECTION_PATH.read_bytes() + b"\n")
+    corrupted_correction.write_bytes(resolve_corpus_path(block.CORRECTION_PATH).read_bytes() + b"\n")
     correction_sources = dict(block.EVIDENCE_SOURCES)
     correction_sources["protocol_correction"] = (
         corrupted_correction,
@@ -701,9 +702,9 @@ def test_latest_safe_start_and_terminal_seal(tmp_path: Path) -> None:
 
     seal_dir = tmp_path / "seal"
     seal_dir.mkdir()
-    (seal_dir / "preregistration.md").write_bytes(block.PREREGISTRATION_PATH.read_bytes())
+    (seal_dir / "preregistration.md").write_bytes(resolve_corpus_path(block.PREREGISTRATION_PATH).read_bytes())
     (seal_dir / "protocol_correction.md").write_bytes(
-        block.CORRECTION_PATH.read_bytes()
+        resolve_corpus_path(block.CORRECTION_PATH).read_bytes()
     )
     (seal_dir / "runner_source.py").write_text("fixture\n", encoding="utf-8")
     (seal_dir / "events.jsonl").write_text('{"x":1}\n', encoding="utf-8")

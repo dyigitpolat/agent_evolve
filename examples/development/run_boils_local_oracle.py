@@ -51,7 +51,7 @@ from examples.benchmarks.boils_abc.evaluator import (  # noqa: E402
 from examples.development import run_agentic_probe as support  # noqa: E402
 from examples.development import run_boils_agentic_pilot as v1  # noqa: E402
 from examples.development import run_boils_agentic_pilot_v2 as v2  # noqa: E402
-from examples.development.corpus_paths import resolve_corpus_path  # noqa: E402
+from examples.development.corpus_paths import corpus_path_or_none, resolve_corpus_path  # noqa: E402
 
 
 ORACLE_CPUS = (8, 9, 10, 11)
@@ -400,7 +400,7 @@ class EvaluationPublicationRecorder:
 
 def _validate_v2_terminal_file(run_dir: Path, name: str, expected: Mapping[str, object]) -> None:
     path = run_dir / name
-    if not path.is_file():
+    if not corpus_path_or_none(path) is not None:
         raise RuntimeError(f"sealed v2 terminal file is missing: {name}")
     payload = resolve_corpus_path(path).read_bytes()
     if len(payload) != expected["bytes"] or _sha256_bytes(payload) != expected["sha256"]:
@@ -1422,7 +1422,7 @@ def _finalize(run_dir: Path, status: str) -> None:
     files: dict[str, dict[str, object]] = {}
     for name in names:
         path = run_dir / name
-        if not path.exists():
+        if not corpus_path_or_none(path) is not None:
             continue
         payload = resolve_corpus_path(path).read_bytes()
         record: dict[str, object] = {

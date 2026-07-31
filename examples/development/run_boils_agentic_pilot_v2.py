@@ -218,7 +218,7 @@ def _materialize_child(index: int, replacement: str) -> dict[str, Any]:
     return child
 
 
-from examples.development.corpus_paths import resolve_corpus_path  # noqa: E402
+from examples.development.corpus_paths import corpus_path_or_none, resolve_corpus_path  # noqa: E402
 
 
 def _load_and_validate_legal_universe() -> tuple[bytes, dict[str, object]]:
@@ -1045,7 +1045,7 @@ def _finalize(run_dir: Path, status: str) -> None:
     files: dict[str, dict[str, object]] = {}
     for name in names:
         path = run_dir / name
-        if not path.exists():
+        if not corpus_path_or_none(path) is not None:
             continue
         payload = path.read_bytes()
         record: dict[str, object] = {

@@ -59,6 +59,7 @@ from agent_evolve.ports.agentic_generator import InsightDraft
 
 from examples.development.dag_dispatch_codesign import problem_def as dag_problem
 from examples.development.pipeline_codesign import problem_def as pipeline_problem
+from examples.development.corpus_paths import resolve_corpus_path  # noqa: E402
 
 
 MODEL = "deepseek/deepseek-v4-pro"
@@ -131,7 +132,10 @@ def _write_json(path: Path, value: object) -> None:
 
 
 def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    # Resolves across the 2026-07-28 archive split. Safe because the digest is
+    # of the bytes: an archived copy either hashes to the sealed value or is
+    # caught by whatever compares against it.
+    return hashlib.sha256(resolve_corpus_path(path).read_bytes()).hexdigest()
 
 
 def _source_snapshot(paths: Sequence[Path]) -> dict[str, object]:

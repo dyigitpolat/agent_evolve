@@ -61,7 +61,7 @@ from examples.development.boils_action_shadow_contracts import (  # noqa: E402
 from examples.development import run_agentic_probe as support  # noqa: E402
 from examples.development import run_boils_agentic_pilot as v1  # noqa: E402
 from examples.development import run_boils_agentic_pilot_v2 as v2  # noqa: E402
-from examples.development.corpus_paths import resolve_corpus_path  # noqa: E402
+from examples.development.corpus_paths import corpus_path_or_none, resolve_corpus_path  # noqa: E402
 
 
 MODEL = "deepseek/deepseek-v4-pro"
@@ -1099,7 +1099,7 @@ def _finalize(run_dir: Path, status: str) -> None:
     files: dict[str, dict[str, object]] = {}
     for name in names:
         path = run_dir / name
-        if not path.exists():
+        if not corpus_path_or_none(path) is not None:
             continue
         payload = resolve_corpus_path(path).read_bytes()
         record: dict[str, object] = {"bytes": len(payload), "sha256": _sha256_bytes(payload)}

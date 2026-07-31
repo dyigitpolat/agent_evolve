@@ -619,12 +619,27 @@ def _provider_usage(harness: Any, proposer_calls: int) -> ProviderUsageSummary:
             value = None
         if isinstance(value, dict):
             figures = value
+    def _figure(name: str) -> Optional[int]:
+        # Absent means unreported, which is not zero. A harness that reports a
+        # genuine zero passes 0 and it is preserved.
+        value = figures.get(name)
+        return None if value is None else int(value)
+
+    supplied = {
+        "input_tokens": _figure("input_tokens"),
+        "output_tokens": _figure("output_tokens"),
+        "cost_usd": figures.get("cost_usd"),
+    }
+    reporter = (
+        type(harness).__name__
+        if any(v is not None for v in supplied.values())
+        else None
+    )
     return ProviderUsageSummary(
         calls=proposer_calls,
-        input_tokens=int(figures.get("input_tokens") or 0),
-        output_tokens=int(figures.get("output_tokens") or 0),
-        cost_usd=figures.get("cost_usd"),
         model=figures.get("model"),
+        reported_by=reporter,
+        **supplied,
     )
 
 
