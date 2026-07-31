@@ -13,7 +13,8 @@ harness that failed to register. Swallowing it produced ``Unknown harness
 from __future__ import annotations
 
 import importlib
-from typing import Dict
+import importlib.util
+from typing import Dict, Optional
 
 from agent_evolve.harness.registry import harness_registry
 from agent_evolve.proposers.random_proposer import RandomProposer
@@ -37,6 +38,16 @@ def _register_builtin() -> None:
 _register_builtin()
 
 
+#: Harness id -> the third-party distribution it cannot work without, and the
+#: extra that installs it. An adapter that imports its provider lazily still
+#: registers successfully without it, and then fails deep inside the first
+#: model call with a bare ModuleNotFoundError. Checking here turns that into
+#: one sentence naming the install command.
+_REQUIRES = {
+    "pydantic_ai": ("pydantic_ai", "agent_evolve[llm]"),
+}
+
+
 def load_integrations() -> None:
     """Import in-tree integrations and any registered via entry points (once)."""
     global _loaded
@@ -50,6 +61,23 @@ def load_integrations() -> None:
         except Exception as exc:  # noqa: BLE001 - recorded, then reported on use
             load_failures[module] = f"{type(exc).__name__}: {exc}"
     _load_entry_points()
+    _check_lazy_requirements()
+
+
+def _check_lazy_requirements() -> None:
+    """Record harnesses whose provider package is not installed."""
+    for harness_id, (dist, extra) in _REQUIRES.items():
+        if harness_id not in harness_registry.ids():
+            continue
+        if importlib.util.find_spec(dist) is None:
+            load_failures[harness_id] = (
+                f"needs {dist}, which is not installed; pip install '{extra}'"
+            )
+
+
+def requirement_failure(harness_id: str) -> Optional[str]:
+    """Return why *harness_id* cannot run, or ``None`` when it can."""
+    return load_failures.get(harness_id)
 
 
 def _load_entry_points() -> None:

@@ -94,6 +94,14 @@ def _build_harness(kind: str, seed: Optional[int], settings: AgentEvolveSettings
         harness_id = settings.harness
     else:
         harness_id = kind  # an explicitly named registered harness
+    missing = bootstrap.requirement_failure(harness_id)
+    if missing is not None:
+        # Fail here, naming the fix, rather than deep inside the first model
+        # call with a bare ModuleNotFoundError.
+        raise RuntimeError(
+            f"the {harness_id!r} proposer {missing}. "
+            "Or run with proposer='random', which needs nothing."
+        )
     try:
         return harness_registry.create(harness_id, seed=seed)
     except KeyError as error:

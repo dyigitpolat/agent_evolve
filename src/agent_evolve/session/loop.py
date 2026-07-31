@@ -349,12 +349,25 @@ def run_evolution_loop(
         objectives,
         history,
         best_per_generation=best_per_generation,
-        evaluations=sum(r.evaluation_attempted for r in (*all_valid, *all_failed)),
+        # Artifacts actually measured. A result served from the artifact
+        # cache cost nothing, so counting it here would overstate the bill
+        # and make a budget look breached when it was honoured exactly.
+        evaluations=(
+            int(getattr(config.evaluation_cache, 'misses', 0))
+            if config.evaluation_cache is not None
+            else sum(r.evaluation_attempted for r in (*all_valid, *all_failed))
+        ),
         candidate_key=state.key_fn,
     )
     log("")
     log(
-        f"Summary: evaluations={result.evaluations}, valid={len(all_valid)}, "
+        f"Summary: evaluations={result.evaluations}"
+        + (
+            f" (+{getattr(config.evaluation_cache, 'hits', 0)} served from cache)"
+            if getattr(config.evaluation_cache, "hits", 0)
+            else ""
+        )
+        + f", valid={len(all_valid)}, "
         f"pareto={len(result.pareto_front)}, best={result.best.objectives}"
     )
     _emit(
