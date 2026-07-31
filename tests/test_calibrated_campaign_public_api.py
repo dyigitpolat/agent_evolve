@@ -126,7 +126,11 @@ def test_calibrated_campaign_provider_neutral_facade_is_explicit() -> None:
         "create_parent_measurement_projection": create_parent_measurement_projection,
     }
 
-    assert set(expected).issubset(public_api.__all__)
+    # ``__all__`` is the small supported surface now; these research symbols
+    # resolve lazily instead. Reachability is the invariant that matters --
+    # the measured stack must keep importing exactly what it always did.
+    reachable = set(public_api.__all__) | set(public_api._LEGACY_EXPORTS)
+    assert set(expected).issubset(reachable)
     for name, value in expected.items():
         assert getattr(public_api, name) is value
 

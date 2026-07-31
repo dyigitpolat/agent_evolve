@@ -42,6 +42,7 @@ from agent_evolve.policies.selection.residual_frontier import (
     residual_frontier_geometry,
 )
 from agent_evolve.policies.selection.residual_frontier_target import (
+    DIRECTIONAL_BOOTSTRAP_TARGET_ALLOCATOR_ID,
     ResidualHypervolumeFrontierTargetAllocator,
 )
 from agent_evolve.ports.frontier_target import (
@@ -408,8 +409,7 @@ def test_global_target_matching_avoids_the_greedy_parent_direction_mismatch() ->
         value.parent_configuration_sha256: value.direction_id for value in greedy
     }
     global_by_parent = {
-        value.parent_configuration_sha256: value.direction_id
-        for value in global_match
+        value.parent_configuration_sha256: value.direction_id for value in global_match
     }
     assert greedy_by_parent[low_material.occurrence.configuration_hash] == (
         "balanced_tradeoff"
@@ -529,16 +529,12 @@ def test_residual_parent_and_target_policies_form_one_coherent_cell_decision() -
         "axis_1_extreme",
         "axis_2_extreme",
     }
-    assert len(
-        {
-            payload["residual_frontier_cell"]["cell_sha256"]
-            for payload in payloads
-        }
-    ) == 1
+    assert (
+        len({payload["residual_frontier_cell"]["cell_sha256"] for payload in payloads})
+        == 1
+    )
     assert all(
-        payload["residual_frontier_cell"][
-            "normalized_aspiration_point_decimal"
-        ]
+        payload["residual_frontier_cell"]["normalized_aspiration_point_decimal"]
         == ["0.34999999999999998", "0.46499999999999997"]
         for payload in payloads
     )
@@ -564,9 +560,7 @@ def test_residual_parent_and_target_policies_form_one_coherent_cell_decision() -
                 ][0],
                 "aspiration_value_decimal": "0.34999999999999998",
                 "signed_parent_to_aspiration_delta_decimal": (
-                    payload["lane_transition"][
-                        "normalized_signed_delta_decimal"
-                    ][0]
+                    payload["lane_transition"]["normalized_signed_delta_decimal"][0]
                 ),
                 "improving_raw_delta_sign": "negative",
             },
@@ -580,9 +574,7 @@ def test_residual_parent_and_target_policies_form_one_coherent_cell_decision() -
                 ][1],
                 "aspiration_value_decimal": "0.46499999999999997",
                 "signed_parent_to_aspiration_delta_decimal": (
-                    payload["lane_transition"][
-                        "normalized_signed_delta_decimal"
-                    ][1]
+                    payload["lane_transition"]["normalized_signed_delta_decimal"][1]
                 ),
                 "improving_raw_delta_sign": "negative",
             },
@@ -590,17 +582,14 @@ def test_residual_parent_and_target_policies_form_one_coherent_cell_decision() -
         for payload in payloads
     )
     assert all(
-        payload["acquisition_instruction"][
-            "target_realization_is_magnitude_sensitive"
-        ]
+        payload["acquisition_instruction"]["target_realization_is_magnitude_sensitive"]
         and payload["acquisition_instruction"][
             "direction_only_forecasts_are_insufficient"
         ]
         for payload in payloads
     )
     assert {
-        tuple(payload["lane_transition"]["improve_metric_ids"])
-        for payload in payloads
+        tuple(payload["lane_transition"]["improve_metric_ids"]) for payload in payloads
     } == {("first",), ("second",)}
     serialized = json.dumps([value.to_record() for value in targets], sort_keys=True)
     for forbidden in (
@@ -648,9 +637,7 @@ def test_residual_target_chooses_best_cell_reachable_by_supplied_parents() -> No
         == "supplied_parent_lane_anchors"
         and payload["residual_frontier_cell"]["global_opportunity_rank"]
         == target.opportunity_rank
-        and payload["residual_frontier_cell"][
-            "parent_anchor_binding_distance_decimal"
-        ]
+        and payload["residual_frontier_cell"]["parent_anchor_binding_distance_decimal"]
         == "0"
         for target, payload in zip(targets, payloads, strict=True)
     )
@@ -684,8 +671,61 @@ def test_residual_frontier_supports_three_objectives_and_singleton_fallback() ->
 
     pair_geometry = residual_frontier_geometry(pair_snapshot)
     singleton_geometry = residual_frontier_geometry(singleton_snapshot)
+    bootstrap_targets = ResidualHypervolumeFrontierTargetAllocator().allocate(
+        archive_utility=singleton_snapshot,
+        lanes=(
+            (
+                "elite",
+                _named_parent(
+                    "bootstrap_front",
+                    {"a": 0.2, "b": 0.3, "c": 0.4},
+                ),
+            ),
+            (
+                "explorer",
+                _named_parent(
+                    "bootstrap_dominated",
+                    {"a": 0.4, "b": 0.5, "c": 0.6},
+                ),
+            ),
+        ),
+    )
 
     assert len(pair_geometry.axes) == 3
     assert len(pair_geometry.cells) == 1
     assert pair_geometry.cells[0].potential_hypervolume_gain > 0.0
     assert singleton_geometry.cells == ()
+    assert len(bootstrap_targets) == 2
+    for target in bootstrap_targets:
+        payload = thaw_json(target.payload)
+        weights = tuple(
+            float(value)
+            for value in payload["target_direction"]["normalized_weights_decimal"]
+        )
+        parent = tuple(
+            float(value)
+            for value in payload["assigned_parent"]["normalized_point_decimal"]
+        )
+        aspiration = tuple(
+            float(value)
+            for value in payload["frontier_bootstrap"][
+                "normalized_aspiration_point_decimal"
+            ]
+        )
+        expected = tuple(
+            0.9 * value if weight > 0.0 else 1.0
+            for value, weight in zip(parent, weights, strict=True)
+        )
+        objective_target = objective_space_target_from_campaign_target(target)
+
+        assert target.allocator_id == DIRECTIONAL_BOOTSTRAP_TARGET_ALLOCATOR_ID
+        assert payload["schema_version"] == 2
+        assert "residual_frontier_cell" not in payload
+        assert payload["frontier_bootstrap"]["target_kind"] == (
+            "directional_affine_bootstrap"
+        )
+        assert aspiration == pytest.approx(expected)
+        assert objective_target is not None
+        assert tuple(
+            axis.aspiration_normalized for axis in objective_target.axes
+        ) == pytest.approx(expected)

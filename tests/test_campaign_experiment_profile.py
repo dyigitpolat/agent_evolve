@@ -32,6 +32,7 @@ from agent_evolve import (
 from agent_evolve.application.evolution_campaign import (
     ArchiveUtilitySnapshot,
     CampaignPolicyBinding,
+    ReflectionFailureMode,
 )
 from agent_evolve.domain.typed_json import (
     FrozenJsonObject,
@@ -245,6 +246,9 @@ def test_reference_profile_rebinds_runtime_objects_without_method_drift() -> Non
         first.parent_selection.implementation
     )
     assert rebound.to_record()["method"]["workload_specific_fields"] == []
+    assert first.reflection_supervision.mode is (
+        ReflectionFailureMode.BEST_EFFORT_DEGRADED
+    )
 
 
 def test_reference_profile_authenticates_frontier_context_as_method_not_system() -> (

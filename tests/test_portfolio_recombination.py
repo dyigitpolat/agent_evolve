@@ -18,9 +18,11 @@ from agent_evolve.application.detailed_evaluation import (
 )
 from agent_evolve.application.contextual_delayed_credit import (
     observe_contextual_post_recombination_credit,
+    observe_contextual_post_stage_survival,
 )
 from agent_evolve.application.contextual_search_controller import (
     ContextualSearchObservation,
+    SearchPhase,
 )
 from agent_evolve.application.insight_memory import InsightMemoryBank
 from agent_evolve.application.outcome_relation import objective_pareto_outcome_binding
@@ -45,6 +47,12 @@ from agent_evolve.application.portfolio_recombination import (
     frozen_archive_source_utility_context,
     portfolio_recombination_observed_sources,
 )
+from agent_evolve.application.recombination_residual_expert import (
+    RecombinationResidualExpert,
+)
+from agent_evolve.application.residual_portfolio_evolution import (
+    ResidualPortfolioDecisionRequest,
+)
 from agent_evolve.application.evolution_campaign import ArchiveUtilitySnapshot
 from agent_evolve.core.problem import ObjectiveSpec
 from agent_evolve.domain.finite_variation import (
@@ -56,6 +64,7 @@ from agent_evolve.domain.outcome import FailureCategory, FailureCode, FailureRec
 from agent_evolve.domain.typed_json import (
     FrozenJsonObject,
     freeze_json,
+    thaw_json,
     typed_json_sha256,
 )
 from agent_evolve.infrastructure.ids import DeterministicIdFactory
@@ -440,6 +449,122 @@ def test_enumerates_all_pairs_and_evaluates_two_concurrent_unions() -> None:
     assert receipt.to_record()["pair_universe_size"] == 6
 
 
+def test_prepared_recombination_defers_and_limits_real_evaluation() -> None:
+    async def scenario():
+        values = await _source_wave("portfolio_recombination_prepared_subset")
+        ids, problem, generator, engine, selector, ancestor, source_wave, source = (
+            values
+        )
+        service = PortfolioRecombination(engine=engine, ids=ids)
+        prepared = service.prepare(
+            PortfolioRecombinationWaveRequest(
+                source_wave=source_wave,
+                source_result=source,
+                ancestor=ancestor,
+                generation=2,
+                label_prefix="prepared_portfolio_union",
+                path_family_exposures=_exposures(),
+            )
+        )
+        evaluations_before = problem.evaluations
+        evaluated = await service.evaluate_prepared_members(
+            prepared,
+            (prepared.target_candidate_ids[1],),
+        )
+        return problem, generator, selector, prepared, evaluations_before, evaluated
+
+    (
+        problem,
+        generator,
+        selector,
+        prepared,
+        evaluations_before,
+        evaluated,
+    ) = asyncio.run(scenario())
+    assert evaluations_before == 0
+    assert len(prepared.invocations) == 2
+    assert len(evaluated) == 1
+    assert problem.evaluations == 1
+    assert evaluated[0].invocation.candidate_id == prepared.target_candidate_ids[1]
+    assert evaluated[0].selection_role == "coverage"
+    assert generator.calls == 0
+    assert selector.calls == 1
+
+
+def test_recombination_residual_expert_proposes_before_selected_only_evaluation(
+) -> None:
+    async def scenario():
+        values = await _source_wave("recombination_residual_expert_subset")
+        ids, problem, generator, engine, selector, ancestor, source_wave, source = (
+            values
+        )
+        campaign_scope_sha256 = hashlib.sha256(
+            b"recombination-residual-expert-campaign"
+        ).hexdigest()
+        prior_state_sha256 = hashlib.sha256(
+            b"recombination-residual-expert-prior"
+        ).hexdigest()
+        expert = RecombinationResidualExpert(
+            recombination=PortfolioRecombination(engine=engine, ids=ids),
+            wave=PortfolioRecombinationWaveRequest(
+                source_wave=source_wave,
+                source_result=source,
+                ancestor=ancestor,
+                generation=2,
+                label_prefix="residual_portfolio_union",
+                path_family_exposures=_exposures(),
+            ),
+            campaign_scope_sha256=campaign_scope_sha256,
+            prior_state_sha256=prior_state_sha256,
+        )
+        request = ResidualPortfolioDecisionRequest(
+            campaign_scope_sha256=campaign_scope_sha256,
+            prior_state_sha256=prior_state_sha256,
+            decision_index=2,
+            phase=SearchPhase.BASIN_EXPANSION,
+            remaining_decisions=3,
+            remaining_evaluations=8,
+            evaluation_slots=1,
+            expert_proposal_slots=(
+                ("recombination", expert.available_proposal_count),
+            ),
+            proposal_context=_frozen({"common_cutoff": "fixture"}),
+            reference_escrow_slots=0,
+        )
+        proposal = await expert.propose(request)
+        evaluations_before = problem.evaluations
+        selected = (proposal.actions[1].action_sha256,)
+        evaluated = await expert.evaluate(proposal, selected)
+        return (
+            problem,
+            generator,
+            selector,
+            expert,
+            proposal,
+            evaluations_before,
+            evaluated,
+        )
+
+    (
+        problem,
+        generator,
+        selector,
+        expert,
+        proposal,
+        evaluations_before,
+        evaluated,
+    ) = asyncio.run(scenario())
+    assert expert.available_proposal_count == 2
+    assert len(proposal.actions) == 2
+    assert evaluations_before == 0
+    assert problem.evaluations == 1
+    assert len(evaluated.evaluations) == 1
+    assert evaluated.evaluations[0].action == proposal.actions[1]
+    assert thaw_json(evaluated.evidence)["broker_selected_subset_only"] is True
+    assert generator.calls == 0
+    assert selector.calls == 1
+
+
 def test_campaign_child_envelope_can_select_only_the_exploit_union() -> None:
     async def scenario():
         values = await _source_wave("portfolio_recombination_single_child")
@@ -551,6 +676,61 @@ def test_post_recombination_credit_separates_survival_and_descendant_yield() -> 
         assert credit.useful_descendant_observed is (
             True if candidate_id in selected else None
         )
+
+
+def test_post_stage_survival_preserves_feedback_without_descendant_attempt() -> None:
+    async def scenario():
+        values = await _source_wave("portfolio_recourse_only_contextual_credit")
+        return values[-2], values[-1]
+
+    source_wave, source = asyncio.run(scenario())
+    campaign_scope_sha256 = hashlib.sha256(
+        b"portfolio-recourse-only-contextual-campaign"
+    ).hexdigest()
+    observations = tuple(
+        sorted(
+            (
+                ContextualSearchObservation(
+                    campaign_scope_sha256=campaign_scope_sha256,
+                    wave_index=1,
+                    source_id="model",
+                    operator_id="atomic",
+                    option_identity_sha256=(
+                        member.materialization.option_identity_sha256
+                    ),
+                    parent_context_sha256=(
+                        source_wave.selection_request.context_sha256
+                    ),
+                    feasible=True,
+                    positive_marginal_utility=False,
+                    normalized_marginal_utility=0.0,
+                    marginal_utility_share=0.0,
+                    candidate_id=member.materialization.candidate_id,
+                )
+                for member in source.receipt.members
+            ),
+            key=lambda value: value.observation_sha256,
+        )
+    )
+    surviving_source = observations[0].candidate_id
+    assert surviving_source is not None
+    batch = observe_contextual_post_stage_survival(
+        campaign_scope_sha256=campaign_scope_sha256,
+        source_wave_index=1,
+        stage_request_sha256=hashlib.sha256(b"recourse-only-stage").hexdigest(),
+        observations=observations,
+        post_stage_front_candidate_ids=(surviving_source,),
+    )
+
+    observation_by_hash = {value.observation_sha256: value for value in observations}
+    assert batch.stage_surviving_source_candidate_ids == (surviving_source,)
+    assert len(batch.credits) == len(observations)
+    assert all(value.useful_descendant_observed is None for value in batch.credits)
+    assert sum(value.stage_front_persisted is True for value in batch.credits) == 1
+    assert {
+        observation_by_hash[value.source_observation_sha256].candidate_id
+        for value in batch.credits
+    } == {value.candidate_id for value in observations}
 
 
 def test_exact_archive_source_utility_selects_exploit_and_binds_complete_receipt() -> (
@@ -927,6 +1107,81 @@ def test_overlapping_pair_universe_yields_typed_provider_free_skip() -> None:
     assert result.receipt.no_pair.reason is (
         PortfolioRecombinationNoPairReason.NO_REPLAY_SAFE_DISJOINT_PAIR
     )
+
+
+def test_no_pair_recombination_publishes_unobserved_descendant_credit() -> None:
+    """A valid no-pair stage must not invent ancestry or abort learning.
+
+    Stage-front persistence is still observed for every source action, while
+    descendant yield stays explicitly unobserved because no source pair was
+    selected.  This is the typed zero-yield case exercised by full-configuration
+    expert proposals and overlapping composite actions in real campaigns.
+    """
+
+    async def scenario():
+        values = await _source_wave(
+            "recombination_no_pair_credit",
+            disjoint=False,
+        )
+        ids, _problem, _generator, engine, _selector, ancestor, source_wave, source = (
+            values
+        )
+        result = await PortfolioRecombination(engine=engine, ids=ids).run(
+            PortfolioRecombinationWaveRequest(
+                source_wave=source_wave,
+                source_result=source,
+                ancestor=ancestor,
+                generation=2,
+                label_prefix="contextual_no_pair_union",
+            )
+        )
+        return source_wave, source, result
+
+    source_wave, source, result = asyncio.run(scenario())
+    campaign_scope_sha256 = hashlib.sha256(
+        b"portfolio-recombination-no-pair-contextual-campaign"
+    ).hexdigest()
+    observations = tuple(
+        sorted(
+            (
+                ContextualSearchObservation(
+                    campaign_scope_sha256=campaign_scope_sha256,
+                    wave_index=1,
+                    source_id="model",
+                    operator_id="atomic",
+                    option_identity_sha256=(
+                        member.materialization.option_identity_sha256
+                    ),
+                    parent_context_sha256=(
+                        source_wave.selection_request.context_sha256
+                    ),
+                    feasible=True,
+                    positive_marginal_utility=False,
+                    normalized_marginal_utility=0.0,
+                    marginal_utility_share=0.0,
+                    candidate_id=member.materialization.candidate_id,
+                )
+                for member in source.receipt.members
+            ),
+            key=lambda value: value.observation_sha256,
+        )
+    )
+    surviving_source = observations[0].candidate_id
+    assert surviving_source is not None
+    batch = observe_contextual_post_recombination_credit(
+        campaign_scope_sha256=campaign_scope_sha256,
+        source_wave_index=1,
+        observations=observations,
+        results=(result,),
+        post_stage_front_candidate_ids=(surviving_source,),
+    )
+
+    assert batch.selected_source_candidate_ids == ()
+    assert batch.stage_surviving_source_candidate_ids == (surviving_source,)
+    assert batch.useful_descendant_candidate_ids == ()
+    assert len(batch.credits) == len(observations)
+    assert all(value.useful_descendant_observed is None for value in batch.credits)
+    assert sum(value.stage_front_persisted is True for value in batch.credits) == 1
 
 
 def test_candidate_infeasible_source_is_excluded_without_rank_resampling() -> None:

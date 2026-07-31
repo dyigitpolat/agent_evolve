@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from agent_evolve.settings import _DEFAULT_MODEL
+
 from agent_evolve import settings as settings_module
 from agent_evolve.settings import AgentEvolveSettings
 
@@ -117,7 +119,7 @@ def test_loader_never_walks_up_to_an_ancestor_dotenv(tmp_path):
     leaked = {k: v for k, v in out["env"].items() if v is not None}
     assert leaked == {}, f"loader reached outside its caller's scope: {leaked}"
     assert out["dotenv_source"] is None
-    assert out["model"] == "openai:gpt-4o", "model came from a .env nobody named"
+    assert out["model"] == _DEFAULT_MODEL, "model came from a .env nobody named"
 
 
 def test_loader_never_falls_back_to_the_working_directory(tmp_path):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from fractions import Fraction
 import hashlib
 import json
@@ -10,6 +11,13 @@ from pathlib import Path
 import pytest
 
 from agent_evolve.agentic import AgenticBenchmark
+from agent_evolve.application.contextual_search_controller import SearchPhase
+from agent_evolve.application.materialized_action_broker import (
+    MaterializedActionContext,
+    MaterializedActionDescriptor,
+)
+from agent_evolve.domain.ids import CandidateId
+from agent_evolve.domain.typed_json import freeze_json
 from examples.benchmarks.heat2d_constructive.agentic_benchmark import (
     benchmark as historical_scalar_benchmark,
 )
@@ -34,6 +42,11 @@ from examples.benchmarks.heat2d_constructive.problem_def import (
     Heat2DConstructiveProblem,
     Heat2DDirectV3Evaluation,
     Heat2DDirectV3Settings,
+)
+from examples.benchmarks.heat2d_constructive.residual_portfolio_adapter import (
+    Heat2DResidualPhenotypeProjection,
+    Heat2DSelectedMaterializedActionEvaluator,
+    heat2d_residual_phenotype_projection_definition_sha256,
 )
 
 
@@ -211,3 +224,96 @@ def test_candidate_identity_is_formulation_scoped_and_catalog_is_workload_local(
     )
     assert len(contract.options) >= 136
     assert "Pareto co-optimization" in pareto_problem.search_space_description()
+
+
+def test_residual_adapter_binds_resolution_and_evaluates_selected_action() -> None:
+    settings, direct, benchmark = _fixture()
+    problem = benchmark.problem
+    assert type(problem) is Heat2DMultiObjectiveV1Problem
+    projection = Heat2DResidualPhenotypeProjection(
+        resolution=settings.resolution
+    )
+    assert projection.definition_sha256 == (
+        heat2d_residual_phenotype_projection_definition_sha256(
+            settings.resolution
+        )
+    )
+    configuration = freeze_json(SEED_LAYOUT_A)
+    action = MaterializedActionDescriptor(
+        context=MaterializedActionContext(
+            campaign_scope_sha256="4" * 64,
+            decision_index=1,
+            phase=SearchPhase.COMPOSITION,
+            remaining_decisions=2,
+            remaining_evaluations=8,
+            residual_frontier_cell="frontier.reachable",
+            parent_position_cell="parent.frontier",
+            archive_relation_cell="archive.novel",
+            structural_signature_sha256="5" * 64,
+            patch_compatibility_cell="compatible",
+            forecast_calibration_cell="unseen",
+            source_distance_bin=1,
+            memory_dose_bin=0,
+        ),
+        configuration=configuration,
+        phenotype_identity_sha256=projection.project(configuration),
+        expert_id="local_residual",
+        native_rank=1,
+        parent_ids=(CandidateId("candidate_heat_parent"),),
+        operator_id="finite_residual.radius_1",
+        target_candidate_id=CandidateId("candidate_heat_target"),
+        role_id="local_exploit",
+        normalized_evaluation_cost=1.0,
+    )
+    observations: list[dict[str, object]] = []
+    evaluator = Heat2DSelectedMaterializedActionEvaluator(
+        problem=problem,
+        phenotype_projection=projection,
+        observation_sink=observations.append,
+        proposal_sequence_start=7,
+    )
+
+    evaluated = asyncio.run(evaluator.evaluate(action))
+
+    assert direct.evaluate_calls == 1
+    assert evaluator.evaluation_count == 1
+    assert evaluated.action is action
+    assert evaluated.candidate.candidate_id == CandidateId(
+        "candidate_heat_target"
+    )
+    assert evaluated.candidate.parent_ids == (
+        CandidateId("candidate_heat_parent"),
+    )
+    assert evaluated.candidate.occurrence.proposal_sequence == 8
+    assert tuple(name for name, _ in evaluated.candidate.objectives) == (
+        THERMAL_OBJECTIVE_NAME,
+        MATERIAL_OBJECTIVE_NAME,
+    )
+    assert evaluated.candidate.objective_resolution_receipt is not None
+    assert len(observations) == 1
+    assert observations[0][
+        "selected_only_authoritative_evaluation"
+    ] is True
+    # The sink is an external evidence boundary: every nested value must be
+    # directly encodable as strict JSON, including the selected configuration.
+    json.dumps(
+        observations[0],
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    with pytest.raises(ValueError, match="only once"):
+        asyncio.run(evaluator.evaluate(action))
+
+
+def test_residual_evaluator_rejects_projection_for_another_mesh() -> None:
+    settings, _, benchmark = _fixture()
+    assert type(benchmark.problem) is Heat2DMultiObjectiveV1Problem
+    with pytest.raises(ValueError, match="qualified phenotype projection"):
+        Heat2DSelectedMaterializedActionEvaluator(
+            problem=benchmark.problem,
+            phenotype_projection=Heat2DResidualPhenotypeProjection(
+                resolution=settings.resolution + 2
+            ),
+        )

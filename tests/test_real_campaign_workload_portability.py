@@ -716,9 +716,7 @@ def test_same_calibrated_k8_binding_and_prompt_crosses_three_real_workloads(
         ledger = PortfolioOutcomeFeedbackLedger()
         scope = ForecastCalibrationScope(
             model_profile_sha256=_sha("shared-portability-model-profile"),
-            prompt_definition_sha256=(
-                CALIBRATED_PORTFOLIO_PROMPT_DEFINITION_SHA256
-            ),
+            prompt_definition_sha256=(CALIBRATED_PORTFOLIO_PROMPT_DEFINITION_SHA256),
             selector_policy_definition_sha256=(
                 CALIBRATED_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256
             ),
@@ -749,9 +747,7 @@ def test_same_calibrated_k8_binding_and_prompt_crosses_three_real_workloads(
             scope=replace(
                 scope,
                 prompt_definition_sha256=(
-                    calibrated_portfolio_prompt_definition_sha256(
-                        projection_policy
-                    )
+                    calibrated_portfolio_prompt_definition_sha256(projection_policy)
                 ),
             ),
             objectives=slate_objectives,
@@ -785,8 +781,9 @@ def test_same_calibrated_k8_binding_and_prompt_crosses_three_real_workloads(
         assert projection.policy_configuration_sha256 == (
             projection_policy.configuration_sha256
         )
-        assert projection.included_metadata_keys == (
-            semantic_metadata_keys[config.workload_id]
+        assert (
+            projection.included_metadata_keys
+            == (semantic_metadata_keys[config.workload_id])
         )
         assert projected_binding.binding_sha256 != binding.binding_sha256
         projected_binding.require_request(request)

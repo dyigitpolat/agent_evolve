@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import itertools
+import random
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +13,7 @@ from agent_evolve.application.action_allocation import (
     GREEDY_RISK_DIVERSITY_ALLOCATOR_DEFINITION_SHA256,
     GREEDY_RISK_DIVERSITY_ALLOCATOR_ID,
     GREEDY_RISK_DIVERSITY_ALLOCATOR_VERSION,
+    FeasibleBeamRiskAdjustedDiversityAllocator,
     GreedyRiskAdjustedDiversityAllocator,
 )
 from agent_evolve.application.action_metric_projection import (
@@ -21,11 +26,23 @@ from agent_evolve.application.action_role_value import (
 from agent_evolve.application.archive_conditioned_action_target import (
     bind_archive_conditioned_affine_action_target,
 )
+from agent_evolve.application.contextual_action_allocation import (
+    contextual_action_arm_count_constraints,
+    contextual_allocation_realization,
+)
+from agent_evolve.application.global_wave_action_allocation import (
+    BarrierGlobalWaveActionAllocationCoordinator,
+    GlobalRoleBalancedWaveActionAllocationPolicy,
+    GlobalWaveActionAllocationLane,
+)
 from agent_evolve.application.insight_memory import (
     InsightEvidenceLineage,
     InsightLifecycleState,
     InsightMemoryEntry,
     InsightOrigin,
+)
+from agent_evolve.application.outcome_conditioned_portfolio_selection import (
+    _plain_global_allocation_audit,
 )
 from agent_evolve.application.portfolio_projection import (
     admit_portfolio_card_sources,
@@ -62,11 +79,21 @@ from agent_evolve.domain.ids import (
     OperatorInvocationId,
 )
 from agent_evolve.domain.insight import InsightRef
-from agent_evolve.domain.typed_json import FrozenJsonObject, freeze_json, typed_json_sha256
+from agent_evolve.domain.typed_json import (
+    FrozenJsonObject,
+    freeze_json,
+    typed_json_sha256,
+)
+from agent_evolve.policies.reward.affine_hypervolume import (
+    AffineHypervolume2DSpec,
+    AffineHypervolumeArchiveUtility,
+    AffineObjectiveAxis,
+)
 from agent_evolve.ports import action_forecast as action_forecast_port
 from agent_evolve.ports.action_allocation import (
     ActionAllocationRequest,
     DeterministicActionAllocator,
+    ExactActionArmCountConstraint,
     ForecastPortfolioUtilityBinding,
     ForecastPortfolioUtilityInput,
     ForecastQuantile,
@@ -95,14 +122,12 @@ from agent_evolve.ports.agentic_generator import (
     MetricEffectDirection,
     MetricEffectPrediction,
 )
+from agent_evolve.ports.contextual_search_allocation import (
+    ContextualPortfolioAllocationContract,
+)
 from agent_evolve.ports.portfolio_selection import (
     PortfolioExperimentalArm,
     PortfolioSelectionRequest,
-)
-from agent_evolve.policies.reward.affine_hypervolume import (
-    AffineHypervolume2DSpec,
-    AffineHypervolumeArchiveUtility,
-    AffineObjectiveAxis,
 )
 
 
@@ -151,6 +176,64 @@ def _contract(
                 families,
                 strict=True,
             )
+        ),
+    )
+
+
+def _mixed_arm_contract() -> FiniteVariationContract:
+    """Expose two generic source/operator arms without workload semantics."""
+
+    base = _contract()
+    metadata = (
+        (
+            ("evaluation_operator", "atomic"),
+            ("evaluation_source", "primary"),
+        ),
+        (
+            ("evaluation_operator", "atomic"),
+            ("evaluation_source", "primary"),
+        ),
+        (
+            ("evaluation_operator", "composite"),
+            ("evaluation_source", "restart"),
+        ),
+        (
+            ("evaluation_operator", "atomic"),
+            ("evaluation_source", "primary"),
+        ),
+    )
+    return replace(
+        base,
+        options=tuple(
+            replace(option, metadata=option_metadata)
+            for option, option_metadata in zip(base.options, metadata, strict=True)
+        ),
+    )
+
+
+def _structural_floor_contract() -> FiniteVariationContract:
+    parent = _frozen({"a": 0, "b": 0, "c": 0})
+    parent_sha256 = typed_json_sha256(parent)
+    children = (
+        ("action.a", {"a": 1, "b": 0, "c": 0}),
+        ("action.b", {"a": 2, "b": 0, "c": 0}),
+        ("action.c", {"a": 0, "b": 1, "c": 0}),
+        ("action.d", {"a": 0, "b": 1, "c": 1}),
+    )
+    return FiniteVariationContract(
+        catalog_id="structural_floor_fixture",
+        catalog_version=1,
+        catalog_definition_sha256=_sha("structural-floor-fixture-v1"),
+        parent_configuration=parent,
+        options=tuple(
+            FiniteVariationOption(
+                option_id=option_id,
+                parent_configuration_sha256=parent_sha256,
+                child_configuration=_frozen(child),
+                family="fixture",
+                description=f"Choose structural fixture {option_id}.",
+            )
+            for option_id, child in children
         ),
     )
 
@@ -268,9 +351,7 @@ def _entry(
         source_operator_invocation_ids=(
             OperatorInvocationId(f"operator_forecast_fixture_{index}"),
         ),
-        source_candidate_ids=(
-            CandidateId(f"candidate_forecast_fixture_{index}"),
-        ),
+        source_candidate_ids=(CandidateId(f"candidate_forecast_fixture_{index}"),),
         available_contrast_ids=(contrast_id,),
         cited_contrast_ids=(contrast_id,),
         finite_action_bindings=(binding,),
@@ -374,9 +455,7 @@ def _drafts(request: ActionForecastRequest) -> tuple[ActionForecastDraft, ...]:
     for option in request.finite_variation_contract.options:
         card = cards_by_option[option.option_id]
         binding = card.finite_action_evidence[0]
-        citation = (
-            ActionEvidenceCitation(card.card_key, binding.identity_sha256),
-        )
+        citation = (ActionEvidenceCitation(card.card_key, binding.identity_sha256),)
         p10, p50, p90 = _QUALITY_QUANTILES[option.option_id]
         drafts.append(
             ActionForecastDraft(
@@ -430,8 +509,14 @@ def test_all_option_resolution_binds_semantics_cards_actions_and_metrics() -> No
     assert all(value.probability_valid == 1.0 for value in batch.forecasts)
     assert len(batch.receipt_sha256) == 64
     first = batch.forecasts[0]
-    assert first.option_identity_sha256 == request.finite_variation_contract.options[0].identity_sha256
-    assert first.child_configuration_sha256 == request.finite_variation_contract.options[0].child_configuration_sha256
+    assert (
+        first.option_identity_sha256
+        == request.finite_variation_contract.options[0].identity_sha256
+    )
+    assert (
+        first.child_configuration_sha256
+        == request.finite_variation_contract.options[0].child_configuration_sha256
+    )
     assert first.metric_forecasts[1].p50_delta == 10.0
     assert first.metric_forecasts[1].citations[0].source_option_id == "action.a"
     assert request.to_record()["source_registry_sha256"] == (
@@ -488,7 +573,9 @@ def test_all_option_resolution_binds_semantics_cards_actions_and_metrics() -> No
         validate_resolved_action_forecasts(request, stripped_citations)
 
 
-def test_exact_metric_projection_overlays_only_authorized_cells_and_binds_receipts() -> None:
+def test_exact_metric_projection_overlays_only_authorized_cells_and_binds_receipts() -> (
+    None
+):
     request = _request()
     source = _resolved(request)
     projections = ExactActionMetricProjectionBatch(
@@ -504,9 +591,7 @@ def test_exact_metric_projection_overlays_only_authorized_cells_and_binds_receip
                 metric_id="objective:cost",
                 delta=float(index + 1),
             )
-            for index, option in enumerate(
-                request.finite_variation_contract.options
-            )
+            for index, option in enumerate(request.finite_variation_contract.options)
         ),
         projector_id="fixture_exact_cost",
         projector_version=1,
@@ -543,9 +628,7 @@ def test_exact_metric_projection_overlays_only_authorized_cells_and_binds_receip
         ) * 3
         assert exact.confidence == 1.0
         assert exact.citations == before_by_id["objective:cost"].citations
-        assert after_by_id["objective:quality"] == (
-            before_by_id["objective:quality"]
-        )
+        assert after_by_id["objective:quality"] == (before_by_id["objective:quality"])
 
     foreign = replace(projections, forecast_request_sha256="0" * 64)
     with pytest.raises(ValueError, match="foreign forecast request"):
@@ -571,8 +654,12 @@ def test_exact_metric_projection_overlays_only_authorized_cells_and_binds_receip
         )
 
 
-def _archive_conditioned_plan():
-    forecast_request = _request()
+def _archive_conditioned_plan(
+    *,
+    lane_id: str = "fixture_lane",
+    contract: FiniteVariationContract | None = None,
+):
+    forecast_request = _request(contract=contract)
     request = PortfolioSelectionRequest(
         call_id=LLMCallId("call_archive_target_selector_fixture"),
         operation="select_portfolio",
@@ -586,9 +673,7 @@ def _archive_conditioned_plan():
         max_output_tokens=2_048,
         temperature=0.0,
         source_registry=forecast_request.source_registry,
-        experimental_view_receipt=(
-            forecast_request.experimental_view_receipt
-        ),
+        experimental_view_receipt=(forecast_request.experimental_view_receipt),
     )
     utility = AffineHypervolumeArchiveUtility(
         AffineHypervolume2DSpec(
@@ -622,19 +707,21 @@ def _archive_conditioned_plan():
         archive_utility=archive_utility,
         affine_snapshot=snapshot,
         parent_objectives={"cost": 100.0, "quality": 10.0},
-        lane_id="fixture_lane",
+        lane_id=lane_id,
     )
     plan = build_target_conditioned_action_forecast_plan(
         selection_request=rebound,
         optimization_semantics=_semantics(),
-        call_id=LLMCallId("call_archive_conditioned_fixture"),
+        call_id=LLMCallId(f"call_archive_conditioned_{lane_id}"),
         evidence_mode=ActionForecastEvidenceMode.GROUNDED,
     )
 
     return plan, target
 
 
-def test_archive_conditioned_target_reorders_anchor_axes_into_canonical_metrics() -> None:
+def test_archive_conditioned_target_reorders_anchor_axes_into_canonical_metrics() -> (
+    None
+):
     plan, target = _archive_conditioned_plan()
 
     assert plan.campaign_target == target
@@ -705,9 +792,7 @@ def test_role_factorized_utility_assigns_two_exploits_bridge_and_probe() -> None
         ForecastQuantile.P90,
     ]
     assignments = next(
-        value.assignments
-        for value in audits
-        if value.quantile is ForecastQuantile.P50
+        value.assignments for value in audits if value.quantile is ForecastQuantile.P50
     )
     counts = {
         role: sum(value.role is role for value in assignments)
@@ -718,6 +803,328 @@ def test_role_factorized_utility_assigns_two_exploits_bridge_and_probe() -> None
         ActionAcquisitionRole.RESIDUAL_BRIDGE: 1,
         ActionAcquisitionRole.EPISTEMIC_PROBE: 1,
     }
+
+
+def test_role_factorized_utility_accepts_wave_budgeted_all_exploit_lane() -> None:
+    plan, _ = _archive_conditioned_plan()
+    batch = _resolved(plan.request)
+    result = allocate_target_conditioned_actions(
+        plan=plan,
+        forecasts=batch,
+        portfolio_size=4,
+        diversity_weight=0.0,
+        utility_mode="role_factorized",
+        role_slots=(4, 0, 0),
+    )
+    audits = audit_target_conditioned_role_allocation(
+        plan=plan,
+        forecasts=batch,
+        decision=result.decision,
+        role_slots=(4, 0, 0),
+    )
+    assignments = next(
+        value.assignments for value in audits if value.quantile is ForecastQuantile.P50
+    )
+    assert all(
+        value.role is ActionAcquisitionRole.RELIABLE_ARCHIVE_EXPLOIT
+        for value in assignments
+    )
+
+
+def test_role_audit_replays_required_options_exactly() -> None:
+    plan, _ = _archive_conditioned_plan()
+    batch = _resolved(plan.request)
+    result = allocate_target_conditioned_actions(
+        plan=plan,
+        forecasts=batch,
+        portfolio_size=4,
+        diversity_weight=0.0,
+        utility_mode="role_factorized",
+        required_option_ids=("action.a",),
+    )
+    audits = audit_target_conditioned_role_allocation(
+        plan=plan,
+        forecasts=batch,
+        decision=result.decision,
+        required_option_ids=("action.a",),
+    )
+    assert len(audits) == 3
+    with pytest.raises(ValueError, match="different request"):
+        audit_target_conditioned_role_allocation(
+            plan=plan,
+            forecasts=batch,
+            decision=result.decision,
+        )
+
+
+def _global_lane(
+    lane_id: str,
+    *,
+    contract: FiniteVariationContract | None = None,
+) -> GlobalWaveActionAllocationLane:
+    plan, _ = _archive_conditioned_plan(lane_id=lane_id, contract=contract)
+    request = PortfolioSelectionRequest(
+        call_id=LLMCallId(f"call_global_selector_{lane_id}"),
+        operation="select_portfolio",
+        instruction="Select a bounded portfolio from the sealed fixture actions.",
+        context=plan.request.context,
+        finite_variation_contract=plan.request.finite_variation_contract,
+        cards=plan.request.cards,
+        portfolio_size=4,
+        required_metric_ids=("objective:cost", "objective:quality"),
+        require_supporting_cards=True,
+        max_output_tokens=2_048,
+        temperature=0.0,
+        source_registry=plan.request.source_registry,
+        experimental_view_receipt=plan.request.experimental_view_receipt,
+    )
+    return GlobalWaveActionAllocationLane(
+        generation=2,
+        request=request,
+        plan=plan,
+        forecasts=_resolved(plan.request),
+        utility_mode="role_factorized",
+        target_kind="residual_frontier_cell",
+        memory_assignments=((),),
+        risk_aversion=0.5,
+        diversity_weight=0.05,
+        beam_width=64,
+    )
+
+
+def test_global_wave_allocator_uses_one_bridge_and_probe_across_two_lanes() -> None:
+    lanes = (_global_lane("fixture_lane_a"), _global_lane("fixture_lane_b"))
+    results = GlobalRoleBalancedWaveActionAllocationPolicy().allocate(lanes)
+
+    assert set(results) == {"fixture_lane_a", "fixture_lane_b"}
+    assert len({value.global_receipt_sha256 for value in results.values()}) == 1
+    # Frozen v7 policy reference receipt: exact trials precede all count
+    # projection while an exactly feasible request keeps the same selected
+    # lane-local decisions.
+    assert {
+        lane_id: (
+            value.global_receipt_sha256,
+            value.allocation.decision.receipt_sha256,
+        )
+        for lane_id, value in sorted(results.items())
+    } == {
+        "fixture_lane_a": (
+            "600f319e3d03e1e82858ad79bc0f1cc69e96b525b6cdd2a476d1907c83c4ef81",
+            "d1ccd9fed87d05d9491c091372d33c4e3fe4ca823af35f86e426e2134a87062e",
+        ),
+        "fixture_lane_b": (
+            "600f319e3d03e1e82858ad79bc0f1cc69e96b525b6cdd2a476d1907c83c4ef81",
+            "59b7ae28300bf680eab4b53190684848b7b76563e6a89a475a1fc8304cce9645",
+        ),
+    }
+    budgets = tuple(value.role_slots for value in results.values())
+    assert sum(value[0] for value in budgets if value is not None) == 6
+    assert sum(value[1] for value in budgets if value is not None) == 1
+    assert sum(value[2] for value in budgets if value is not None) == 1
+    # Four legal bridge/probe lane placements x two lane rotations x the
+    # redundancy-on/off counterfactual are all tested.  Hard feasibility, not
+    # a cheap role screen, decides which placement survives.
+    assert (
+        typed_json_domain.thaw_json(results["fixture_lane_a"].audit)["trial_count"]
+        == 16
+    )
+
+    # Supplemental selector audits are raw JSON trees at their construction
+    # boundary.  A wave audit is already frozen, so it must be thawed before it
+    # is nested and frozen again.  This is the exact allocator-to-selector seam
+    # exercised by live multi-lane campaigns.
+    nested = freeze_json(
+        {
+            "global_wave_allocation": _plain_global_allocation_audit(
+                results["fixture_lane_a"]
+            )
+        }
+    )
+    assert type(nested) is FrozenJsonObject
+
+
+def test_global_wave_projects_unrealizable_contextual_counts_to_nearest_slate() -> (
+    None
+):
+    lane_id = "fixture_lane_count_recourse"
+    lane = _global_lane(lane_id, contract=_mixed_arm_contract())
+    allocation = ContextualPortfolioAllocationContract(
+        campaign_scope_sha256=_sha("count-recourse-campaign"),
+        query_sha256=_sha("count-recourse-query"),
+        decision_sha256=_sha("count-recourse-decision"),
+        campaign_generation=lane.generation,
+        controller_wave_index=1,
+        phase_id="basin_acquisition",
+        slice_id=lane_id,
+        evaluation_slots=4,
+        # The materialized universe contains exactly three primary/atomic
+        # actions and one restart/composite action, so these desired marginals
+        # are impossible even though a full hard-feasible slate exists.
+        source_target_counts=(("primary", 4), ("restart", 0)),
+        operator_target_counts=(("atomic", 4), ("composite", 0)),
+    )
+
+    result = GlobalRoleBalancedWaveActionAllocationPolicy().allocate(
+        (replace(lane, contextual_allocation=allocation),)
+    )[lane_id]
+    audit = typed_json_domain.thaw_json(result.audit)
+
+    assert {value.option_id for value in result.allocation.decision.members} == {
+        "action.a",
+        "action.b",
+        "action.c",
+        "action.d",
+    }
+    assert audit["contextual_count_recourse_used"] is True
+    assert audit["contextual_source_l1_deviation"] == 2
+    assert audit["contextual_operator_l1_deviation"] == 2
+    assert audit["contextual_projection_count"] == 1
+
+
+def test_global_wave_barrier_releases_both_concurrent_lanes() -> None:
+    lanes = (_global_lane("fixture_lane_a"), _global_lane("fixture_lane_b"))
+    coordinator = BarrierGlobalWaveActionAllocationCoordinator(
+        policy=GlobalRoleBalancedWaveActionAllocationPolicy(),
+        expected_lane_count=2,
+    )
+
+    async def execute():
+        return await asyncio.gather(*(coordinator.allocate(value) for value in lanes))
+
+    results = asyncio.run(execute())
+    assert results[0].global_receipt_sha256 == results[1].global_receipt_sha256
+
+
+def test_global_wave_constraints_use_screened_forecast_contract() -> None:
+    """A retained source union must not leak into screened allocation."""
+
+    lane = _global_lane("fixture_lane_projected")
+    projected = lane.plan.request.finite_variation_contract
+    extra = FiniteVariationOption(
+        option_id="action.source_only",
+        parent_configuration_sha256=projected.parent_configuration_sha256,
+        child_configuration=_frozen({"x": 99}),
+        family="source_only",
+        description="Source-union action intentionally absent from forecasting.",
+    )
+    source = replace(projected, options=(*projected.options, extra))
+    source_receipt = bind_portfolio_experimental_view(
+        arm=PortfolioExperimentalArm.MEMORY,
+        cards=lane.request.cards,
+        finite_variation_contract=source,
+        source_registry=lane.request.source_registry,
+        policy_id="projected_global_source_view",
+        policy_version=1,
+        policy_definition_sha256=_sha("projected-global-source-view-v1"),
+    )
+    source_request = replace(
+        lane.request,
+        finite_variation_contract=source,
+        experimental_view_receipt=source_receipt,
+    )
+    allocation = ContextualPortfolioAllocationContract(
+        campaign_scope_sha256=_sha("projected-global-campaign"),
+        query_sha256=_sha("projected-global-query"),
+        decision_sha256=_sha("projected-global-decision"),
+        campaign_generation=2,
+        controller_wave_index=1,
+        phase_id="basin_acquisition",
+        slice_id="fixture_lane_projected",
+        evaluation_slots=4,
+        source_target_counts=(("primary", 4),),
+        operator_target_counts=(("atomic", 4),),
+    )
+    result = GlobalRoleBalancedWaveActionAllocationPolicy().allocate(
+        (replace(lane, request=source_request, contextual_allocation=allocation),)
+    )["fixture_lane_projected"]
+    audit = typed_json_domain.thaw_json(result.audit)
+
+    assert {value.option_id for value in result.allocation.decision.members} == {
+        "action.a",
+        "action.b",
+        "action.c",
+        "action.d",
+    }
+    assert audit["source_finite_contract_sha256s"]["fixture_lane_projected"] == (
+        source.identity_sha256
+    )
+    assert audit["allocation_finite_contract_sha256s"][
+        "fixture_lane_projected"
+    ] == projected.identity_sha256
+
+
+def test_global_wave_allocator_falls_back_after_primary_memory_infeasibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lanes = tuple(
+        replace(
+            _global_lane(lane_id),
+            memory_assignments=(
+                (("action.a", "card.01"),),
+                (("action.b", "card.01"),),
+            ),
+        )
+        for lane_id in ("fixture_lane_a", "fixture_lane_b")
+    )
+    original = GlobalRoleBalancedWaveActionAllocationPolicy._allocate_lane
+    original_recourse = (
+        GlobalRoleBalancedWaveActionAllocationPolicy._allocate_lane_with_count_recourse
+    )
+    recourse_calls = 0
+
+    def fail_first_assignment(
+        self,
+        lane,
+        *,
+        assignment,
+        role_slots,
+        eligible_option_ids,
+    ):
+        if any(option_id == "action.a" for option_id, _ in assignment):
+            raise ValueError("synthetic primary-memory infeasibility")
+        return original(
+            self,
+            lane,
+            assignment=assignment,
+            role_slots=role_slots,
+            eligible_option_ids=eligible_option_ids,
+        )
+
+    monkeypatch.setattr(
+        GlobalRoleBalancedWaveActionAllocationPolicy,
+        "_allocate_lane",
+        fail_first_assignment,
+    )
+
+    def count_recourse(*args, **kwargs):
+        nonlocal recourse_calls
+        recourse_calls += 1
+        return original_recourse(*args, **kwargs)
+
+    monkeypatch.setattr(
+        GlobalRoleBalancedWaveActionAllocationPolicy,
+        "_allocate_lane_with_count_recourse",
+        count_recourse,
+    )
+    results = GlobalRoleBalancedWaveActionAllocationPolicy(
+        memory_assignments_per_lane=2,
+        memory_combination_limit=1,
+    ).allocate(lanes)
+    audit = typed_json_domain.thaw_json(results["fixture_lane_a"].audit)
+
+    assert audit["fallback_memory_search_used"] is True
+    assert audit["memory_combination_count"] == 4
+    assert audit["primary_memory_combination_count"] == 1
+    assert audit["contextual_projection_eligible_trial_count"] > 0
+    assert audit["contextual_projection_trial_count"] == 0
+    assert recourse_calls == 0
+    assert all(
+        dict(assignment) == {"action.b": "card.01"}
+        for assignment in (
+            results["fixture_lane_a"].memory_assignment,
+            results["fixture_lane_b"].memory_assignment,
+        )
+    )
 
 
 def test_action_semantics_are_required_and_change_the_forecast_request_hash() -> None:
@@ -799,7 +1206,9 @@ def test_quantiles_validity_and_citations_fail_closed() -> None:
         replace(_drafts(request)[0], probability_valid=1.1)
     drafts = _drafts(request)
     foreign_citation = ActionEvidenceCitation("card.foreign", "a" * 64)
-    altered_metric = replace(drafts[0].metric_forecasts[0], citations=(foreign_citation,))
+    altered_metric = replace(
+        drafts[0].metric_forecasts[0], citations=(foreign_citation,)
+    )
     altered = replace(
         drafts[0],
         metric_forecasts=(altered_metric, drafts[0].metric_forecasts[1]),
@@ -917,9 +1326,13 @@ def test_request_requires_exact_registry_but_allows_source_to_target_analogy() -
     assert transfer_batch.forecasts[0].option_identity_sha256 == (
         target_contract.options[0].identity_sha256
     )
-    assert transfer_batch.forecasts[0].metric_forecasts[0].citations[
-        0
-    ].source_contract_identity_sha256 == source_contract.identity_sha256
+    assert (
+        transfer_batch.forecasts[0]
+        .metric_forecasts[0]
+        .citations[0]
+        .source_contract_identity_sha256
+        == source_contract.identity_sha256
+    )
 
 
 def test_evidence_mode_makes_catalog_only_no_memory_arm_representable() -> None:
@@ -971,14 +1384,11 @@ def test_grounded_forecast_can_cite_a_different_source_action_as_analogy() -> No
     drafts = _drafts(request)
     donor = request.cards[1]
     donor_binding = donor.finite_action_evidence[0]
-    citation = (
-        ActionEvidenceCitation(donor.card_key, donor_binding.identity_sha256),
-    )
+    citation = (ActionEvidenceCitation(donor.card_key, donor_binding.identity_sha256),)
     first = replace(
         drafts[0],
         metric_forecasts=tuple(
-            replace(metric, citations=citation)
-            for metric in drafts[0].metric_forecasts
+            replace(metric, citations=citation) for metric in drafts[0].metric_forecasts
         ),
     )
     batch = resolve_action_forecasts(
@@ -1022,6 +1432,263 @@ class _ZeroSetUtility(_SetUtility):
     def __call__(self, request: ForecastPortfolioUtilityInput) -> float:
         self.member_counts.append(len(request.members))
         return 0.0
+
+
+def _exhaustive_final_is_feasible(
+    selected: tuple[int, ...],
+    *,
+    options: tuple[SimpleNamespace, ...],
+    allowed_pairs: frozenset[frozenset[str]] | None,
+    required_indices: frozenset[int],
+    min_distinct_families: int | None,
+    single_path_indices: frozenset[int],
+    minimum_single_path_interventions: int,
+    disjoint_pairs: frozenset[frozenset[str]],
+    minimum_disjoint_parent_patch_pairs: int,
+    arm_constraints: tuple[tuple[dict[str, int], tuple[str, ...]], ...],
+) -> bool:
+    allocator = FeasibleBeamRiskAdjustedDiversityAllocator
+    if not allocator._pairs_allowed(selected, options, allowed_pairs):
+        return False
+    if not required_indices.issubset(selected):
+        return False
+    if (
+        min_distinct_families is not None
+        and len({options[index].family for index in selected})
+        < min_distinct_families
+    ):
+        return False
+    if (
+        sum(index in single_path_indices for index in selected)
+        < minimum_single_path_interventions
+    ):
+        return False
+    observed_disjoint_pairs = sum(
+        frozenset((options[left].option_id, options[right].option_id))
+        in disjoint_pairs
+        for left, right in itertools.combinations(selected, 2)
+    )
+    if observed_disjoint_pairs < minimum_disjoint_parent_patch_pairs:
+        return False
+    return all(
+        {
+            arm_id: sum(arm_by_index[index] == arm_id for index in selected)
+            for arm_id in target
+        }
+        == target
+        for target, arm_by_index in arm_constraints
+    )
+
+
+def test_feasible_beam_enforces_exact_generic_arm_marginals() -> None:
+    utility = _SetUtility()
+    base = _allocation_request(
+        eligible=("action.a", "action.b", "action.c", "action.d"),
+        portfolio_size=2,
+        utility=utility,
+    )
+    constraint = ExactActionArmCountConstraint(
+        constraint_id="source",
+        option_arm_ids=(
+            ("action.a", "local"),
+            ("action.b", "local"),
+            ("action.c", "task:restart"),
+            ("action.d", "task:restart"),
+        ),
+        target_counts=(("local", 1), ("task:restart", 1)),
+    )
+    request = replace(base, exact_arm_count_constraints=(constraint,))
+    result = FeasibleBeamRiskAdjustedDiversityAllocator(
+        beam_width=32,
+    ).allocate(request)
+    selected = tuple(value.option_id for value in result.decision.members)
+    arm_by_option = dict(constraint.option_arm_ids)
+    assert {
+        arm: sum(arm_by_option[value] == arm for value in selected)
+        for arm in ("local", "task:restart")
+    } == {
+        "local": 1,
+        "task:restart": 1,
+    }
+    validate_action_portfolio_decision(request, result.decision)
+    with pytest.raises(ValueError, match="does not implement exact arm-count"):
+        GreedyRiskAdjustedDiversityAllocator().allocate(request)
+
+
+def test_feasible_beam_enforces_contextual_structural_floors_during_search() -> None:
+    utility = _SetUtility()
+    base = _allocation_request(
+        eligible=("action.a", "action.b", "action.c", "action.d"),
+        portfolio_size=2,
+        utility=utility,
+        contract=_structural_floor_contract(),
+    )
+    unconstrained = FeasibleBeamRiskAdjustedDiversityAllocator(
+        risk_aversion=0.0,
+        beam_width=32,
+    ).allocate(base)
+    assert tuple(
+        value.option_id for value in unconstrained.decision.members
+    ) == ("action.a", "action.b")
+
+    request = replace(
+        base,
+        minimum_single_path_interventions=2,
+        minimum_disjoint_parent_patch_pairs=1,
+    )
+    result = FeasibleBeamRiskAdjustedDiversityAllocator(
+        risk_aversion=0.0,
+        beam_width=32,
+    ).allocate(request)
+    assert {value.option_id for value in result.decision.members} == {
+        "action.a",
+        "action.c",
+    }
+    validate_action_portfolio_decision(request, result.decision)
+    with pytest.raises(ValueError, match="different request"):
+        validate_action_portfolio_decision(base, result.decision)
+    with pytest.raises(ValueError, match="minimum structural floors"):
+        GreedyRiskAdjustedDiversityAllocator().allocate(request)
+
+
+def test_feasibility_oracle_matches_exhaustive_random_panels() -> None:
+    rng = random.Random(20260724)
+    allocator = FeasibleBeamRiskAdjustedDiversityAllocator
+
+    for _ in range(96):
+        option_count = rng.randint(4, 9)
+        portfolio_size = rng.randint(1, min(4, option_count))
+        options = tuple(
+            SimpleNamespace(
+                option_id=f"option.{index:02d}",
+                family=f"family.{rng.randrange(3)}",
+            )
+            for index in range(option_count)
+        )
+        all_pairs = tuple(
+            frozenset((options[left].option_id, options[right].option_id))
+            for left, right in itertools.combinations(range(option_count), 2)
+        )
+        allowed_pairs = (
+            None
+            if rng.random() < 0.5
+            else frozenset(pair for pair in all_pairs if rng.random() < 0.65)
+        )
+        disjoint_pairs = frozenset(
+            pair for pair in all_pairs if rng.random() < 0.45
+        )
+        single_path_indices = frozenset(
+            index for index in range(option_count) if rng.random() < 0.55
+        )
+        minimum_single_path_interventions = rng.randrange(portfolio_size + 1)
+        minimum_disjoint_parent_patch_pairs = rng.randrange(
+            portfolio_size * (portfolio_size - 1) // 2 + 1
+        )
+        required_indices = frozenset(
+            rng.sample(
+                range(option_count),
+                rng.randrange(min(option_count, portfolio_size + 1) + 1),
+            )
+        )
+        min_distinct_families = (
+            None
+            if rng.random() < 0.35
+            else rng.randint(1, portfolio_size)
+        )
+        arm_constraints = []
+        for axis_index in range(rng.randrange(3)):
+            arm_ids = tuple(f"axis.{axis_index}.arm.{index}" for index in range(3))
+            arm_by_index = tuple(rng.choice(arm_ids) for _ in range(option_count))
+            target_draws = tuple(
+                rng.choice(arm_ids) for _ in range(portfolio_size)
+            )
+            target = {
+                arm_id: target_draws.count(arm_id) for arm_id in arm_ids
+            }
+            arm_constraints.append((target, arm_by_index))
+        frozen_arm_constraints = tuple(arm_constraints)
+
+        for partial_size in range(portfolio_size + 1):
+            for partial in itertools.combinations(range(option_count), partial_size):
+                remaining = range(partial[-1] + 1, option_count) if partial else (
+                    range(option_count)
+                )
+                expected = any(
+                    _exhaustive_final_is_feasible(
+                        (*partial, *completion),
+                        options=options,
+                        allowed_pairs=allowed_pairs,
+                        required_indices=required_indices,
+                        min_distinct_families=min_distinct_families,
+                        single_path_indices=single_path_indices,
+                        minimum_single_path_interventions=(
+                            minimum_single_path_interventions
+                        ),
+                        disjoint_pairs=disjoint_pairs,
+                        minimum_disjoint_parent_patch_pairs=(
+                            minimum_disjoint_parent_patch_pairs
+                        ),
+                        arm_constraints=frozen_arm_constraints,
+                    )
+                    for completion in itertools.combinations(
+                        remaining,
+                        portfolio_size - partial_size,
+                    )
+                )
+                observed = allocator._has_completion(
+                    partial=partial,
+                    options=options,
+                    portfolio_size=portfolio_size,
+                    min_distinct_families=min_distinct_families,
+                    allowed_pairs=allowed_pairs,
+                    disjoint_pairs=disjoint_pairs,
+                    single_path_indices=single_path_indices,
+                    minimum_single_path_interventions=(
+                        minimum_single_path_interventions
+                    ),
+                    minimum_disjoint_parent_patch_pairs=(
+                        minimum_disjoint_parent_patch_pairs
+                    ),
+                    required_indices=required_indices,
+                    arm_constraints=frozen_arm_constraints,
+                )
+                assert observed is expected
+
+
+def test_contextual_contract_lowers_and_realizes_without_workload_branches() -> None:
+    contract = _contract()
+    allocation = ContextualPortfolioAllocationContract(
+        campaign_scope_sha256=_sha("contextual-campaign"),
+        query_sha256=_sha("contextual-query"),
+        decision_sha256=_sha("contextual-decision"),
+        campaign_generation=1,
+        controller_wave_index=1,
+        phase_id="basin_acquisition",
+        slice_id="elite",
+        evaluation_slots=4,
+        source_target_counts=(("primary", 4),),
+        operator_target_counts=(("atomic", 4), ("composite", 0)),
+    )
+    constraints = contextual_action_arm_count_constraints(
+        finite_contract=contract,
+        allocation=allocation,
+        portfolio_size=4,
+    )
+    assert tuple(value.constraint_id for value in constraints) == (
+        "operator",
+        "source",
+    )
+    realization = contextual_allocation_realization(
+        finite_contract=contract,
+        allocation=allocation,
+        selected_option_ids=("action.a", "action.b", "action.c", "action.d"),
+    )
+    assert realization is not None
+    assert realization.exact is True
+    assert realization.realized_operator_target_counts == (
+        ("atomic", 4),
+        ("composite", 0),
+    )
 
 
 def _allocation_request(
@@ -1148,8 +1815,7 @@ def test_diversity_reward_uses_constant_attainable_final_denominator(
     ).allocate(request)
 
     rewards = tuple(
-        member.greedy_step_score.diversity_reward
-        for member in result.decision.members
+        member.greedy_step_score.diversity_reward for member in result.decision.members
     )
     marginals = tuple(
         member.marginal_total_utility for member in result.decision.members
@@ -1160,8 +1826,9 @@ def test_diversity_reward_uses_constant_attainable_final_denominator(
     assert all(value >= 0.0 for value in marginals)
 
 
-def test_third_member_cannot_lose_diversity_reward_when_two_families_are_attainable(
-) -> None:
+def test_third_member_cannot_lose_diversity_reward_when_two_families_are_attainable() -> (
+    None
+):
     request = _allocation_request(
         eligible=("action.a", "action.b", "action.c"),
         portfolio_size=3,
@@ -1176,8 +1843,7 @@ def test_third_member_cannot_lose_diversity_reward_when_two_families_are_attaina
     assert len({first.family, second.family}) == 2
     assert third.family in {first.family, second.family}
     assert [
-        member.greedy_step_score.diversity_reward
-        for member in result.decision.members
+        member.greedy_step_score.diversity_reward for member in result.decision.members
     ] == pytest.approx([4.5, 9.0, 9.0])
     assert third.marginal_total_utility == pytest.approx(0.0)
 
@@ -1188,9 +1854,7 @@ def test_diversity_ties_use_canonical_option_identity_deterministically() -> Non
         portfolio_size=3,
         utility=_ZeroSetUtility(),
     )
-    forecasts = {
-        value.option_id: value for value in request.forecasts.forecasts
-    }
+    forecasts = {value.option_id: value for value in request.forecasts.forecasts}
     canonical = sorted(
         (forecasts[option_id] for option_id in request.eligible_option_ids),
         key=lambda value: (value.option_identity_sha256, value.option_id),
@@ -1202,9 +1866,7 @@ def test_diversity_ties_use_canonical_option_identity_deterministically() -> Non
         remaining = [
             value for value in canonical if value.option_id not in selected_ids
         ]
-        novel = [
-            value for value in remaining if value.family not in selected_families
-        ]
+        novel = [value for value in remaining if value.family not in selected_families]
         expected.append((novel or remaining)[0])
 
     allocator = GreedyRiskAdjustedDiversityAllocator(
@@ -1290,9 +1952,7 @@ def test_allocator_rejects_unidentified_or_nonfinite_utility() -> None:
 
 
 def test_public_facades_export_forecast_and_allocation_contracts() -> None:
-    import agent_evolve.agentic as agentic
-    import agent_evolve.application as application
-    import agent_evolve.ports as ports
+    from agent_evolve import agentic, application, ports
 
     assert agentic.ActionForecastRequest is ActionForecastRequest
     assert agentic.ActionAllocationRequest is ActionAllocationRequest

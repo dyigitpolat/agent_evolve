@@ -127,6 +127,10 @@ def test_closed_loop_campaign_facade_is_provider_and_workload_neutral() -> None:
             TransactionalPortfolioGenerationAuditor
         ),
     }
-    assert set(expected).issubset(public_api.__all__)
+    # ``__all__`` is the small supported surface now; these research symbols
+    # resolve lazily instead. Reachability is the invariant that matters --
+    # the measured stack must keep importing exactly what it always did.
+    reachable = set(public_api.__all__) | set(public_api._LEGACY_EXPORTS)
+    assert set(expected).issubset(reachable)
     for name, value in expected.items():
         assert getattr(public_api, name) is value

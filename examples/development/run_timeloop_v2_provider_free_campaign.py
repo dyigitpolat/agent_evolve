@@ -101,6 +101,9 @@ from agent_evolve.application.campaign_contextual_outcomes import (  # noqa: E40
 from agent_evolve.application.campaign_variation_trace import (  # noqa: E402
     summarize_campaign_variation_trace,
 )
+from agent_evolve.application.campaign_variation_envelope import (  # noqa: E402
+    CampaignVariationEnvelopePolicy,
+)
 from agent_evolve.application.evolution_campaign import (  # noqa: E402
     ArchiveUtilitySnapshot,
     CampaignAgentRuntimeReceipt,
@@ -132,6 +135,7 @@ from agent_evolve.application.portfolio_campaign_runtime import (  # noqa: E402
     CampaignPortfolioMemoryEstimandProjection,
     CampaignPortfolioWaveContext,
     CommittedRegistryIdentifiableReflectionEvidenceSource,
+    RecombinationEvaluationAllocationMode,
 )
 from agent_evolve.application.portfolio_evolution import (  # noqa: E402
     PortfolioVariationWaveRequest,
@@ -179,10 +183,28 @@ from agent_evolve.integrations.pydantic_ai.model_execution_profile import (  # n
     DEEPSEEK_V4_PRO_STREAMLAKE_XHIGH_NATIVE_JSON,
     OpenRouterModelExecutionProfile,
 )
+from agent_evolve.integrations.pydantic_ai.provider_free_calibrated_runner import (  # noqa: E402
+    ProviderFreeCalibratedPortfolioRunner,
+)
 from agent_evolve.campaign_profiles import CampaignExperimentProfile  # noqa: E402
+from agent_evolve.campaign_presets import (  # noqa: E402
+    SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES,
+    PortfolioScaleShape,
+)
 from agent_evolve.campaign_variation_topology import (  # noqa: E402
     CampaignVariationTopology,
     CampaignVariationTopologyMode,
+)
+from agent_evolve.policies.variation.multiscale_restart_catalog import (  # noqa: E402
+    GenericMultiscaleRestartFiniteVariationCatalog,
+)
+from agent_evolve.policies.variation.source_union_finite_catalog import (  # noqa: E402
+    SourceExposureFiniteVariationCatalog,
+    SourceUnionFiniteVariationCatalog,
+)
+from agent_evolve.ports.variation_source import (  # noqa: E402
+    PRIMARY_VARIATION_SOURCE_ID,
+    finite_variation_operator_id,
 )
 from agent_evolve.reference_method import (  # noqa: E402
     ReferenceCampaignImplementations,
@@ -194,6 +216,8 @@ from agent_evolve.reference_method import (  # noqa: E402
 from agent_evolve.integrations.pydantic_ai.calibrated_portfolio_selection import (  # noqa: E402
     CalibratedPortfolioAllocator,
     CalibratedPortfolioFeasibilityWitnessMode,
+    PydanticAIAcquisitionCertifiedResidualPortfolioSelectionPolicy,
+    PydanticAIRegretBoundedInformationPortfolioSelectionPolicy,
     PydanticAIContextualSearchAllocationPortfolioSelectionPolicy,
     PydanticAITargetConditionedCalibratedPortfolioSelectionPolicy,
     calibrated_portfolio_prompt_definition_sha256,
@@ -224,7 +248,7 @@ from agent_evolve.policies.reward.affine_hypervolume_3d import (  # noqa: E402
     AffineHypervolumeArchiveUtility3D,
 )
 from agent_evolve.policies.reward.contextual_marginal_utility import (  # noqa: E402
-    FixedReferenceContextualMarginalUtilityProjector,
+    ExactCoalitionShapleyContextualUtilityProjector,
 )
 from agent_evolve.policies.memory.global_falsification import (  # noqa: E402
     HypothesisAuditScope,
@@ -269,7 +293,7 @@ from agent_evolve.ports.structured_generator import (  # noqa: E402
     StructuredGenerationResponse,
 )
 from agent_evolve.ports.portfolio_selection import (  # noqa: E402
-    pairwise_disjoint_parent_patch_witness,
+    pairwise_disjoint_parent_patch_pairs,
 )
 from examples.benchmarks.timeloop_codesign.v2.campaign_reflection import (  # noqa: E402
     OBJECTIVE_IDS,
@@ -299,17 +323,17 @@ from examples.benchmarks.timeloop_codesign.v2.finite_variation_catalog import ( 
 from examples.benchmarks.timeloop_codesign.v2.frozen_panels import (  # noqa: E402
     frozen_network_panel,
 )
+from examples.benchmarks.timeloop_codesign.v2.hard_feasibility import (  # noqa: E402
+    TimeloopV2HardFeasibility,
+)
 from examples.benchmarks.timeloop_codesign.v2.problem_def import (  # noqa: E402
     TimeloopV2CoDesignProblem,
 )
 
 
 OUTER_SEED = 20260717
-GENERATION_COUNT = 6
 PARENTS_PER_PORTFOLIO = 2
 CALIBRATED_PROPOSAL_WIDTH = 8
-RECOMBINATIONS_PER_PARENT = 2
-PLANNED_LOGICAL_CALLS = 7
 MAX_OUTPUT_TOKENS = 384_000
 TEMPERATURE = 0.0
 FEASIBILITY_WITNESS_MODE = CalibratedPortfolioFeasibilityWitnessMode(
@@ -323,8 +347,7 @@ MEMORY_AGGREGATION_DEFINITION_SHA256 = hashlib.sha256(
     b"agent-evolve:affine-archive-joint-wave-gain:v1"
 ).hexdigest()
 _TARGET_CONDITIONED_FREEZE_PATH = (
-    AGENT_EVOLVE_ROOT.parent
-    / "papers/agent_evolve_aaai_2027/research_artifacts/data/"
+    AGENT_EVOLVE_ROOT.parent / "papers/agent_evolve_aaai_2027/research_artifacts/data/"
     "trap_portable_profile_v1.json"
 )
 
@@ -339,6 +362,42 @@ def _common_pool_enabled() -> bool:
     return FEASIBILITY_WITNESS_MODE is (
         CalibratedPortfolioFeasibilityWitnessMode.TASK_KEYED_COMMON_POOL
     )
+
+
+_SCALE_SHAPE_ID = os.environ.get(
+    "AGENT_EVOLVE_SCALE_SHAPE",
+    os.environ.get("AGENT_EVOLVE_B38_SCALE_SHAPE", "g6_k4_r2"),
+).strip()
+if _common_pool_enabled():
+    try:
+        CAMPAIGN_SCALE_SHAPE = SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES[
+            _SCALE_SHAPE_ID
+        ]
+    except KeyError as error:
+        raise ValueError(
+            "AGENT_EVOLVE_SCALE_SHAPE must name a registered small-budget "
+            "shape: " + ", ".join(SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES)
+        ) from error
+else:
+    if _SCALE_SHAPE_ID != "g6_k4_r2":
+        raise ValueError(
+            "AGENT_EVOLVE_SCALE_SHAPE requires task_keyed_common_pool"
+        )
+    CAMPAIGN_SCALE_SHAPE = PortfolioScaleShape("g6_k8_r2", 6, 2, 8, 2)
+GENERATION_COUNT = CAMPAIGN_SCALE_SHAPE.generation_count
+PORTFOLIO_WIDTH = CAMPAIGN_SCALE_SHAPE.portfolio_width
+RECOMBINATIONS_PER_PARENT = CAMPAIGN_SCALE_SHAPE.recombinations_per_parent
+PORTFOLIO_GENERATIONS = tuple(range(1, GENERATION_COUNT + 1, 2))
+RECOMBINATION_GENERATIONS = tuple(range(2, GENERATION_COUNT + 1, 2))
+PLANNED_REFLECTION_SOURCE_GENERATIONS = tuple(
+    generation
+    for generation in RECOMBINATION_GENERATIONS
+    if generation + 3 <= GENERATION_COUNT
+)
+PLANNED_LOGICAL_CALLS = (
+    2 * len(PORTFOLIO_GENERATIONS)
+    + len(PLANNED_REFLECTION_SOURCE_GENERATIONS)
+)
 
 
 ACQUISITION_MODE = CampaignAcquisitionMode(
@@ -364,9 +423,7 @@ RESIDUAL_FRONTIER_PLANNING = campaign_residual_frontier_planning_from_environmen
     os.environ
 )
 if RESIDUAL_FRONTIER_PLANNING and not CONTEXTUAL_SEARCH_ALLOCATION:
-    raise ValueError(
-        "residual frontier planning requires contextual search allocation"
-    )
+    raise ValueError("residual frontier planning requires contextual search allocation")
 if CONTEXTUAL_SEARCH_ALLOCATION and not EVIDENCE_CALIBRATED_SOURCE_MIX:
     raise ValueError(
         "contextual search allocation requires evidence-calibrated source mix"
@@ -377,9 +434,17 @@ if MINIMUM_INTERVENTION_PROJECTION and not CONSTRAINT_DECOUPLED_ACQUISITION:
     raise ValueError("minimum-intervention projection requires constraint decoupling")
 if (
     CONSTRAINT_DECOUPLED_ACQUISITION
-    and ACQUISITION_MODE is not CampaignAcquisitionMode.HORIZON_BOUNDED
+    and ACQUISITION_MODE
+    not in {
+        CampaignAcquisitionMode.HORIZON_BOUNDED,
+        CampaignAcquisitionMode.ACQUISITION_CERTIFIED,
+        CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION,
+    }
 ):
-    raise ValueError("constraint-decoupled acquisition requires horizon_bounded mode")
+    raise ValueError(
+        "constraint-decoupled acquisition requires horizon_bounded or "
+        "acquisition_certified or regret_bounded_information mode"
+    )
 
 
 def _proposal_support_policy():
@@ -407,7 +472,6 @@ def _candidate_pool_size_from_environment(default: int) -> int | None:
     return value
 
 
-PORTFOLIO_WIDTH = 4 if _common_pool_enabled() else 8
 COMMON_CANDIDATE_POOL_SIZE = _candidate_pool_size_from_environment(8)
 VARIATION_TOPOLOGY = CampaignVariationTopology.from_environment(os.environ)
 if (
@@ -416,6 +480,8 @@ if (
         CampaignAcquisitionMode.OPERATOR_STRATIFIED,
         CampaignAcquisitionMode.HORIZON_BOUNDED,
         CampaignAcquisitionMode.TARGET_CONDITIONED,
+        CampaignAcquisitionMode.ACQUISITION_CERTIFIED,
+        CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION,
     }
     and VARIATION_TOPOLOGY.mode is not CampaignVariationTopologyMode.HIERARCHICAL_R2
 ):
@@ -426,7 +492,11 @@ if (
 ):
     raise ValueError("operator assay minimum exceeds hierarchical proposal minimum")
 PLANNED_CANDIDATE_OCCURRENCES = 2 + PARENTS_PER_PORTFOLIO * (
-    3 * PORTFOLIO_WIDTH + 3 * RECOMBINATIONS_PER_PARENT
+    len(PORTFOLIO_GENERATIONS) * PORTFOLIO_WIDTH
+    + len(RECOMBINATION_GENERATIONS) * RECOMBINATIONS_PER_PARENT
+)
+MANDATORY_CANDIDATE_OCCURRENCES = 2 + PARENTS_PER_PORTFOLIO * (
+    len(PORTFOLIO_GENERATIONS) * PORTFOLIO_WIDTH
 )
 _CAMPAIGN_SHA256 = hashlib.sha256(
     b"agent-evolve:timeloop-v2-provider-free-g6-delayed-identifiable:v1"
@@ -575,9 +645,151 @@ class _NeverGenerator:
 def _option_locus(option: object) -> str:
     metadata = dict(option.metadata)
     locus = metadata.get("locus")
-    if type(locus) is not str or not locus:
-        raise RuntimeError("Timeloop option omitted its exact locus")
-    return locus
+    if type(locus) is str and locus:
+        return locus
+    if finite_variation_operator_id(option) == "global":
+        # A full-configuration expert action is independently evaluable and
+        # therefore does not share a mutable parent-relative locus with any
+        # local action.  Give the provider-free transport double an opaque,
+        # option-unique structural key; production selection still reasons
+        # over the authenticated finite option itself.
+        return f"independent_global:{option.option_id}"
+    raise RuntimeError("Timeloop local option omitted its exact locus")
+
+
+def _family_bounded_evaluation_witness(
+    contract: object,
+    option_ids: tuple[str, ...],
+    *,
+    portfolio_size: int,
+    min_distinct_families: int | None,
+    family_exposure_bounds: tuple[tuple[str, int, int], ...],
+    required_option_ids: tuple[str, ...] = (),
+    embedding_required_option_ids: tuple[str, ...] = (),
+    embedding_composite_option_ids: tuple[str, ...] = (),
+    embedding_composite_capacity: int | None = None,
+    embedding_total_capacity: int | None = None,
+    require_pairwise_disjoint_parent_patches: bool = False,
+) -> tuple[str, ...] | None:
+    """Find a deterministic structural witness without patch-disjointness.
+
+    Full-configuration proposal experts are independently evaluable, so their
+    patches may overlap every parent-relative edit.  The production request
+    still retains family/source/operator constraints; this local construction
+    double only drops the inapplicable mating constraint.
+    """
+
+    contract.__post_init__()
+    option_by_id = {option.option_id: option for option in contract.options}
+    if not set(option_ids).issubset(option_by_id):
+        raise ValueError("evaluation option escapes the finite contract")
+    options = tuple(option_by_id[option_id] for option_id in option_ids)
+    required = set(required_option_ids)
+    if not required.issubset(option_ids):
+        raise ValueError("required evaluation option escapes the eligible universe")
+    embedding_required = set(embedding_required_option_ids)
+    embedding_composites = set(embedding_composite_option_ids)
+    if not embedding_required.issubset(option_ids):
+        raise ValueError("embedding requirement escapes the eligible universe")
+    if not embedding_composites.issubset(option_ids):
+        raise ValueError("embedding partition escapes the eligible universe")
+    if (embedding_composite_capacity is None) != (
+        embedding_total_capacity is None
+    ):
+        raise ValueError("embedding capacities must be jointly configured")
+    if embedding_composite_capacity is not None:
+        assert embedding_total_capacity is not None
+        if (
+            type(embedding_composite_capacity) is not int
+            or type(embedding_total_capacity) is not int
+            or not 0 <= embedding_composite_capacity <= embedding_total_capacity
+        ):
+            raise ValueError("embedding capacities are invalid")
+    if type(require_pairwise_disjoint_parent_patches) is not bool:
+        raise TypeError("pairwise-disjoint requirement must be exact bool")
+    required_options = tuple(
+        option for option in options if option.option_id in required
+    )
+    if len(required_options) > portfolio_size:
+        return None
+    bounds = {family: (minimum, maximum) for family, minimum, maximum in family_exposure_bounds}
+    allowed_pairs = (
+        None
+        if not require_pairwise_disjoint_parent_patches
+        else {
+            frozenset(pair)
+            for pair in pairwise_disjoint_parent_patch_pairs(contract, option_ids)
+        }
+    )
+
+    def embeddable(chosen: tuple[object, ...]) -> bool:
+        if embedding_composite_capacity is None:
+            return True
+        assert embedding_total_capacity is not None
+        member_ids = embedding_required | {
+            option.option_id for option in chosen
+        }
+        composite_count = len(member_ids.intersection(embedding_composites))
+        atomic_count = len(member_ids) - composite_count
+        return (
+            composite_count <= embedding_composite_capacity
+            and atomic_count
+            <= embedding_total_capacity - embedding_composite_capacity
+        )
+
+    def valid_prefix(chosen: tuple[object, ...], remaining: tuple[object, ...]) -> bool:
+        if not embeddable(chosen):
+            return False
+        if allowed_pairs is not None and any(
+            frozenset((left.option_id, right.option_id)) not in allowed_pairs
+            for index, left in enumerate(chosen)
+            for right in chosen[index + 1 :]
+        ):
+            return False
+        needed = portfolio_size - len(chosen)
+        for family, (minimum, maximum) in bounds.items():
+            count = sum(option.family == family for option in chosen)
+            if count > maximum:
+                return False
+            available = sum(option.family == family for option in remaining)
+            if count + min(needed, available) < minimum:
+                return False
+        if min_distinct_families is not None:
+            present = {option.family for option in chosen}
+            available = {option.family for option in remaining} - present
+            if len(present) + min(needed, len(available)) < min_distinct_families:
+                return False
+        return True
+
+    def search(
+        remaining: tuple[object, ...],
+        chosen: tuple[object, ...],
+    ) -> tuple[str, ...] | None:
+        if not valid_prefix(chosen, remaining):
+            return None
+        if len(chosen) == portfolio_size:
+            if min_distinct_families is not None and len(
+                {option.family for option in chosen}
+            ) < min_distinct_families:
+                return None
+            if any(
+                not minimum
+                <= sum(option.family == family for option in chosen)
+                <= maximum
+                for family, (minimum, maximum) in bounds.items()
+            ):
+                return None
+            return tuple(option.option_id for option in chosen)
+        if len(remaining) < portfolio_size - len(chosen):
+            return None
+        for index, option in enumerate(remaining):
+            witness = search(remaining[index + 1 :], (*chosen, option))
+            if witness is not None:
+                return witness
+        return None
+
+    remaining = tuple(option for option in options if option.option_id not in required)
+    return search(remaining, required_options)
 
 
 class _ProviderFreeCalibratedRunner:
@@ -591,8 +803,10 @@ class _ProviderFreeCalibratedRunner:
     def _proposal_options(output_type: type) -> tuple[object, ...]:
         contract = output_type.finite_variation_contract
         common_pool = output_type.ordered_common_pool_option_ids
+        contract.__post_init__()
+        option_by_id = {option.option_id: option for option in contract.options}
         eligible_options = (
-            tuple(contract.resolve(option_id) for option_id in common_pool)
+            tuple(option_by_id[option_id] for option_id in common_pool)
             if common_pool is not None
             else contract.options
         )
@@ -628,7 +842,9 @@ class _ProviderFreeCalibratedRunner:
                     "Timeloop common pool omitted its required memory-dose action"
                 )
             return (supported,) + tuple(
-                option for option in eligible_options if option != supported
+                option
+                for option in eligible_options
+                if option.option_id != supported.option_id
             )
         composite_options = tuple(
             option
@@ -636,9 +852,13 @@ class _ProviderFreeCalibratedRunner:
             if dict(option.metadata).get("composition_selection_exposure")
             == "hierarchical_ranked_union"
         )
+        composite_option_ids = {option.option_id for option in composite_options}
         atomic_options = tuple(
-            option for option in eligible_options if option not in composite_options
+            option
+            for option in eligible_options
+            if option.option_id not in composite_option_ids
         )
+        atomic_option_ids = {option.option_id for option in atomic_options}
         if required_composites:
             if len(composite_options) < required_composites:
                 raise RuntimeError(
@@ -672,19 +892,32 @@ class _ProviderFreeCalibratedRunner:
 
             atomic_capacity = CALIBRATED_PROPOSAL_WIDTH - required_composites
             mandatory_composites = tuple(
-                option for option in required_options if option in composite_options
+                option
+                for option in required_options
+                if option.option_id in composite_option_ids
             )
             mandatory_atomics = tuple(
-                option for option in required_options if option in atomic_options
+                option
+                for option in required_options
+                if option.option_id in atomic_option_ids
             )
+            mandatory_composite_ids = {
+                option.option_id for option in mandatory_composites
+            }
+            mandatory_atomic_ids = {option.option_id for option in mandatory_atomics}
             if supported is not None:
                 if (
-                    supported in composite_options
-                    and supported not in mandatory_composites
+                    supported.option_id in composite_option_ids
+                    and supported.option_id not in mandatory_composite_ids
                 ):
                     mandatory_composites = (*mandatory_composites, supported)
-                elif supported in atomic_options and supported not in mandatory_atomics:
+                    mandatory_composite_ids.add(supported.option_id)
+                elif (
+                    supported.option_id in atomic_option_ids
+                    and supported.option_id not in mandatory_atomic_ids
+                ):
                     mandatory_atomics = (*mandatory_atomics, supported)
+                    mandatory_atomic_ids.add(supported.option_id)
             if len(mandatory_composites) > required_composites:
                 raise RuntimeError("Timeloop hierarchy over-subscribed composite slots")
             if len(mandatory_atomics) > atomic_capacity:
@@ -692,28 +925,58 @@ class _ProviderFreeCalibratedRunner:
 
             family_bounds = output_type.required_evaluation_family_bounds
             if family_bounds:
-                witness_ids = pairwise_disjoint_parent_patch_witness(
+                # Proposal-support reservations constrain the provider-visible
+                # K8, not the evaluator-visible K4.  In particular, required
+                # composite assays may be explicitly forbidden by an atomic-
+                # only evaluation-family bound.  The allocator independently
+                # authenticates every hard evaluator exposure requirement.
+                required_evaluation_ids: tuple[str, ...] = ()
+                witness_ids = _family_bounded_evaluation_witness(
                     contract,
                     tuple(option.option_id for option in eligible_options),
                     portfolio_size=output_type.evaluation_portfolio_size,
                     min_distinct_families=output_type.min_distinct_families,
                     family_exposure_bounds=family_bounds,
+                    required_option_ids=required_evaluation_ids,
+                    embedding_required_option_ids=tuple(
+                        sorted(
+                            {
+                                *mandatory_composite_ids,
+                                *mandatory_atomic_ids,
+                            }
+                        )
+                    ),
+                    embedding_composite_option_ids=tuple(
+                        sorted(composite_option_ids)
+                    ),
+                    embedding_composite_capacity=required_composites,
+                    embedding_total_capacity=CALIBRATED_PROPOSAL_WIDTH,
+                    require_pairwise_disjoint_parent_patches=(
+                        output_type.require_pairwise_disjoint_parent_patches
+                    ),
                 )
                 if witness_ids is None:
                     raise RuntimeError(
-                        "Timeloop hierarchy has no family-bounded evaluation witness"
+                        "Timeloop hierarchy has no family-bounded evaluation witness: "
+                        f"mandatory_option_ids={required_evaluation_ids}, "
+                        f"family_bounds={family_bounds}, "
+                        f"eligible_option_count={len(eligible_options)}, "
+                        f"atomic_capacity={atomic_capacity}, "
+                        f"required_composites={required_composites}"
                     )
                 by_id = {option.option_id: option for option in eligible_options}
                 chosen: list[object] = []
+                chosen_ids: set[str] = set()
                 for option in (
                     *mandatory_composites,
                     *mandatory_atomics,
                     *(by_id[option_id] for option_id in witness_ids),
                 ):
-                    if option not in chosen:
+                    if option.option_id not in chosen_ids:
                         chosen.append(option)
+                        chosen_ids.add(option.option_id)
                 chosen_composites = sum(
-                    option in composite_options for option in chosen
+                    option.option_id in composite_option_ids for option in chosen
                 )
                 chosen_atomics = len(chosen) - chosen_composites
                 if (
@@ -722,19 +985,28 @@ class _ProviderFreeCalibratedRunner:
                 ):
                     raise RuntimeError(
                         "Timeloop mandatory proposal support conflicts with the "
-                        "family-bounded evaluation witness"
+                        "family-bounded evaluation witness: "
+                        f"mandatory_composite_ids={tuple(sorted(mandatory_composite_ids))}, "
+                        f"mandatory_atomic_ids={tuple(sorted(mandatory_atomic_ids))}, "
+                        f"witness_ids={witness_ids}, "
+                        f"chosen_composites={chosen_composites}, "
+                        f"chosen_atomics={chosen_atomics}, "
+                        f"required_composites={required_composites}, "
+                        f"atomic_capacity={atomic_capacity}"
                     )
                 for option in composite_options:
                     if chosen_composites == required_composites:
                         break
-                    if option not in chosen:
+                    if option.option_id not in chosen_ids:
                         chosen.append(option)
+                        chosen_ids.add(option.option_id)
                         chosen_composites += 1
                 for option in atomic_options:
                     if chosen_atomics == atomic_capacity:
                         break
-                    if option not in chosen:
+                    if option.option_id not in chosen_ids:
                         chosen.append(option)
+                        chosen_ids.add(option.option_id)
                         chosen_atomics += 1
                 if (
                     chosen_composites != required_composites
@@ -757,11 +1029,16 @@ class _ProviderFreeCalibratedRunner:
                 selected = tuple(chosen)
                 if supported is not None:
                     selected = (supported,) + tuple(
-                        option for option in selected if option != supported
+                        option
+                        for option in selected
+                        if option.option_id != supported.option_id
                     )
                 return selected
 
             selected_atomics = list(mandatory_atomics)
+            selected_atomic_ids = {
+                option.option_id for option in selected_atomics
+            }
             used_loci = {_option_locus(option) for option in selected_atomics}
             used_families = {option.family for option in selected_atomics}
             # Keep an engine-checkable K4 atomic witness in every deterministic
@@ -770,12 +1047,13 @@ class _ProviderFreeCalibratedRunner:
             for option in atomic_options:
                 locus = _option_locus(option)
                 if (
-                    option in selected_atomics
+                    option.option_id in selected_atomic_ids
                     or locus in used_loci
                     or option.family in used_families
                 ):
                     continue
                 selected_atomics.append(option)
+                selected_atomic_ids.add(option.option_id)
                 used_loci.add(locus)
                 used_families.add(option.family)
                 if len(selected_atomics) >= max(4, len(mandatory_atomics)):
@@ -783,14 +1061,19 @@ class _ProviderFreeCalibratedRunner:
             for option in atomic_options:
                 if len(selected_atomics) == atomic_capacity:
                     break
-                if option not in selected_atomics:
+                if option.option_id not in selected_atomic_ids:
                     selected_atomics.append(option)
+                    selected_atomic_ids.add(option.option_id)
             selected_composites = list(mandatory_composites)
+            selected_composite_ids = {
+                option.option_id for option in selected_composites
+            }
             for option in composite_options:
                 if len(selected_composites) == required_composites:
                     break
-                if option not in selected_composites:
+                if option.option_id not in selected_composite_ids:
                     selected_composites.append(option)
+                    selected_composite_ids.add(option.option_id)
             if (
                 len(selected_atomics) != atomic_capacity
                 or len(selected_composites) != required_composites
@@ -799,10 +1082,13 @@ class _ProviderFreeCalibratedRunner:
             selected = (*selected_atomics, *selected_composites)
             if supported is not None:
                 selected = (supported,) + tuple(
-                    option for option in selected if option != supported
+                    option
+                    for option in selected
+                    if option.option_id != supported.option_id
                 )
             return tuple(selected)
         chosen: list[object] = []
+        chosen_ids: set[str] = set()
         used_loci: set[str] = set()
         used_families: set[str] = set()
         if dose is not None:
@@ -821,13 +1107,19 @@ class _ProviderFreeCalibratedRunner:
                     "Timeloop common pool omitted its required memory-dose action"
                 )
             chosen.append(supported)
+            chosen_ids.add(supported.option_id)
             used_loci.add(_option_locus(supported))
             used_families.add(supported.family)
         for option in eligible_options:
             locus = _option_locus(option)
-            if option in chosen or locus in used_loci or option.family in used_families:
+            if (
+                option.option_id in chosen_ids
+                or locus in used_loci
+                or option.family in used_families
+            ):
                 continue
             chosen.append(option)
+            chosen_ids.add(option.option_id)
             used_loci.add(locus)
             used_families.add(option.family)
             if len(chosen) == CALIBRATED_PROPOSAL_WIDTH:
@@ -841,9 +1133,10 @@ class _ProviderFreeCalibratedRunner:
             if len(chosen) == CALIBRATED_PROPOSAL_WIDTH:
                 break
             locus = _option_locus(option)
-            if option in chosen or locus in used_loci:
+            if option.option_id in chosen_ids or locus in used_loci:
                 continue
             chosen.append(option)
+            chosen_ids.add(option.option_id)
             used_loci.add(locus)
         if len(chosen) != CALIBRATED_PROPOSAL_WIDTH:
             raise RuntimeError("Timeloop palette did not yield eight disjoint loci")
@@ -891,7 +1184,11 @@ class _ProviderFreeCalibratedRunner:
             missing,
             strict=True,
         ):
-            updated[index] = output_type.finite_variation_contract.resolve(option_id)
+            updated[index] = next(
+                option
+                for option in output_type.finite_variation_contract.options
+                if option.option_id == option_id
+            )
         updated_ids = tuple(option.option_id for option in updated)
         if len(set(updated_ids)) != len(updated_ids):
             raise RuntimeError(
@@ -1085,9 +1382,9 @@ class _ReflectionExecutor:
         contrasts = reflection_input.evidence.contrasts
         clusters = cluster_identifiable_mutation_reflection_hypotheses(contrasts)
         insight_count = min(8, len(clusters))
-        if insight_count < PARENTS_PER_PORTFOLIO:
+        if insight_count < 1:
             raise RuntimeError(
-                "Timeloop reflection requires at least two scored G1 mutations"
+                "Timeloop reflection requires identifiable mutation evidence"
             )
         request = build_timeloop_v2_identifiable_reflection_request(
             call_id=self.ids.new_llm_call_id(),
@@ -1154,8 +1451,8 @@ class _TimeloopDiagnosticCohort:
         self.exposure.__post_init__()
         if self.eligible_references != self.exposure.references:
             raise ValueError("diagnostic cohort differs from its admitted references")
-        if len(self.eligible_references) < PARENTS_PER_PORTFOLIO:
-            raise ValueError("Timeloop diagnostic cohort cannot underfill its lanes")
+        if not self.eligible_references:
+            raise ValueError("Timeloop diagnostic cohort cannot be empty")
         if type(self.estimand_context) is not FrozenJsonObject:
             raise TypeError("estimand_context must be an exact FrozenJsonObject")
         if type(self.full_block_permutation_rank) is not int or not (
@@ -1229,8 +1526,8 @@ class _TimeloopDiagnosticBlockCoordinator:
             raise ValueError("Timeloop requires one sealed diagnostic exposure")
         exposure = exposures[0]
         entries = self.memory.entries_for(exposure.references)
-        if len(entries) < PARENTS_PER_PORTFOLIO:
-            raise ValueError("Timeloop diagnostic cohort cannot underfill two lanes")
+        if not entries:
+            raise ValueError("Timeloop diagnostic cohort cannot be empty")
         rank = int.from_bytes(
             hashlib.sha256(
                 (
@@ -1365,10 +1662,9 @@ class _WaveFactory:
         seed_card: PortfolioCard,
         binding_factory: CalibratedCampaignBindingFactory,
         coordinator: CalibratedPortfolioCampaignCoordinator,
-        target_conditioned_controller: (
-            TargetConditionedCampaignOutcomeUpdater | None
-        ),
+        target_conditioned_controller: (TargetConditionedCampaignOutcomeUpdater | None),
         evaluation_mating_constraints: bool,
+        require_pairwise_disjoint_parent_patches: bool,
         max_output_tokens: int,
         temperature: float | None,
     ) -> None:
@@ -1384,7 +1680,14 @@ class _WaveFactory:
         self.temperature = temperature
         if type(evaluation_mating_constraints) is not bool:
             raise TypeError("evaluation_mating_constraints must be exact bool")
+        if type(require_pairwise_disjoint_parent_patches) is not bool:
+            raise TypeError(
+                "require_pairwise_disjoint_parent_patches must be exact bool"
+            )
         self.evaluation_mating_constraints = evaluation_mating_constraints
+        self.require_pairwise_disjoint_parent_patches = (
+            require_pairwise_disjoint_parent_patches
+        )
         self.wave_records: list[dict[str, object]] = []
         self.dose_contracts: list[BoundedPortfolioMemoryDoseContract] = []
         self.matching_receipts: list[object] = []
@@ -1422,7 +1725,7 @@ class _WaveFactory:
             min_distinct_families=(4 if self.evaluation_mating_constraints else None),
             require_supporting_cards=False,
             require_pairwise_disjoint_parent_patches=(
-                self.evaluation_mating_constraints
+                self.require_pairwise_disjoint_parent_patches
             ),
             max_output_tokens=self.max_output_tokens,
             temperature=self.temperature,
@@ -1627,7 +1930,19 @@ class _WaveFactory:
         for context in contexts:
             cohort = self.diagnostic_coordinator.require_projected_context(context)
             if cohort is None:
-                raise RuntimeError("Timeloop G5 requires one projected cohort")
+                return tuple(
+                    self._bootstrap_wave(
+                        value,
+                        status="typed_e0_no_reflected_memory_available",
+                        evidence={
+                            "evidence_tier": "e0",
+                            "eligible_reflection_receipt_count": 0,
+                            "memory_dose_administered": False,
+                            "memory_credit_issued": False,
+                        },
+                    )
+                    for value in contexts
+                )
             cohort_by_lane[context.parent_lane.lane_id] = cohort
         if (
             len({value.exposure.receipt_sha256 for value in cohort_by_lane.values()})
@@ -1642,7 +1957,7 @@ class _WaveFactory:
                 key=lambda value: value.reference,
             )
         )
-        if len(entries) < PARENTS_PER_PORTFOLIO:
+        if not entries:
             raise RuntimeError("Timeloop G5 lost its eligible insight cohort")
 
         contexts_by_lane = {value.parent_lane.lane_id: value for value in contexts}
@@ -2093,6 +2408,7 @@ class ProviderFreeTimeloopCampaignRun:
             "status": self.execution.finalization_receipt.status.value,
             "generations_completed": self.execution.counters.generations_completed,
             "planned_candidate_occurrences": PLANNED_CANDIDATE_OCCURRENCES,
+            "mandatory_candidate_occurrences": MANDATORY_CANDIDATE_OCCURRENCES,
             "candidate_occurrences": self.execution.counters.candidate_occurrences,
             "unique_evaluations": self.execution.counters.unique_evaluations,
             "physical_evaluator_calls": evaluator_calls,
@@ -2218,6 +2534,29 @@ class ProviderFreeTimeloopCampaignRun:
         }
 
 
+def _profile_portfolio_selection_implementation(
+    *,
+    selected_allocator: CalibratedPortfolioAllocator | None,
+    runtime_selector_override: object | None,
+) -> CalibratedPortfolioAllocator:
+    """Keep method identity bound to the engine policy, not its runtime adapter.
+
+    A selector override may forecast every action and record the resulting choice,
+    but the calibrated allocator still owns feasibility, exposure, and allocation.
+    Therefore the reference profile must authenticate the allocator in both prepare
+    and live modes.  Returning the runtime adapter here would make method identity
+    depend on an execution wrapper and can fail only after credentials are opened.
+    """
+
+    if selected_allocator is None:
+        raise ValueError("reference profile requires an engine-owned allocator")
+    if runtime_selector_override is not None and not callable(
+        getattr(runtime_selector_override, "select", None)
+    ):
+        raise TypeError("runtime selector override must expose select")
+    return selected_allocator
+
+
 def run_timeloop_campaign(
     *,
     benchmark: AgenticBenchmark,
@@ -2256,12 +2595,18 @@ def run_timeloop_campaign(
     engine_trace_sink: Callable[[dict[str, object]], None] | None = None,
     archive_utility: object | None = None,
     recombination_utility_binder: object | None = None,
+    variation_envelope: CampaignVariationEnvelopePolicy | None = None,
+    capacity_recourse_factory: Callable[[AgenticBenchmark, object], object] | None = None,
+    recombination_evaluation_allocation_mode: RecombinationEvaluationAllocationMode = (
+        RecombinationEvaluationAllocationMode.NATIVE_THEN_RECOURSE
+    ),
     model_execution_profile: OpenRouterModelExecutionProfile | None = None,
     constraint_decoupled_acquisition: bool = CONSTRAINT_DECOUPLED_ACQUISITION,
     minimum_intervention_projection: bool = MINIMUM_INTERVENTION_PROJECTION,
     evidence_calibrated_source_mix: bool = EVIDENCE_CALIBRATED_SOURCE_MIX,
     contextual_search_allocation: bool = CONTEXTUAL_SEARCH_ALLOCATION,
     residual_frontier_planning: bool = RESIDUAL_FRONTIER_PLANNING,
+    contextual_incumbent_source_id: str = PRIMARY_VARIATION_SOURCE_ID,
     evaluator_concurrency: int = 1,
     agent_concurrency: int = 3,
     agent_queue_capacity: int = 8,
@@ -2274,14 +2619,25 @@ def run_timeloop_campaign(
 
     if type(benchmark) is not AgenticBenchmark:
         raise TypeError("benchmark must be an exact AgenticBenchmark")
+    if capacity_recourse_factory is not None and not callable(
+        capacity_recourse_factory
+    ):
+        raise TypeError("capacity_recourse_factory must be callable or None")
     if len(benchmark.finite_variation_catalogs) != 1:
         raise ValueError("Timeloop campaign requires one atomic finite catalog")
-    benchmark = replace(
-        benchmark,
-        finite_variation_catalogs=(
-            VARIATION_TOPOLOGY.decorate(benchmark.finite_variation_catalogs[0]),
-        ),
-    )
+    atomic_catalog = benchmark.finite_variation_catalogs[0]
+    selected_catalog = VARIATION_TOPOLOGY.decorate(atomic_catalog)
+    if contextual_search_allocation or portfolio_selector_override is not None:
+        selected_catalog = SourceUnionFiniteVariationCatalog(
+            primary_catalog=selected_catalog,
+            source_catalogs=(
+                SourceExposureFiniteVariationCatalog(
+                    GenericMultiscaleRestartFiniteVariationCatalog(atomic_catalog),
+                    evaluation_source_minimum=None,
+                ),
+            ),
+        )
+    benchmark = replace(benchmark, finite_variation_catalogs=(selected_catalog,))
     benchmark.validate_binding()
     if benchmark.optimization_semantics is None:
         raise ValueError("Timeloop G6 requires benchmark optimization semantics")
@@ -2315,6 +2671,10 @@ def run_timeloop_campaign(
         raise TypeError("evidence_calibrated_source_mix must be an exact bool")
     if type(contextual_search_allocation) is not bool:
         raise TypeError("contextual_search_allocation must be an exact bool")
+    if type(contextual_incumbent_source_id) is not str or not (
+        contextual_incumbent_source_id
+    ):
+        raise ValueError("contextual incumbent source ID must be non-empty")
     if type(residual_frontier_planning) is not bool:
         raise TypeError("residual_frontier_planning must be an exact bool")
     if residual_frontier_planning and not contextual_search_allocation:
@@ -2333,10 +2693,16 @@ def run_timeloop_campaign(
         )
     if (
         constraint_decoupled_acquisition
-        and ACQUISITION_MODE is not CampaignAcquisitionMode.HORIZON_BOUNDED
+        and ACQUISITION_MODE
+        not in {
+            CampaignAcquisitionMode.HORIZON_BOUNDED,
+            CampaignAcquisitionMode.ACQUISITION_CERTIFIED,
+            CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION,
+        }
     ):
         raise ValueError(
-            "constraint-decoupled acquisition requires horizon_bounded mode"
+            "constraint-decoupled acquisition requires horizon_bounded or "
+            "acquisition_certified or regret_bounded_information mode"
         )
     for name, value in (
         ("evaluator_concurrency", evaluator_concurrency),
@@ -2349,9 +2715,11 @@ def run_timeloop_campaign(
         raise ValueError("agent_queue_capacity must cover agent_concurrency")
     if calibrated_runner is not None and not callable(calibrated_runner):
         raise TypeError("calibrated_runner must be callable or None")
-    if target_conditioned_specification is not None and type(
-        target_conditioned_specification
-    ) is not TargetConditionedCampaignSpecification:
+    if (
+        target_conditioned_specification is not None
+        and type(target_conditioned_specification)
+        is not TargetConditionedCampaignSpecification
+    ):
         raise TypeError("target_conditioned_specification must be exact or None")
     if direct_portfolio_selector is not None:
         if contextual_search_allocation:
@@ -2374,10 +2742,6 @@ def run_timeloop_campaign(
             raise ValueError(
                 "portfolio selector override and direct selector are mutually exclusive"
             )
-        if contextual_search_allocation:
-            raise ValueError(
-                "portfolio selector override cannot consume contextual allocations"
-            )
         for attribute in (
             "select",
             "render",
@@ -2395,6 +2759,26 @@ def run_timeloop_campaign(
                 raise TypeError(
                     f"portfolio selector override must expose callable {attribute}"
                 )
+        if _common_pool_enabled() and not callable(
+            getattr(
+                portfolio_selector_override,
+                "bind_candidate_pool_provider",
+                None,
+            )
+        ):
+            raise TypeError(
+                "common-pool selector override must bind its forecast projection"
+            )
+        if contextual_search_allocation:
+            for attribute in (
+                "bind_contextual_allocation_provider",
+                "decode_selected_source_ids",
+                "decode_contextual_allocation_realization",
+            ):
+                if not callable(getattr(portfolio_selector_override, attribute, None)):
+                    raise TypeError(
+                        f"contextual selector override must expose callable {attribute}"
+                    )
     if reflection_executor_factory is not None and not callable(
         reflection_executor_factory
     ):
@@ -2483,10 +2867,11 @@ def run_timeloop_campaign(
         selected_runner = direct_portfolio_selector
         selected_allocator = None
         coordinator = None
+        engine_selector_delegate = None
         selector_delegate = direct_portfolio_selector
     else:
         selected_runner = (
-            _ProviderFreeCalibratedRunner()
+            ProviderFreeCalibratedPortfolioRunner()
             if calibrated_runner is None
             else calibrated_runner
         )
@@ -2523,19 +2908,42 @@ def run_timeloop_campaign(
             evidence_calibrated_source_mix=evidence_calibrated_source_mix,
             contextual_search_allocation=contextual_search_allocation,
         )
+        engine_selector_delegate = coordinator.build_selector(selected_runner)
         selector_delegate = (
             portfolio_selector_override
             if portfolio_selector_override is not None
-            else coordinator.build_selector(selected_runner)
+            else engine_selector_delegate
         )
+        if portfolio_selector_override is not None and contextual_search_allocation:
+            portfolio_selector_override.bind_contextual_allocation_provider(
+                lambda request: coordinator.binding_for(request).contextual_allocation
+            )
+        if portfolio_selector_override is not None and _common_pool_enabled():
+            portfolio_selector_override.bind_candidate_pool_provider(
+                lambda request: coordinator.binding_for(request).common_candidate_pool
+            )
         if (
             portfolio_selector_override is None
             and contextual_search_allocation
-            and type(selector_delegate) is not (
-                PydanticAIContextualSearchAllocationPortfolioSelectionPolicy
-            )
+            and type(selector_delegate)
+            is not (PydanticAIContextualSearchAllocationPortfolioSelectionPolicy)
         ):
             raise TypeError("Timeloop coordinator built a foreign V12 selector")
+        if (
+            portfolio_selector_override is None
+            and ACQUISITION_MODE is CampaignAcquisitionMode.ACQUISITION_CERTIFIED
+            and type(selector_delegate)
+            is not PydanticAIAcquisitionCertifiedResidualPortfolioSelectionPolicy
+        ):
+            raise TypeError("Timeloop coordinator built a foreign ACRE selector")
+        if (
+            portfolio_selector_override is None
+            and ACQUISITION_MODE
+            is CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION
+            and type(selector_delegate)
+            is not PydanticAIRegretBoundedInformationPortfolioSelectionPolicy
+        ):
+            raise TypeError("Timeloop coordinator built a foreign RBIE selector")
         if (
             portfolio_selector_override is None
             and active_target_specification is not None
@@ -2603,10 +3011,9 @@ def run_timeloop_campaign(
                 # ``selector`` remains the runtime adapter that records and
                 # executes its decisions.  Binding the adapter here would hide
                 # the exact operator-assay configuration from method identity.
-                portfolio_selection=(
-                    portfolio_selector_override
-                    if portfolio_selector_override is not None
-                    else selected_allocator
+                portfolio_selection=_profile_portfolio_selection_implementation(
+                    selected_allocator=selected_allocator,
+                    runtime_selector_override=portfolio_selector_override,
                 ),
                 recombination=object(),
                 reflection=reflection_executor,
@@ -2637,6 +3044,7 @@ def run_timeloop_campaign(
             minimum_intervention_projection=minimum_intervention_projection,
             evidence_calibrated_source_mix=evidence_calibrated_source_mix,
             contextual_search_allocation=contextual_search_allocation,
+            scale_shape=CAMPAIGN_SCALE_SHAPE,
         )
         policies = experiment_profile.behavior(archive_utility=utility).bind()
     else:
@@ -2664,7 +3072,7 @@ def run_timeloop_campaign(
                 reflection_executor,
             ),
             reflection_supervision=CampaignReflectionSupervisionPolicy(
-                ReflectionFailureMode.FAIL_AT_NEXT_STAGE_BOUNDARY
+                ReflectionFailureMode.BEST_EFFORT_DEGRADED
             ),
             archive_utility=utility,
         )
@@ -2712,19 +3120,28 @@ def run_timeloop_campaign(
     )
     schedule = prepared.schedule
     if (
-        schedule.portfolio_generations != (1, 3, 5)
-        or schedule.paired_recombination_generations != (2, 4, 6)
+        schedule.portfolio_generations != PORTFOLIO_GENERATIONS
+        or schedule.paired_recombination_generations
+        != RECOMBINATION_GENERATIONS
         or tuple(step.planned_candidate_evaluations for step in schedule.steps)
-        != (
-            PARENTS_PER_PORTFOLIO * PORTFOLIO_WIDTH,
-            PARENTS_PER_PORTFOLIO * RECOMBINATIONS_PER_PARENT,
-            PARENTS_PER_PORTFOLIO * PORTFOLIO_WIDTH,
-            PARENTS_PER_PORTFOLIO * RECOMBINATIONS_PER_PARENT,
-            PARENTS_PER_PORTFOLIO * PORTFOLIO_WIDTH,
-            PARENTS_PER_PORTFOLIO * RECOMBINATIONS_PER_PARENT,
+        != tuple(
+            PARENTS_PER_PORTFOLIO
+            * (
+                PORTFOLIO_WIDTH
+                if generation in PORTFOLIO_GENERATIONS
+                else RECOMBINATIONS_PER_PARENT
+            )
+            for generation in range(1, GENERATION_COUNT + 1)
         )
         or tuple(step.planned_agent_calls for step in schedule.steps)
-        != (2, 1, 2, 0, 2, 0)
+        != tuple(
+            2
+            if generation in PORTFOLIO_GENERATIONS
+            else 1
+            if generation in PLANNED_REFLECTION_SOURCE_GENERATIONS
+            else 0
+            for generation in range(1, GENERATION_COUNT + 1)
+        )
         or schedule.planned_candidate_evaluations + protocol.required_seed_count
         != PLANNED_CANDIDATE_OCCURRENCES
         or schedule.planned_agent_calls != PLANNED_LOGICAL_CALLS
@@ -2732,7 +3149,10 @@ def run_timeloop_campaign(
             (value.source_generation, value.promotion_barrier_generation)
             for value in schedule.reflection_waves
         )
-        != ((2, 4),)
+        != tuple(
+            (generation, generation + 2)
+            for generation in PLANNED_REFLECTION_SOURCE_GENERATIONS
+        )
     ):
         raise RuntimeError(
             "prepared Timeloop schedule differs from its configured evaluation/call contract"
@@ -2740,6 +3160,7 @@ def run_timeloop_campaign(
 
     benchmark_sha256 = typed_json_sha256(prepared.benchmark_session.benchmark)
     feedback_ledger = PortfolioOutcomeFeedbackLedger()
+    outcome_feedback_scope: ForecastCalibrationScope | None = None
     binding_factory = (
         None
         if direct_selection
@@ -2749,22 +3170,16 @@ def run_timeloop_campaign(
                     model_profile_sha256
                     or _sha("timeloop-provider-free-calibrated-double")
                 ),
-                prompt_definition_sha256=(
-                    portfolio_selector_override.prompt_definition_sha256
-                    if portfolio_selector_override is not None
-                    else calibrated_portfolio_prompt_definition_sha256(
-                        proposal_support=_proposal_support_policy() is not None,
-                        hierarchical_composition_required_proposals=(
-                            VARIATION_TOPOLOGY.hierarchical_composition_required_proposals
-                        ),
-                        feasibility_witness_mode=FEASIBILITY_WITNESS_MODE,
-                        constraint_decoupled=constraint_decoupled_acquisition,
-                    )
+                prompt_definition_sha256=calibrated_portfolio_prompt_definition_sha256(
+                    proposal_support=_proposal_support_policy() is not None,
+                    hierarchical_composition_required_proposals=(
+                        VARIATION_TOPOLOGY.hierarchical_composition_required_proposals
+                    ),
+                    feasibility_witness_mode=FEASIBILITY_WITNESS_MODE,
+                    constraint_decoupled=constraint_decoupled_acquisition,
                 ),
                 selector_policy_definition_sha256=(
-                    portfolio_selector_override.policy_definition_sha256
-                    if portfolio_selector_override is not None
-                    else selector_delegate.policy_definition_sha256
+                    engine_selector_delegate.policy_definition_sha256
                 ),
                 benchmark_sha256=benchmark_sha256,
                 session_sha256=prepared.benchmark_session.session_sha256,
@@ -2784,6 +3199,24 @@ def run_timeloop_campaign(
             assign_all_cards_by_default=not _common_pool_enabled(),
         )
     )
+    if portfolio_selector_override is not None:
+        if binding_factory is None:  # pragma: no cover - override excludes direct.
+            raise AssertionError("selector override omitted its binding factory")
+        outcome_feedback_scope = binding_factory.scope.for_policy_frame(
+            prompt_definition_sha256=(
+                portfolio_selector_override.prompt_definition_sha256
+            ),
+            selector_policy_definition_sha256=(
+                portfolio_selector_override.policy_definition_sha256
+            ),
+        )
+        feedback_binder = getattr(
+            portfolio_selector_override,
+            "bind_prior_outcome_feedback",
+            None,
+        )
+        if callable(feedback_binder):
+            feedback_binder(feedback_ledger, outcome_feedback_scope)
     direction_adjudicator = (
         None
         if binding_factory is None
@@ -2819,6 +3252,11 @@ def run_timeloop_campaign(
         max_output_tokens=max_output_tokens,
         temperature=temperature,
     )
+    capacity_recourse = (
+        None
+        if capacity_recourse_factory is None
+        else capacity_recourse_factory(benchmark, composition)
+    )
     target_conditioned_controller = (
         None
         if active_target_specification is None
@@ -2836,9 +3274,7 @@ def run_timeloop_campaign(
                     result
                 )
             ),
-            marginal_utility=FixedReferenceContextualMarginalUtilityProjector(
-                utility
-            ),
+            marginal_utility=ExactCoalitionShapleyContextualUtilityProjector(utility),
         )
     )
     contextual_search_ledger = (
@@ -2846,8 +3282,19 @@ def run_timeloop_campaign(
         if not direct_selection and contextual_search_allocation
         else None
     )
+    # The legacy Timeloop K4 constraint asked for four distinct action
+    # families and pairwise-disjoint parent patches.  A protected global
+    # acquisition option is a full independently evaluated configuration, and
+    # the contextual controller may also require two composite-family slots.
+    # Retaining the legacy family/disjoint conjunction would make that exact
+    # source/operator allocation algebraically impossible.  Source floors and
+    # operator targets remain engine-owned hard constraints.
     evaluation_mating_constraints = (
         type(selected_allocator) is not FrontierProbeSlatePolicy
+        and variation_envelope is None
+    )
+    require_pairwise_disjoint_parent_patches = (
+        evaluation_mating_constraints and variation_envelope is None
     )
     contextual_search_scope_sha256 = _sha(
         "agent-evolve:contextual-search-campaign:" + prepared.preparation_sha256
@@ -2858,22 +3305,28 @@ def run_timeloop_campaign(
         else CampaignContextualSearchPlanner(
             ledger=contextual_search_ledger,
             campaign_scope_sha256=contextual_search_scope_sha256,
+            incumbent_source_id=contextual_incumbent_source_id,
             joint_capability_projector=(
                 FiniteContractContextualJointCapabilityProjector(
                     min_distinct_families=(
                         4 if evaluation_mating_constraints else None
                     ),
                     require_pairwise_disjoint_parent_patches=(
-                        evaluation_mating_constraints
+                        require_pairwise_disjoint_parent_patches
                     ),
+                    operator_exposure_bounds=(("atomic", 1, PORTFOLIO_WIDTH),),
+                    minimum_single_path_interventions=1,
+                    protect_future_recombination_opportunities=True,
                     require_declared_source_floor_options=True,
                 )
             ),
+            available_operator_ids=("atomic", "composite", "global"),
             frontier_target_allocator=(
                 ResidualHypervolumeFrontierTargetAllocator()
-                if residual_frontier_planning
+                if residual_frontier_planning or portfolio_selector_override is not None
                 else AuthenticatedAffineFrontierTargetAllocator()
             ),
+            require_objective_space_targets=(portfolio_selector_override is not None),
         )
     )
     diagnostic_coordinator = (
@@ -2903,6 +3356,9 @@ def run_timeloop_campaign(
             coordinator=coordinator,
             target_conditioned_controller=target_conditioned_controller,
             evaluation_mating_constraints=evaluation_mating_constraints,
+            require_pairwise_disjoint_parent_patches=(
+                require_pairwise_disjoint_parent_patches
+            ),
             max_output_tokens=max_output_tokens,
             temperature=temperature,
         )
@@ -2916,15 +3372,15 @@ def run_timeloop_campaign(
                 (
                     lambda wave, result: (
                         portfolio_selector_override.decode_selected_predictions(
-                            binding_factory.scope,
+                            outcome_feedback_scope,
                             wave,
                             result,
                         )
                     )
                 )
                 if portfolio_selector_override is not None
-                else lambda wave, result: (
-                    coordinator.decode_selected_predictions(result)
+                else lambda wave, result: coordinator.decode_selected_predictions(
+                    result
                 )
             ),
             adjudicator_for=lambda wave, result: direction_adjudicator,
@@ -2934,17 +3390,38 @@ def run_timeloop_campaign(
                 else {
                     "contextual_ledger": contextual_search_ledger,
                     "selected_search_sources": (
-                        lambda wave, result: coordinator.decode_selected_source_ids(
-                            result
+                        (
+                            lambda wave, result: (
+                                portfolio_selector_override.decode_selected_source_ids(
+                                    wave,
+                                    result,
+                                )
+                            )
+                        )
+                        if portfolio_selector_override is not None
+                        else lambda wave, result: (
+                            coordinator.decode_selected_source_ids(result)
                         )
                     ),
                     "selected_allocation_realization": (
-                        lambda wave, result: (
+                        (
+                            lambda wave, result: (
+                                portfolio_selector_override.decode_contextual_allocation_realization(
+                                    coordinator.binding_for(
+                                        wave.selection_request
+                                    ).contextual_allocation,
+                                    wave,
+                                    result,
+                                )
+                            )
+                        )
+                        if portfolio_selector_override is not None
+                        else lambda wave, result: (
                             coordinator.decode_contextual_allocation_realization(result)
                         )
                     ),
                     "contextual_marginal_utility": (
-                        FixedReferenceContextualMarginalUtilityProjector(utility)
+                        ExactCoalitionShapleyContextualUtilityProjector(utility)
                     ),
                     "contextual_campaign_scope_sha256": (
                         contextual_search_scope_sha256
@@ -2988,12 +3465,15 @@ def run_timeloop_campaign(
         ),
         contextual_search_planner=contextual_search_planner,
         frontier_target_allocator=(
-            ResidualHypervolumeFrontierTargetAllocator()
+            None
+            if contextual_search_planner is not None
+            else ResidualHypervolumeFrontierTargetAllocator()
             if portfolio_selector_override is not None
             else AuthenticatedAffineFrontierTargetAllocator()
             if target_conditioned_controller is not None
             else None
         ),
+        variation_envelope=variation_envelope,
         outcome_updater=outcome_updater,
         selector_request_prompt_renderer=(
             None
@@ -3003,6 +3483,10 @@ def run_timeloop_campaign(
             else coordinator
         ),
         recombination_utility_binder=recombination_utility_binder,
+        capacity_recourse=capacity_recourse,
+        recombination_evaluation_allocation_mode=(
+            recombination_evaluation_allocation_mode
+        ),
         owned_resources=owned_resources,
     )
     journal = _ExecutionJournal() if execution_journal is None else execution_journal
@@ -3054,7 +3538,20 @@ def run_provider_free_timeloop_campaign(
     direct_portfolio_selector: object | None = None,
     archive_utility: object | None = None,
     recombination_utility_binder: object | None = None,
+    variation_envelope_factory: (
+        Callable[[AgenticBenchmark], CampaignVariationEnvelopePolicy] | None
+    ) = None,
+    capacity_recourse_factory: (
+        Callable[[AgenticBenchmark, object], object] | None
+    ) = None,
+    recombination_evaluation_allocation_mode: RecombinationEvaluationAllocationMode = (
+        RecombinationEvaluationAllocationMode.NATIVE_THEN_RECOURSE
+    ),
+    portfolio_selector_override_factory: (
+        Callable[[AgenticBenchmark], object] | None
+    ) = None,
     execution_journal: object | None = None,
+    contextual_incumbent_source_id: str = PRIMARY_VARIATION_SOURCE_ID,
 ) -> ProviderFreeTimeloopCampaignRun:
     """Run six actual generations without a provider, credential, or Docker."""
 
@@ -3072,6 +3569,27 @@ def run_provider_free_timeloop_campaign(
         optimization_semantics=timeloop_v2_optimization_semantics(problem),
         phenotype_identity=TypedConfigurationPhenotypeIdentityPolicy(),
         finite_variation_catalogs=(TimeloopV2FiniteVariationCatalog(panel),),
+        hard_feasibility=TimeloopV2HardFeasibility(panel),
+    )
+    if variation_envelope_factory is not None and not callable(
+        variation_envelope_factory
+    ):
+        raise TypeError("variation_envelope_factory must be callable or None")
+    if portfolio_selector_override_factory is not None and not callable(
+        portfolio_selector_override_factory
+    ):
+        raise TypeError(
+            "portfolio_selector_override_factory must be callable or None"
+        )
+    variation_envelope = (
+        None
+        if variation_envelope_factory is None
+        else variation_envelope_factory(benchmark)
+    )
+    portfolio_selector_override = (
+        None
+        if portfolio_selector_override_factory is None
+        else portfolio_selector_override_factory(benchmark)
     )
     return run_timeloop_campaign(
         benchmark=benchmark,
@@ -3116,8 +3634,15 @@ def run_provider_free_timeloop_campaign(
         calibrated_allocator=calibrated_allocator,
         target_conditioned_specification=target_conditioned_specification,
         direct_portfolio_selector=direct_portfolio_selector,
+        portfolio_selector_override=portfolio_selector_override,
         archive_utility=archive_utility,
         recombination_utility_binder=recombination_utility_binder,
+        variation_envelope=variation_envelope,
+        capacity_recourse_factory=capacity_recourse_factory,
+        recombination_evaluation_allocation_mode=(
+            recombination_evaluation_allocation_mode
+        ),
+        contextual_incumbent_source_id=contextual_incumbent_source_id,
         execution_journal=execution_journal,
         model_execution_profile=DEEPSEEK_V4_PRO_STREAMLAKE_XHIGH_NATIVE_JSON,
         selector_policy_binding_id=(

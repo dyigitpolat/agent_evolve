@@ -24,6 +24,8 @@ from agent_evolve.application.campaign_execution import (
     CampaignStageReceipt,
     EvolutionCampaignScheduler,
     SelectorAuditExecutionMode,
+    decode_selector_audit_text,
+    encode_selector_audit_text,
 )
 from agent_evolve.application.evolution_campaign import (
     AlternatingPortfolioRecombinationCadence,
@@ -69,6 +71,36 @@ def _async_test(function):
         return asyncio.run(function(*args, **kwargs))
 
     return run
+
+
+def test_large_selector_audit_text_is_losslessly_authenticated_in_chunks() -> None:
+    response_text = '{"trace":"' + ("forecast-evidence," * 80_000) + '"}'
+    payload = {
+        "selector_call_id": "call_large_audit",
+        "request_sha256": _sha("large request"),
+        "decision_sha256": _sha("large decision"),
+        "request_text": "bounded request",
+        **encode_selector_audit_text("response_text", response_text),
+        "request_text_kind": "exact_framework_prompt",
+        "response_text_kind": "trusted_structured_decision_projection",
+    }
+    plaintext = _object(payload)
+
+    receipt = CampaignSelectorAuditReceipt(
+        generation=1,
+        parent_slot=0,
+        selector_call_id="call_large_audit",
+        request_sha256=_sha("large request"),
+        decision_sha256=_sha("large decision"),
+        trace_receipt_sha256=typed_json_sha256(plaintext),
+        plaintext_audit=plaintext,
+        prior_audit_set_sha256=_sha("prior large audit set"),
+        execution_mode=SelectorAuditExecutionMode.FRESH,
+    )
+
+    thawed = thaw_json(receipt.plaintext_audit)
+    assert "response_text" not in thawed
+    assert decode_selector_audit_text(thawed, "response_text") == response_text
 
 
 class _ArchiveUtility:
@@ -475,10 +507,12 @@ class _ReflectionRuntime:
         started: asyncio.Event | None = None,
         release: asyncio.Event | None = None,
         fail_source: int | None = None,
+        abstain_source: int | None = None,
     ) -> None:
         self.started = started
         self.release = release
         self.fail_source = fail_source
+        self.abstain_source = abstain_source
         self.requests = []
         self.test_admission_requests = []
         self.finished = False
@@ -491,6 +525,28 @@ class _ReflectionRuntime:
             await self.release.wait()
         if request.wave.source_generation == self.fail_source:
             raise RuntimeError("injected asynchronous reflection failure")
+        if request.wave.source_generation == self.abstain_source:
+            return CampaignReflectionReceipt(
+                request_sha256=request.request_sha256,
+                preparation_sha256=request.preparation_sha256,
+                source_generation=request.wave.source_generation,
+                source_stage_receipt_sha256=request.source_stage.receipt_sha256,
+                logical_agent_calls=request.wave.call_count,
+                visibility=request.wave.visibility,
+                status=CampaignReflectionStatus.ABSTAINED,
+                failure_type=None,
+                quarantined_result=_object(
+                    {
+                        "schema_version": 1,
+                        "status": (
+                            "abstained_no_identifiable_mutation_evidence"
+                        ),
+                        "evidence_tier": "e0",
+                        "provider_calls": 0,
+                        "publishable_reflection_content": False,
+                    }
+                ),
+            )
         self.finished = True
         return CampaignReflectionReceipt(
             request_sha256=request.request_sha256,
@@ -792,6 +848,37 @@ async def test_best_effort_returns_degraded_without_partial_block_admission():
     assert CampaignExecutionEventKind.EXECUTION_DEGRADED in {
         event.kind for event in journal.events
     }
+
+
+@_async_test
+async def test_e0_reflection_abstention_is_completed_without_test_admission():
+    prepared, policies = _prepared(6, delayed_admission=True)
+    journal = _DurableJournal()
+    lifecycle = _Lifecycle()
+    reflections = _ReflectionRuntime(abstain_source=2)
+
+    result = await EvolutionCampaignScheduler(
+        prepared,
+        policies,
+        _StageRuntime(journal=journal),
+        reflections,
+        lifecycle,
+        journal,
+    ).run()
+
+    assert result.finalization_receipt.status is CampaignExecutionStatus.COMPLETED
+    assert result.test_admission_receipts == ()
+    assert tuple(value.status for value in result.reflection_receipts) == (
+        CampaignReflectionStatus.ABSTAINED,
+    )
+    assert result.counters.logical_agent_calls == 7
+    assert result.counters.logical_agent_calls_dispatched_to_runtime == 7
+    assert result.counters.logical_agent_calls_succeeded == 6
+    assert result.counters.logical_agent_calls_abstained == 1
+    assert result.counters.logical_agent_calls_failed == 0
+    kinds = {event.kind for event in journal.events}
+    assert CampaignExecutionEventKind.REFLECTION_ABSTAINED in kinds
+    assert CampaignExecutionEventKind.EXECUTION_DEGRADED not in kinds
 
 
 @_async_test

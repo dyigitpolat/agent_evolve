@@ -2236,6 +2236,42 @@ def test_typed_raw_connection_failures_are_retryable(raw: BaseException) -> None
 @pytest.mark.parametrize(
     "raw",
     [
+        httpx.RemoteProtocolError("RAW_SECRET_REMOTE_PROTOCOL"),
+        RuntimeError("RAW_SECRET_WRAPPER"),
+    ],
+)
+def test_typed_remote_protocol_failures_are_retryable(raw: BaseException) -> None:
+    if type(raw) is RuntimeError:
+        import httpcore
+
+        raw.__cause__ = httpcore.RemoteProtocolError(
+            "RAW_SECRET_HTTPCORE_REMOTE_PROTOCOL"
+        )
+
+    translated = classify_generation_exception(raw)
+
+    assert translated.kind is GenerationFailureKind.PROVIDER_UNAVAILABLE
+    assert translated.retryable is True
+    assert translated.safe_message == (
+        "provider response stream was interrupted remotely"
+    )
+    assert "RAW_SECRET" not in repr(translated.__dict__)
+
+
+def test_local_protocol_failure_remains_terminal_and_fail_closed() -> None:
+    translated = classify_generation_exception(
+        httpx.LocalProtocolError("RAW_SECRET_LOCAL_PROTOCOL")
+    )
+
+    assert translated.kind is GenerationFailureKind.UNKNOWN
+    assert translated.retryable is False
+    assert translated.safe_message == "unclassified generation adapter failure"
+    assert "RAW_SECRET" not in repr(translated.__dict__)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
         type("NetworkLookalikeError", (RuntimeError,), {})("RAW_SECRET"),
         type("TimeoutLookalikeError", (RuntimeError,), {})("RAW_SECRET"),
     ],

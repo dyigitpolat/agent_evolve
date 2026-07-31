@@ -32,6 +32,7 @@ EXPECTED_PROFILE_NAMES = (
     "deepseek",
     "gpt_oss_120b",
     "gpt_oss_20b",
+    "gpt_luna",
     "gpt_sol",
     "mistral",
     "qwen",

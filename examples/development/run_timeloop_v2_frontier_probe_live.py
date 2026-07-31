@@ -9,9 +9,11 @@ runs a candidate in Docker.
 ``live`` first replays the provider-free construction gate, validates the
 preregistration and pinned Docker image, and only then reads the OpenRouter
 credential.  The paid path uses one shared concurrency-limited queue for six
-typed selector calls and one delayed exact-action reflection call.  Every
-provider attempt, typed response, campaign event, engine event, reflection,
-selection decision, and physical Timeloop evaluation is durably journaled.
+typed selector calls and at most one delayed exact-action reflection call; a
+typed E0 abstention consumes the reserved logical opportunity without a
+provider call.  Every provider attempt, typed response, campaign event, engine
+event, reflection, selection decision, and physical Timeloop evaluation is
+durably journaled.
 """
 
 from __future__ import annotations
@@ -54,13 +56,27 @@ instrument_startup_window()
 from agent_evolve.settings import load_credentials  # noqa: E402
 
 from agent_evolve.agentic import (  # noqa: E402
+    AgenticBenchmark,
     DeterministicIdFactory,
     freeze_json,
     typed_json_sha256,
 )
+from agent_evolve.application.finite_acquisition_variation_envelope import (  # noqa: E402
+    PROTECTED_ACQUISITION_SOURCE_ID,
+    ProtectedFiniteAcquisitionVariationEnvelope,
+)
+from agent_evolve.application.finite_acquisition_capacity_recourse import (  # noqa: E402
+    FiniteAcquisitionCapacityRecourse,
+)
 from agent_evolve.application.campaign_execution import (  # noqa: E402
     CampaignExecutionEvent,
     CampaignJournalAck,
+    CampaignReflectionReceipt,
+    CampaignReflectionStatus,
+)
+from agent_evolve.application.anchor_residual_identification import (  # noqa: E402
+    AnchorResidualIdentificationContract,
+    project_anchor_residual_selection_audits,
 )
 from agent_evolve.application.evaluation_accounting import (  # noqa: E402
     CampaignEvaluationAccounting,
@@ -68,14 +84,35 @@ from agent_evolve.application.evaluation_accounting import (  # noqa: E402
 from agent_evolve.application.action_forecast_partitioning import (  # noqa: E402
     ConcurrentActionForecastWave,
 )
+from agent_evolve.application.empirical_consequence_calibration import (  # noqa: E402
+    HierarchicalEmpiricalConsequenceCalibrationPolicy,
+)
+from agent_evolve.application.global_wave_action_allocation import (  # noqa: E402
+    BarrierGlobalWaveActionAllocationCoordinator,
+    GLOBAL_WAVE_ACTION_ALLOCATION_POLICY_DEFINITION_SHA256,
+    GLOBAL_WAVE_ACTION_ALLOCATION_POLICY_ID,
+    GLOBAL_WAVE_ACTION_ALLOCATION_POLICY_VERSION,
+    GlobalRoleBalancedWaveActionAllocationPolicy,
+)
+from agent_evolve.application.portfolio_outcome_feedback import (  # noqa: E402
+    PortfolioOutcomeFeedbackLedger,
+)
+from agent_evolve.policies.selection.forecast_calibration import (  # noqa: E402
+    ForecastCalibrationScope,
+)
 from agent_evolve.application.outcome_conditioned_portfolio_selection import (  # noqa: E402
     OUTCOME_CONDITIONED_PORTFOLIO_POLICY_DEFINITION_SHA256,
+    OUTCOME_CONDITIONED_PORTFOLIO_POLICY_ID,
+    OUTCOME_CONDITIONED_PORTFOLIO_POLICY_VERSION,
     OutcomeConditionedPortfolioSelectionPolicy,
+    outcome_conditioned_contextual_allocation_realization,
     outcome_conditioned_selected_predictions,
+    outcome_conditioned_selected_source_ids,
 )
 from agent_evolve.application.portfolio_campaign_runtime import (  # noqa: E402
     CAMPAIGN_ARCHIVE_CONTEXT_KEY,
     CampaignIdentifiableReflectionInput,
+    RecombinationEvaluationAllocationMode,
 )
 from agent_evolve.application.portfolio_recombination import (  # noqa: E402
     bind_portfolio_recombination_source_utilities,
@@ -86,8 +123,9 @@ from agent_evolve.domain.typed_json import (  # noqa: E402
     FrozenJsonObject,
     thaw_json,
 )
-from agent_evolve.infrastructure.artifacts.filesystem import (  # noqa: E402
+from agent_evolve.infrastructure.artifacts import (  # noqa: E402
     FileSystemArtifactStore,
+    InMemoryArtifactStore,
 )
 from agent_evolve.integrations.pydantic_ai.agentic_generator import (  # noqa: E402
     AttemptedStructuredGenerationResponse,
@@ -96,6 +134,12 @@ from agent_evolve.integrations.pydantic_ai.agentic_generator import (  # noqa: E
 from agent_evolve.integrations.pydantic_ai.action_forecast import (  # noqa: E402
     ACTION_FORECAST_POLICY_DEFINITION_SHA256,
     PydanticAIActionForecastBlockPolicy,
+)
+from agent_evolve.integrations.botorch import (  # noqa: E402
+    build_isolated_botorch_qlognehvi,
+)
+from agent_evolve.integrations.botorch.subprocess_qlognehvi_batch import (  # noqa: E402
+    build_isolated_botorch_qlognehvi_batch_score,
 )
 from agent_evolve.integrations.pydantic_ai.model_execution_profile import (  # noqa: E402
     OpenRouterModelExecutionProfile,
@@ -106,6 +150,7 @@ from agent_evolve.integrations.pydantic_ai.campaign_acquisition import (  # noqa
     build_campaign_acquisition_allocator,
     build_campaign_proposal_support_policy,
     campaign_operator_assay_minimum_from_environment,
+    campaign_regret_bounded_information_controls_from_environment,
 )
 from agent_evolve.integrations.pydantic_ai.outbound_request_manifest import (  # noqa: E402
     validate_openrouter_outbound_request_manifest_record,
@@ -129,7 +174,12 @@ from agent_evolve.policies.reward.affine_hypervolume_3d import (  # noqa: E402
     audit_affine_reference_envelope_3d,
 )
 from agent_evolve.policies.selection.structural_posterior_slate import (  # noqa: E402
+    build_controller_owned_family_exposure_phases,
     build_terminal_tapered_family_exposure_phases,
+)
+from agent_evolve.policies.selection.acquisition_certified_slate import (  # noqa: E402
+    AcquisitionCertifiedSlateContextRegistry,
+    AcquisitionCertifiedSlateContextSink,
 )
 from agent_evolve.ports.structured_generator import (  # noqa: E402
     StructuredGenerationResponse,
@@ -139,6 +189,12 @@ from agent_evolve.ports.structured_generator import (  # noqa: E402
 )
 from agent_evolve.ports.action_forecast import (  # noqa: E402
     ActionForecastPartitionPolicyBinding,
+)
+from agent_evolve.ports.finite_acquisition import (  # noqa: E402
+    FiniteAcquisitionObjective,
+)
+from agent_evolve.ports.variation_source import (  # noqa: E402
+    finite_variation_source_id,
 )
 from examples.benchmarks.timeloop_codesign.v2.campaign_reflection import (  # noqa: E402
     build_timeloop_v2_identifiable_learning_envelope,
@@ -164,6 +220,9 @@ from examples.benchmarks.timeloop_codesign.v2.evaluator import (  # noqa: E402
 from examples.benchmarks.timeloop_codesign.v2.frozen_panels import (  # noqa: E402
     frozen_network_panel,
 )
+from examples.benchmarks.timeloop_codesign.v2.finite_acquisition_space import (  # noqa: E402
+    TimeloopV2FiniteAcquisitionSpace,
+)
 from examples.development.durable_run_artifacts import (  # noqa: E402
     BatchedDurableJsonlJournal,
     DurableJsonlJournal,
@@ -175,11 +234,18 @@ from examples.development.durable_run_artifacts import (  # noqa: E402
 from examples.development.run_timeloop_v2_provider_free_campaign import (  # noqa: E402
     ARCHIVE_CONTEXT_MODE,
     COMMON_CANDIDATE_POOL_SIZE,
+    CONSTRAINT_DECOUPLED_ACQUISITION,
+    CONTEXTUAL_SEARCH_ALLOCATION,
     FEASIBILITY_WITNESS_MODE,
     GENERATION_COUNT,
+    MANDATORY_CANDIDATE_OCCURRENCES,
+    PARENTS_PER_PORTFOLIO,
     PLANNED_CANDIDATE_OCCURRENCES,
     PLANNED_LOGICAL_CALLS,
+    PORTFOLIO_GENERATIONS,
     PORTFOLIO_WIDTH,
+    RECOMBINATION_GENERATIONS,
+    RECOMBINATIONS_PER_PARENT,
     VARIATION_TOPOLOGY,
     run_provider_free_timeloop_campaign,
     run_timeloop_campaign,
@@ -282,6 +348,15 @@ ACQUISITION_MODE = CampaignAcquisitionMode(
         "model_top_k" if _common_pool_enabled() else "full_support",
     )
 )
+NUMERICALLY_CERTIFIED_ACQUISITION = ACQUISITION_MODE in {
+    CampaignAcquisitionMode.ACQUISITION_CERTIFIED,
+    CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION,
+}
+REGRET_BOUNDED_CONTROLS = (
+    campaign_regret_bounded_information_controls_from_environment(os.environ)
+    if ACQUISITION_MODE is CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION
+    else None
+)
 OPERATOR_ASSAY_MINIMUM = campaign_operator_assay_minimum_from_environment(os.environ)
 if (
     ACQUISITION_MODE is CampaignAcquisitionMode.OPERATOR_STRATIFIED
@@ -290,18 +365,67 @@ if (
     raise ValueError("operator assay minimum exceeds hierarchical proposal minimum")
 
 
-def _calibrated_allocator():
+def _calibrated_allocator(
+    certification_registry: AcquisitionCertifiedSlateContextRegistry | None = None,
+):
+    if NUMERICALLY_CERTIFIED_ACQUISITION:
+        if certification_registry is None:
+            certification_registry = AcquisitionCertifiedSlateContextRegistry()
+        certification_scorer = build_isolated_botorch_qlognehvi_batch_score(
+            python_executable=PINNED_BOTORCH_PYTHON,
+            source_root=AGENT_EVOLVE_ROOT / "src",
+            mc_samples=PROTECTED_ACQUISITION_MC_SAMPLES,
+            maximum_score_batch_size=512,
+            timeout_s=900.0,
+        )
+    else:
+        if certification_registry is not None:
+            raise ValueError(
+                "certification registry requires a numerically certified mode"
+            )
+        certification_scorer = None
     return build_campaign_acquisition_allocator(
         ACQUISITION_MODE,
         common_pool_enabled=_common_pool_enabled(),
         operator_assay_minimum=OPERATOR_ASSAY_MINIMUM,
         family_exposure_phases=(
-            build_terminal_tapered_family_exposure_phases(
+            build_controller_owned_family_exposure_phases(
+                family="composite_r2",
+            )
+            if CONTEXTUAL_SEARCH_ALLOCATION
+            else build_terminal_tapered_family_exposure_phases(
                 family="composite_r2",
                 terminal_wave_index=GENERATION_COUNT - 1,
             )
             if ACQUISITION_MODE is CampaignAcquisitionMode.HORIZON_BOUNDED
             else None
+        ),
+        acquisition_certification_context_provider=certification_registry,
+        acquisition_batch_scorer=certification_scorer,
+        regret_minimum_acquisition_retention_ratio=(
+            1.0
+            if REGRET_BOUNDED_CONTROLS is None
+            else REGRET_BOUNDED_CONTROLS.minimum_acquisition_retention_ratio
+        ),
+        regret_minimum_residual_audit_members=(
+            0
+            if REGRET_BOUNDED_CONTROLS is None
+            else REGRET_BOUNDED_CONTROLS.minimum_residual_audit_members
+        ),
+        regret_future_value_policy=(
+            None
+            if REGRET_BOUNDED_CONTROLS is None
+            else REGRET_BOUNDED_CONTROLS.future_value_policy
+        ),
+        regret_calibration_error_bound=(
+            None
+            if REGRET_BOUNDED_CONTROLS is None
+            else REGRET_BOUNDED_CONTROLS.calibration_error_bound
+        ),
+        regret_allow_development_assay=(
+            False
+            if REGRET_BOUNDED_CONTROLS is None
+            else REGRET_BOUNDED_CONTROLS.allow_development_assay
         ),
     )
 
@@ -329,6 +453,12 @@ def _acquisition_execution_label() -> str:
         CampaignAcquisitionMode.HORIZON_BOUNDED: (
             "horizon_bounded_hierarchical_k8_to_k4"
         ),
+        CampaignAcquisitionMode.ACQUISITION_CERTIFIED: (
+            "acquisition_certified_residual_k8_to_k4"
+        ),
+        CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION: (
+            "regret_bounded_information_k8_to_k4"
+        ),
     }[ACQUISITION_MODE]
 
 
@@ -338,6 +468,155 @@ def _allocation_policy_identity() -> tuple[str, int, str]:
         allocator.policy_id,
         allocator.policy_version,
         allocator.definition_sha256,
+    )
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _selector_policy_binding_valid(result: object) -> bool:
+    """Verify either supported selector receipt without assuming its layout."""
+
+    audit = getattr(result, "supplemental_audit", None)
+    decision = getattr(result, "decision", None)
+    if audit is None or decision is None:
+        return False
+    payload = thaw_json(audit.payload)
+    if type(payload) is not dict:
+        return False
+    if audit.audit_kind == "outcome_conditioned_expert_portfolio":
+        allocation = payload.get("allocation")
+        allocator = (
+            allocation.get("allocator_policy")
+            if type(allocation) is dict
+            else None
+        )
+        global_allocation = payload.get("global_wave_allocation")
+        global_policy = (
+            global_allocation.get("policy")
+            if type(global_allocation) is dict
+            else None
+        )
+        return (
+            payload.get("schema_version") == 2
+            and decision.policy_id == OUTCOME_CONDITIONED_PORTFOLIO_POLICY_ID
+            and decision.policy_version
+            == OUTCOME_CONDITIONED_PORTFOLIO_POLICY_VERSION
+            and payload.get("policy_definition_sha256")
+            == decision.policy_definition_sha256
+            and _is_sha256(decision.policy_definition_sha256)
+            and type(allocator) is dict
+            and type(allocator.get("policy_id")) is str
+            and type(allocator.get("policy_version")) is int
+            and _is_sha256(allocator.get("definition_sha256"))
+            and global_policy
+            == {
+                "policy_id": GLOBAL_WAVE_ACTION_ALLOCATION_POLICY_ID,
+                "policy_version": GLOBAL_WAVE_ACTION_ALLOCATION_POLICY_VERSION,
+                "definition_sha256": (
+                    GLOBAL_WAVE_ACTION_ALLOCATION_POLICY_DEFINITION_SHA256
+                ),
+            }
+        )
+    allocator = payload.get("allocator_policy")
+    policy_id, policy_version, definition_sha256 = _allocation_policy_identity()
+    expected_allocator_identity = {
+        "policy_id": policy_id,
+        "policy_version": policy_version,
+        "definition_sha256": definition_sha256,
+    }
+    if type(allocator) is not dict or {
+        key: allocator.get(key) for key in expected_allocator_identity
+    } != expected_allocator_identity:
+        return False
+    if audit.audit_kind == "acquisition_certified_residual_portfolio_k8_to_k4":
+        allocation = payload.get("allocation")
+        return (
+            payload.get("schema_version") == 5
+            and payload.get("policy_id") == decision.policy_id
+            and payload.get("policy_version") == decision.policy_version
+            and payload.get("policy_definition_sha256")
+            == decision.policy_definition_sha256
+            and _is_sha256(decision.policy_definition_sha256)
+            and type(allocation) is dict
+            and allocation.get("policy_id") == policy_id
+            and allocation.get("policy_version") == policy_version
+            and allocation.get("policy_definition_sha256") == definition_sha256
+            and allocation.get("certificate_scope")
+            == "frozen_strictly_prior_acquisition_not_unseen_outcome"
+        )
+    if audit.audit_kind == "regret_bounded_information_portfolio_k8_to_k4":
+        allocation = payload.get("allocation")
+        return (
+            payload.get("schema_version") == 5
+            and payload.get("policy_id") == decision.policy_id
+            and payload.get("policy_version") == decision.policy_version
+            and payload.get("policy_definition_sha256")
+            == decision.policy_definition_sha256
+            and _is_sha256(decision.policy_definition_sha256)
+            and type(allocation) is dict
+            and allocation.get("schema_version") == 1
+            and allocation.get("policy_id") == policy_id
+            and allocation.get("policy_version") == policy_version
+            and allocation.get("policy_definition_sha256") == definition_sha256
+            and allocation.get("certificate_scope")
+            == "conditional_on_frozen_acquisition_calibration_not_sota"
+            and type(allocation.get("reference_option_ids")) is list
+            and type(allocation.get("selected_option_ids")) is list
+            and type(allocation.get("selected_future_value")) is dict
+        )
+    return allocator == expected_allocator_identity
+
+
+def _candidate_universe_binding_valid(
+    result: object,
+    *,
+    proposal_support_policy: object | None,
+) -> bool:
+    """Verify the active selector's authenticated proposal universe."""
+
+    audit = getattr(result, "supplemental_audit", None)
+    if audit is None:
+        return False
+    payload = thaw_json(audit.payload)
+    if type(payload) is not dict:
+        return False
+    if audit.audit_kind != "outcome_conditioned_expert_portfolio":
+        if proposal_support_policy is None:
+            return "proposal_support" not in payload
+        return payload.get("proposal_support", {}).get("policy") == {
+            "policy_id": proposal_support_policy.policy_id,
+            "policy_version": proposal_support_policy.policy_version,
+            "definition_sha256": proposal_support_policy.definition_sha256,
+        }
+    projection = payload.get("forecast_universe_projection")
+    topology = payload.get("proposal_topology")
+    if type(projection) is not dict or type(topology) is not dict:
+        return False
+    if proposal_support_policy is None:
+        return (
+            projection.get("mode") == "complete_finite_contract"
+            and projection.get("source_contract_sha256")
+            == projection.get("forecast_contract_sha256")
+            and topology.get("source_contract_sha256")
+            == projection.get("source_contract_sha256")
+            and topology.get("proposal_contract_sha256")
+            == projection.get("forecast_contract_sha256")
+        )
+    return (
+        projection.get("mode") == "authenticated_outcome_blind_candidate_pool"
+        and _is_sha256(projection.get("common_candidate_pool_decision_sha256"))
+        and projection.get("outcomes_consulted") is False
+        and projection.get("model_or_provider_fields_consulted") is False
+        and topology.get("source_contract_sha256")
+        == projection.get("source_contract_sha256")
+        and topology.get("proposal_contract_sha256")
+        == projection.get("forecast_contract_sha256")
     )
 
 
@@ -388,8 +667,7 @@ PORTFOLIO_SELECTOR_MODE = os.environ.get(
 )
 if PORTFOLIO_SELECTOR_MODE not in {"calibrated", "outcome_conditioned"}:
     raise ValueError(
-        "AGENT_EVOLVE_PORTFOLIO_SELECTOR_MODE must be calibrated or "
-        "outcome_conditioned"
+        "AGENT_EVOLVE_PORTFOLIO_SELECTOR_MODE must be calibrated or outcome_conditioned"
     )
 _ACTION_FORECAST_BLOCK_ROWS_RAW = os.environ.get(
     "AGENT_EVOLVE_ACTION_FORECAST_BLOCK_ROWS",
@@ -404,10 +682,84 @@ if (
 ACTION_FORECAST_BLOCK_ROWS = int(_ACTION_FORECAST_BLOCK_ROWS_RAW)
 ACTION_FORECAST_PARTITION_DEFINITION_SHA256 = hashlib.sha256(
     b"agent-evolve:generic-campaign-action-forecast-partition:v1;"
-    + f"rows={ACTION_FORECAST_BLOCK_ROWS};cells-per-row=objective-count".encode(
-        "ascii"
-    )
+    + f"rows={ACTION_FORECAST_BLOCK_ROWS};cells-per-row=objective-count".encode("ascii")
 ).hexdigest()
+
+PROTECTED_ACQUISITION_MODE = os.environ.get(
+    "AGENT_EVOLVE_PROTECTED_ACQUISITION_MODE",
+    "off",
+)
+if PROTECTED_ACQUISITION_MODE not in {"off", "botorch_qlognehvi"}:
+    raise ValueError(
+        "AGENT_EVOLVE_PROTECTED_ACQUISITION_MODE must be off or "
+        "botorch_qlognehvi"
+    )
+
+try:
+    RECOMBINATION_EVALUATION_ALLOCATION_MODE = (
+        RecombinationEvaluationAllocationMode(
+            os.environ.get(
+                "AGENT_EVOLVE_RECOMBINATION_EVALUATION_ALLOCATION_MODE",
+                RecombinationEvaluationAllocationMode.NATIVE_THEN_RECOURSE.value,
+            )
+        )
+    )
+except ValueError as error:
+    raise ValueError(
+        "AGENT_EVOLVE_RECOMBINATION_EVALUATION_ALLOCATION_MODE must be "
+        "native_then_recourse or recourse_only"
+    ) from error
+
+
+def _bounded_integer_environment(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = os.environ.get(name, str(default))
+    if not raw.isascii() or not raw.isdigit():
+        raise ValueError(f"{name} must contain decimal digits")
+    value = int(raw)
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must lie in [{minimum}, {maximum}]")
+    return value
+
+
+PROTECTED_ACQUISITION_POOL_SIZE = _bounded_integer_environment(
+    "AGENT_EVOLVE_PROTECTED_ACQUISITION_POOL_SIZE",
+    8192,
+    minimum=16,
+    maximum=65_536,
+)
+PROTECTED_ACQUISITION_BATCH_SIZE = _bounded_integer_environment(
+    "AGENT_EVOLVE_PROTECTED_ACQUISITION_BATCH_SIZE",
+    4,
+    minimum=2,
+    maximum=8,
+)
+PROTECTED_ACQUISITION_SOURCE_MINIMUM = _bounded_integer_environment(
+    "AGENT_EVOLVE_PROTECTED_ACQUISITION_SOURCE_MINIMUM",
+    1,
+    minimum=1,
+    maximum=7,
+)
+PROTECTED_ACQUISITION_MC_SAMPLES = _bounded_integer_environment(
+    "AGENT_EVOLVE_PROTECTED_ACQUISITION_MC_SAMPLES",
+    128,
+    minimum=16,
+    maximum=4096,
+)
+PINNED_BOTORCH_PYTHON = Path(
+    os.environ.get(
+        "AGENT_EVOLVE_BOTORCH_PYTHON",
+        str(
+            WORKSPACE_ROOT
+            / "baselines/agent_evolve_aaai_2027/botorch_env/bin/python"
+        ),
+    )
+)
 CPU_SET = "8"
 EVALUATOR_TIMEOUT_S = 180.0
 AGENT_CONCURRENCY = MODEL_EXECUTION_PROFILE.effective_max_connections(default=3)
@@ -420,6 +772,8 @@ PARTITIONED_RETRY_BUDGET = (
         CampaignAcquisitionMode.HIERARCHICAL_SUPPORT,
         CampaignAcquisitionMode.OPERATOR_STRATIFIED,
         CampaignAcquisitionMode.HORIZON_BOUNDED,
+        CampaignAcquisitionMode.ACQUISITION_CERTIFIED,
+        CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION,
     }
     else None
 )
@@ -432,6 +786,17 @@ CONNECT_TIMEOUT_SECONDS = 90.0
 BASE_BACKOFF_NS = 1_000_000_000
 MAX_BACKOFF_NS = 30_000_000_000
 
+if NUMERICALLY_CERTIFIED_ACQUISITION and (
+    not _common_pool_enabled()
+    or not CONSTRAINT_DECOUPLED_ACQUISITION
+    or PROTECTED_ACQUISITION_MODE != "botorch_qlognehvi"
+    or PROTECTED_ACQUISITION_BATCH_SIZE != 8
+):
+    raise ValueError(
+        "acquisition_certified requires a common pool, constraint-decoupled "
+        "authority, and protected qLogNEHVI batch 8"
+    )
+
 
 class _OutcomeConditionedSelectorAdapter:
     """One-port Timeloop adapter for the generic outcome-aware selector.
@@ -441,21 +806,59 @@ class _OutcomeConditionedSelectorAdapter:
     not receive Timeloop-specific search hints or effect equations.
     """
 
-    policy_definition_sha256 = (
-        OUTCOME_CONDITIONED_PORTFOLIO_POLICY_DEFINITION_SHA256
-    )
+    policy_definition_sha256 = OUTCOME_CONDITIONED_PORTFOLIO_POLICY_DEFINITION_SHA256
     prompt_definition_sha256 = ACTION_FORECAST_POLICY_DEFINITION_SHA256
 
-    def __init__(self, delegate: OutcomeConditionedPortfolioSelectionPolicy) -> None:
+    def __init__(
+        self,
+        delegate: OutcomeConditionedPortfolioSelectionPolicy,
+        audit_artifact_store: Any,
+    ) -> None:
         if type(delegate) is not OutcomeConditionedPortfolioSelectionPolicy:
             raise TypeError("delegate must be the exact outcome-conditioned policy")
         self._delegate = delegate
+        self._audit_artifact_store = audit_artifact_store
 
     async def select(self, request):
         return await self._delegate.select(request)
 
     def render(self, request):
         return self._delegate.render(request)
+
+    def bind_prior_outcome_feedback(
+        self,
+        ledger: PortfolioOutcomeFeedbackLedger,
+        scope: ForecastCalibrationScope,
+    ) -> None:
+        """Bind the generic prior-only consequence expert before execution."""
+
+        if self._delegate.consequence_calibrator is not None:
+            raise RuntimeError("Timeloop selector consequence expert is already bound")
+        self._delegate.consequence_calibrator = (
+            HierarchicalEmpiricalConsequenceCalibrationPolicy(
+                ledger=ledger,
+                scope=scope,
+                audit_artifact_store=self._audit_artifact_store,
+            )
+        )
+
+    def bind_contextual_allocation_provider(self, provider) -> None:
+        """Bind the composer-owned request-local controller contract resolver."""
+
+        if not callable(provider):
+            raise TypeError("contextual allocation provider must be callable")
+        if self._delegate.contextual_allocation_provider is not None:
+            raise RuntimeError("Timeloop contextual provider is already bound")
+        self._delegate.contextual_allocation_provider = provider
+
+    def bind_candidate_pool_provider(self, provider) -> None:
+        """Bind the same outcome-blind common pool used by the base selector."""
+
+        if not callable(provider):
+            raise TypeError("candidate-pool provider must be callable")
+        if self._delegate.candidate_pool_provider is not None:
+            raise RuntimeError("Timeloop candidate-pool provider is already bound")
+        self._delegate.candidate_pool_provider = provider
 
     def decode_selected_predictions(self, scope, wave, result):
         return outcome_conditioned_selected_predictions(
@@ -464,8 +867,134 @@ class _OutcomeConditionedSelectorAdapter:
             result=result,
         )
 
+    def decode_selected_source_ids(self, wave, result):
+        return outcome_conditioned_selected_source_ids(wave=wave, result=result)
 
-def _outcome_conditioned_selector(*, runner: Any, benchmark: Any):
+    def decode_contextual_allocation_realization(self, allocation, wave, result):
+        return outcome_conditioned_contextual_allocation_realization(
+            allocation=allocation,
+            wave=wave,
+            result=result,
+        )
+
+
+def _provider_free_schema_string_enum(
+    schema: dict[str, object],
+    node: object,
+) -> tuple[str, ...]:
+    """Resolve one closed string enum through local JSON-Schema references."""
+
+    if type(schema) is not dict or type(node) is not dict:
+        raise TypeError("provider-free forecast enum schema must be an object")
+    current = node
+    seen: set[str] = set()
+    while "$ref" in current:
+        reference = current["$ref"]
+        if (
+            type(reference) is not str
+            or not reference.startswith("#/")
+            or reference in seen
+        ):
+            raise ValueError("provider-free forecast enum has an invalid local ref")
+        seen.add(reference)
+        resolved: object = schema
+        for raw_token in reference[2:].split("/"):
+            token = raw_token.replace("~1", "/").replace("~0", "~")
+            if type(resolved) is not dict or token not in resolved:
+                raise ValueError("provider-free forecast enum ref does not resolve")
+            resolved = resolved[token]
+        if type(resolved) is not dict:
+            raise TypeError("provider-free forecast enum ref is not an object")
+        current = resolved
+    constant = current.get("const")
+    if constant is not None:
+        if type(constant) is not str or not constant:
+            raise ValueError(
+                "provider-free forecast code schema has a non-string const"
+            )
+        return (constant,)
+    values = current.get("enum")
+    if (
+        type(values) is not list
+        or not values
+        or any(type(value) is not str or not value for value in values)
+    ):
+        raise ValueError("provider-free forecast code schema lacks a string enum")
+    return tuple(values)
+
+
+class _ProviderFreeActionForecastRunner:
+    """Schema-derived neutral forecasts for the exact live selector path."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(self, request):
+        self.calls += 1
+        schema = request.output_type.model_json_schema()
+        properties = schema["properties"]
+        row_count = properties["probability_valid_codes"]["minItems"]
+        metric_count = properties["median_effect_codes"]["items"]["minItems"]
+        # ``n1`` already traverses the exact metric-bound resolver for every
+        # Timeloop objective in this gate.  Vary only toward smaller nonzero
+        # effects: a wider synthetic pattern (for example ``n2``) can leave a
+        # bounded metric's legal transform interval and would test the fake,
+        # not the live selector composition.  Three signatures are enough to
+        # exercise the anti-collapse health gate.
+        effect_codes = ("n1", "n0_5", "n0_25")
+        payload = {
+            "probability_valid_codes": ["p0_8"] * row_count,
+            "median_effect_codes": [
+                [
+                    effect_codes[(row_index + metric_index) % len(effect_codes)]
+                    for metric_index in range(metric_count)
+                ]
+                for row_index in range(row_count)
+            ],
+            "lower_uncertainty_codes": [
+                ["u1"] * metric_count for _ in range(row_count)
+            ],
+            "upper_uncertainty_codes": [
+                ["u1"] * metric_count for _ in range(row_count)
+            ],
+        }
+        if "evidence_slot_codes" in properties:
+            evidence_field = properties["evidence_slot_codes"]
+            if type(evidence_field) is not dict:
+                raise TypeError("evidence-slot field schema must be an object")
+            evidence_rows = evidence_field.get("items")
+            if type(evidence_rows) is not dict:
+                raise TypeError("evidence-slot row schema must be an object")
+            evidence_codes = _provider_free_schema_string_enum(
+                schema,
+                evidence_rows.get("items"),
+            )
+            payload["evidence_slot_codes"] = [
+                [evidence_codes[0]] * metric_count for _ in range(row_count)
+            ]
+        return StructuredGenerationResponse(
+            value=request.output_type.model_validate(payload, strict=True),
+            requested_model="provider-free/action-forecast-double",
+            resolved_model="provider-free/action-forecast-double",
+            resolved_provider="provider-free",
+            provider_response_id=f"provider-free-forecast-{self.calls}",
+            finish_reason="stop",
+            input_tokens=0,
+            output_tokens=0,
+            reasoning_tokens=0,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+            cost_usd=None,
+            latency_ns=0,
+        )
+
+
+def _outcome_conditioned_selector(
+    *,
+    runner: Any,
+    benchmark: Any,
+    audit_artifact_store: Any,
+):
     semantics = benchmark.optimization_semantics
     if semantics is None:
         raise TypeError("Timeloop outcome-conditioned selector requires semantics")
@@ -478,9 +1007,7 @@ def _outcome_conditioned_selector(*, runner: Any, benchmark: Any):
         partition_policy=ActionForecastPartitionPolicyBinding(
             policy_id="generic_campaign_action_forecast_blocks",
             policy_version=1,
-            policy_definition_sha256=(
-                ACTION_FORECAST_PARTITION_DEFINITION_SHA256
-            ),
+            policy_definition_sha256=(ACTION_FORECAST_PARTITION_DEFINITION_SHA256),
             max_rows_per_block=ACTION_FORECAST_BLOCK_ROWS,
             max_metric_cells_per_block=(
                 ACTION_FORECAST_BLOCK_ROWS * len(benchmark.objectives)
@@ -488,11 +1015,15 @@ def _outcome_conditioned_selector(*, runner: Any, benchmark: Any):
         ),
         action_semantics_factory=None,
         metric_projector=None,
+        wave_action_coordinator=BarrierGlobalWaveActionAllocationCoordinator(
+            policy=GlobalRoleBalancedWaveActionAllocationPolicy(),
+            expected_lane_count=2,
+        ),
         risk_aversion=0.5,
         diversity_weight=0.05,
         beam_width=256,
     )
-    return _OutcomeConditionedSelectorAdapter(delegate)
+    return _OutcomeConditionedSelectorAdapter(delegate, audit_artifact_store)
 
 
 _PROTOCOL_IDENTITIES = {
@@ -531,6 +1062,18 @@ _PROTOCOL_IDENTITIES = {
         b"agent-evolve:timeloop-v2-horizon-bounded-g6-protocol:v16;",
         b"agent-evolve:timeloop-v2-horizon-bounded-g6:v16\x00",
         "v16",
+    ),
+    CampaignAcquisitionMode.ACQUISITION_CERTIFIED: (
+        "timeloop_v2_acquisition_certified_residual_g6_v17",
+        b"agent-evolve:timeloop-v2-acquisition-certified-g6-protocol:v17;",
+        b"agent-evolve:timeloop-v2-acquisition-certified-g6:v17\x00",
+        "v17",
+    ),
+    CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION: (
+        "timeloop_v2_regret_bounded_information_g6_v18",
+        b"agent-evolve:timeloop-v2-regret-bounded-information-g6-protocol:v18;",
+        b"agent-evolve:timeloop-v2-regret-bounded-information-g6:v18\x00",
+        "v18",
     ),
 }
 (
@@ -657,7 +1200,9 @@ def _provider_config(replicate_seed: int) -> ProgressAwareOpenRouterConfig:
         supports_forced_tool_choice=(
             MODEL_EXECUTION_PROFILE.supports_forced_tool_choice
         ),
-        retry_mode=(ProgressAwareRetryMode.OPAQUE_HTTP_400_AND_BOUNDED_SCHEMA_REPAIR),
+        retry_mode=(
+            ProgressAwareRetryMode.FIRST_EVENT_RESILIENT_BOUNDED_SCHEMA_REPAIR
+        ),
     )
 
 
@@ -667,6 +1212,117 @@ def _model_profile_sha256() -> str:
 
 def _utility_spec() -> AffineHypervolume3DSpec:
     return timeloop_v2_affine_hypervolume_spec()
+
+
+def _acquisition_objectives() -> tuple[FiniteAcquisitionObjective, ...]:
+    return tuple(
+        sorted(
+            (
+                FiniteAcquisitionObjective(
+                    axis.metric_id,
+                    axis.goal,
+                    float(axis.ideal),
+                    float(axis.reference),
+                )
+                for axis in _utility_spec().axes
+            ),
+            key=lambda value: value.metric_id,
+        )
+    )
+
+
+def _protected_acquisition_envelope(
+    *,
+    benchmark: AgenticBenchmark,
+    panel: object,
+    replicate_seed: int,
+    acquisition_certification_context_sink: (
+        AcquisitionCertifiedSlateContextSink | None
+    ) = None,
+) -> ProtectedFiniteAcquisitionVariationEnvelope | None:
+    """Bind the generic prior-only numerical proposal expert to Timeloop."""
+
+    if PROTECTED_ACQUISITION_MODE == "off":
+        return None
+    if PROTECTED_ACQUISITION_BATCH_SIZE < (
+        2 * PROTECTED_ACQUISITION_SOURCE_MINIMUM
+    ):
+        raise ValueError(
+            "protected acquisition batch cannot satisfy both parent-lane floors"
+        )
+    return ProtectedFiniteAcquisitionVariationEnvelope(
+        objectives=_acquisition_objectives(),
+        space=TimeloopV2FiniteAcquisitionSpace(panel),
+        acquisition=build_isolated_botorch_qlognehvi(
+            python_executable=PINNED_BOTORCH_PYTHON,
+            source_root=AGENT_EVOLVE_ROOT / "src",
+            mc_samples=PROTECTED_ACQUISITION_MC_SAMPLES,
+            maximum_optimizer_batch_size=2048,
+            timeout_s=900.0,
+        ),
+        phenotype_identity=benchmark.phenotype_identity,
+        hard_feasibility=benchmark.hard_feasibility,
+        acquisition_certification_context_sink=(
+            acquisition_certification_context_sink
+        ),
+        pool_size=PROTECTED_ACQUISITION_POOL_SIZE,
+        protected_batch_size=PROTECTED_ACQUISITION_BATCH_SIZE,
+        source_minimum_per_lane=PROTECTED_ACQUISITION_SOURCE_MINIMUM,
+        seed=replicate_seed,
+        source_id="numerical_acquisition",
+        option_family="acquisition",
+        operator_id="global",
+    )
+
+
+def _capacity_recourse(
+    *,
+    benchmark: AgenticBenchmark,
+    composition: object,
+    panel: object,
+    replicate_seed: int,
+) -> FiniteAcquisitionCapacityRecourse:
+    engine = getattr(composition, "engine", None)
+    return FiniteAcquisitionCapacityRecourse(
+        objectives=_acquisition_objectives(),
+        space=TimeloopV2FiniteAcquisitionSpace(panel),
+        acquisition=build_isolated_botorch_qlognehvi(
+            python_executable=PINNED_BOTORCH_PYTHON,
+            source_root=AGENT_EVOLVE_ROOT / "src",
+            mc_samples=PROTECTED_ACQUISITION_MC_SAMPLES,
+            maximum_optimizer_batch_size=2048,
+            timeout_s=900.0,
+        ),
+        phenotype_identity=benchmark.phenotype_identity,
+        engine=engine,
+        hard_feasibility=benchmark.hard_feasibility,
+        pool_size=PROTECTED_ACQUISITION_POOL_SIZE,
+        seed=replicate_seed + 10_000_019,
+    )
+
+
+def _protected_acquisition_config_record() -> dict[str, object]:
+    panel = frozen_network_panel("resnet50")
+    space = TimeloopV2FiniteAcquisitionSpace(panel)
+    return {
+        "mode": PROTECTED_ACQUISITION_MODE,
+        "pool_size": PROTECTED_ACQUISITION_POOL_SIZE,
+        "protected_batch_size": PROTECTED_ACQUISITION_BATCH_SIZE,
+        "source_minimum_per_lane": PROTECTED_ACQUISITION_SOURCE_MINIMUM,
+        "mc_samples": PROTECTED_ACQUISITION_MC_SAMPLES,
+        "space": {
+            "space_id": space.space_id,
+            "space_version": space.space_version,
+            "definition_sha256": space.definition_sha256,
+        },
+        "acquisition_policy": "isolated_botorch_qlognehvi",
+        "recombination_evaluation_allocation_mode": (
+            RECOMBINATION_EVALUATION_ALLOCATION_MODE.value
+        ),
+        "prior_outcomes_only": True,
+        "base_support_preserved": True,
+        "selected_only_exact_phenotype_recourse": True,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -918,15 +1574,56 @@ def _contextual_history_counts_by_cutoff(
     return dict(sorted(result.items(), key=lambda item: int(item[0])))
 
 
-def _g5_memory_path_audit(summary: dict[str, object]) -> dict[str, object]:
-    """Distinguish a realized assay from its valid no-support recourse.
+def _prior_only_contextual_feedback_gate(
+    contextual_histories: list[dict[str, object]],
+    contextual_by_cutoff: dict[str, list[int]],
+) -> bool:
+    """Validate honest prior transport without requiring invented lineage data.
+
+    A recourse-only transition can promote a fresh acquisition lineage with no
+    same-parent or direct-lineage mutation history.  Zero actions for that lane
+    is the correct outcome because cross-lineage analogies are disabled.  The
+    gate therefore requires evidence to reach each later *cutoff*, while the
+    legacy native transition retains the stronger per-lane requirement.
+    """
+
+    if list(contextual_by_cutoff) != ["1", "3", "5"]:
+        return False
+    if not all(
+        len(value) == PARENTS_PER_PORTFOLIO
+        for value in contextual_by_cutoff.values()
+    ):
+        return False
+    if contextual_by_cutoff["1"] != [0, 0]:
+        return False
+    later = (contextual_by_cutoff["3"], contextual_by_cutoff["5"])
+    if RECOMBINATION_EVALUATION_ALLOCATION_MODE is (
+        RecombinationEvaluationAllocationMode.RECOURSE_ONLY
+    ):
+        reaches_later = all(any(value > 0 for value in values) for values in later)
+    else:
+        reaches_later = all(value > 0 for values in later for value in values)
+    return reaches_later and all(
+        action["wave_index"] < history["cutoff_wave_index_exclusive"]
+        for history in contextual_histories
+        for action in history["actions"]
+    )
+
+
+def _g5_memory_path_audit(
+    summary: dict[str, object],
+    *,
+    reflection_receipts: tuple[CampaignReflectionReceipt, ...],
+) -> dict[str, object]:
+    """Authenticate the mutually exclusive E0 and E1 reflection paths.
 
     Reflection-derived cards are admitted only when one card is compatible
     with both parent-local finite contracts.  That eligibility is necessarily
     data dependent: a healthy campaign may either randomize the admitted card
-    over active/neutral lanes or emit the typed no-yield recourse.  Only the
-    first path realizes the memory estimand, but both paths are valid workflow
-    outcomes when their downstream evidence is internally consistent.
+    over active/neutral lanes, emit the typed no-yield recourse, or abstain at
+    evidence tier E0 before any reflection provider call.  Only the first path
+    realizes the memory estimand.  All three are healthy workflow outcomes
+    when their receipts and downstream non-exposure evidence agree exactly.
     """
 
     resolutions = summary["matched_memory_support_resolutions"]
@@ -940,6 +1637,45 @@ def _g5_memory_path_audit(summary: dict[str, object]) -> dict[str, object]:
     outcomes = preparation["matched_memory_control_outcomes"]
     if type(outcomes) is not list:
         raise TypeError("matched memory control outcomes must be a list")
+
+    if type(reflection_receipts) is not tuple or any(
+        type(value) is not CampaignReflectionReceipt
+        for value in reflection_receipts
+    ):
+        raise TypeError("reflection_receipts must contain exact receipts")
+    abstained_receipts = tuple(
+        value
+        for value in reflection_receipts
+        if value.status is CampaignReflectionStatus.ABSTAINED
+    )
+    completed_receipts = tuple(
+        value
+        for value in reflection_receipts
+        if value.status is CampaignReflectionStatus.COMPLETED
+    )
+    failed_receipts = tuple(
+        value
+        for value in reflection_receipts
+        if value.status is CampaignReflectionStatus.FAILED
+    )
+    typed_e0_receipt = len(abstained_receipts) == 1
+    if typed_e0_receipt:
+        abstention = thaw_json(abstained_receipts[0].quarantined_result)
+        typed_e0_receipt = (
+            abstention.get("status")
+            == "abstained_no_identifiable_mutation_evidence"
+            and abstention.get("evidence_tier") == "e0"
+            and abstention.get("provider_calls") == 0
+            and abstention.get("publishable_reflection_content") is False
+            and abstention.get("learning_registration_permitted") is False
+            and abstention.get("test_admission_permitted") is False
+        )
+    exactly_one_e1_receipt = (
+        len(completed_receipts) == 1
+        and not abstained_receipts
+        and not failed_receipts
+        and len(reflection_receipts) == 1
+    )
 
     active_neutral_realized = (
         summary["memory_trials"] == 0
@@ -970,29 +1706,239 @@ def _g5_memory_path_audit(summary: dict[str, object]) -> dict[str, object]:
         and preparation["projection"] is None
         and outcomes == []
     )
+    e1_reflection_publication_valid = (
+        exactly_one_e1_receipt
+        and summary["reflection_generations"] == [2]
+        and summary["canonical_reflection_records"] == 1
+    )
+    typed_e0_memory_free_recourse = (
+        typed_e0_receipt
+        and not completed_receipts
+        and not failed_receipts
+        and len(reflection_receipts) == 1
+        and summary["reflection_generations"] == []
+        and summary["canonical_reflection_records"] == 0
+        and summary["memory_trials"] == 0
+        and summary["bounded_g5_dose_request_count"] == 0
+        and summary["bounded_g5_dose_result_count"] == 0
+        and resolutions == []
+        and plans == []
+        and summary["typed_recourse_receipts"] == 0
+        and summary["diagnostic_cohort_selections"] == []
+        and summary["diagnostic_memory_blocks"] == []
+        and summary["memory_lifecycle_transitions"] == []
+        and preparation["projection"] is None
+        and outcomes == []
+    )
+    e1_memory_path_valid = e1_reflection_publication_valid and (
+        active_neutral_realized or typed_no_shared_support_recourse
+    )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "reflection_receipt_count": len(reflection_receipts),
+        "completed_reflection_receipt_count": len(completed_receipts),
+        "abstained_reflection_receipt_count": len(abstained_receipts),
+        "failed_reflection_receipt_count": len(failed_receipts),
+        "typed_e0_receipt_authenticated": typed_e0_receipt,
+        "e1_reflection_publication_valid": e1_reflection_publication_valid,
         "active_neutral_assay_realized": active_neutral_realized,
         "typed_no_shared_support_recourse_realized": (typed_no_shared_support_recourse),
-        "workflow_path_valid": (
-            active_neutral_realized or typed_no_shared_support_recourse
+        "typed_e0_memory_free_recourse_realized": typed_e0_memory_free_recourse,
+        "reflection_path_valid": (
+            e1_reflection_publication_valid or typed_e0_receipt
+        ),
+        "workflow_path_valid": e1_memory_path_valid or typed_e0_memory_free_recourse,
+        "expected_physical_reflection_provider_calls": (
+            1 if e1_reflection_publication_valid else 0
         ),
         "memory_effect_claim_available": active_neutral_realized,
     }
 
 
+def _capacity_recourse_stage_records(run: object) -> list[dict[str, object]]:
+    """Project compact, authenticated capacity evidence from stage receipts."""
+
+    execution = getattr(run, "execution", None)
+    receipts = getattr(execution, "stage_receipts", None)
+    if type(receipts) is not tuple:
+        raise TypeError("campaign run lacks exact stage receipts")
+    records: list[dict[str, object]] = []
+    for receipt in receipts:
+        if receipt.kind.value != "recombination":
+            continue
+        result = thaw_json(receipt.result)
+        if type(result) is not dict or type(result.get("capacity")) is not dict:
+            raise TypeError("recombination receipt lacks capacity evidence")
+        capacity = result["capacity"]
+        recourse = capacity.get("recourse_result")
+        recourse_policy = None
+        recourse_result_sha256 = None
+        selected_configuration_sha256s: list[str] = []
+        hard_feasibility = None
+        if recourse is not None:
+            if type(recourse) is not dict:
+                raise TypeError("capacity recourse result must be an object")
+            policy = recourse.get("policy")
+            evidence = recourse.get("evidence")
+            candidates = recourse.get("candidates")
+            if (
+                type(policy) is not dict
+                or type(evidence) is not dict
+                or type(candidates) is not list
+            ):
+                raise TypeError("capacity recourse evidence is malformed")
+            recourse_policy = policy
+            recourse_result_sha256 = recourse.get("result_sha256")
+            selected = evidence.get("selected_configuration_sha256s")
+            hard_feasibility = evidence.get("hard_feasibility")
+            if type(selected) is not list or type(hard_feasibility) is not dict:
+                raise TypeError("capacity recourse omits compact screening evidence")
+            selected_configuration_sha256s = selected
+        records.append(
+            {
+                "generation": receipt.generation,
+                "allocation_mode": capacity.get("allocation_mode"),
+                "native_wave_count": capacity.get("native_wave_count"),
+                "native_wave_evaluation_suppressed": capacity.get(
+                    "native_wave_evaluation_suppressed"
+                ),
+                "planned_candidate_occurrences": capacity.get(
+                    "planned_candidate_occurrences"
+                ),
+                "recombination_candidate_occurrences": capacity.get(
+                    "recombination_candidate_occurrences"
+                ),
+                "missing_candidate_occurrences": capacity.get(
+                    "missing_candidate_occurrences"
+                ),
+                "recourse_enabled": capacity.get("recourse_enabled"),
+                "recourse_candidate_occurrences": capacity.get(
+                    "recourse_candidate_occurrences"
+                ),
+                "realized_candidate_occurrences": capacity.get(
+                    "realized_candidate_occurrences"
+                ),
+                "capacity_complete": capacity.get("capacity_complete"),
+                "recourse_policy": recourse_policy,
+                "recourse_result_sha256": recourse_result_sha256,
+                "selected_configuration_sha256s": (
+                    selected_configuration_sha256s
+                ),
+                "hard_feasibility": hard_feasibility,
+            }
+        )
+    return records
+
+
+def _anchor_residual_identification_assessment(stage_receipts: tuple):
+    """Bind the generic receipt audit to this campaign's frozen dimensions."""
+
+    if (
+        REGRET_BOUNDED_CONTROLS is None
+        or REGRET_BOUNDED_CONTROLS.minimum_residual_audit_members == 0
+    ):
+        return None
+    minimum = REGRET_BOUNDED_CONTROLS.minimum_residual_audit_members
+    return AnchorResidualIdentificationContract(
+        expected_selector_calls=(
+            PARENTS_PER_PORTFOLIO * len(PORTFOLIO_GENERATIONS)
+        ),
+        portfolio_width=PORTFOLIO_WIDTH,
+        minimum_residual_members=minimum,
+        exact_residual_members=minimum,
+    ).assess(project_anchor_residual_selection_audits(stage_receipts))
+
+
+def _capacity_allocation_record_matches_preregistered_mode(
+    value: dict[str, object],
+) -> bool:
+    expected = RECOMBINATION_EVALUATION_ALLOCATION_MODE
+    common = (
+        value.get("allocation_mode") == expected.value
+        and value.get("native_wave_count") == PARENTS_PER_PORTFOLIO
+        and value.get("native_wave_evaluation_suppressed")
+        is (expected is RecombinationEvaluationAllocationMode.RECOURSE_ONLY)
+    )
+    if expected is RecombinationEvaluationAllocationMode.NATIVE_THEN_RECOURSE:
+        return common
+    return (
+        common
+        and value.get("recombination_candidate_occurrences") == 0
+        and value.get("recourse_candidate_occurrences")
+        == value.get("planned_candidate_occurrences")
+    )
+
+
 def _construction_probe(replicate_seed: int) -> dict[str, object]:
+    # Exercise the exact live composition in one provider-free campaign.  The
+    # previous probe ran the protected numerical envelope and the
+    # outcome-conditioned selector in separate campaigns.  Both components
+    # could therefore pass while their composition changed the screened action
+    # support or failed at runtime.  Sharing the same runner also makes the
+    # forecast-call count an exact witness for the composed path.
+    outcome_runner = _ProviderFreeActionForecastRunner()
     utility = AffineHypervolumeArchiveUtility3D(_utility_spec())
+    certification_registry = (
+        AcquisitionCertifiedSlateContextRegistry()
+        if NUMERICALLY_CERTIFIED_ACQUISITION
+        else None
+    )
+    allocator = _calibrated_allocator(certification_registry)
     run = run_provider_free_timeloop_campaign(
         outer_seed=replicate_seed,
         id_namespace=_id_namespace(replicate_seed),
         max_output_tokens=MAX_OUTPUT_TOKENS,
         temperature=TEMPERATURE,
-        calibrated_allocator=_calibrated_allocator(),
+        calibrated_allocator=allocator,
         archive_utility=utility,
         recombination_utility_binder=_RecombinationUtilityBinder(utility),
+        variation_envelope_factory=(
+            None
+            if PROTECTED_ACQUISITION_MODE == "off"
+            else lambda benchmark: _protected_acquisition_envelope(
+                benchmark=benchmark,
+                panel=frozen_network_panel("resnet50"),
+                replicate_seed=replicate_seed,
+                acquisition_certification_context_sink=certification_registry,
+            )
+        ),
+        capacity_recourse_factory=(
+            None
+            if PROTECTED_ACQUISITION_MODE == "off"
+            else lambda benchmark, composition: _capacity_recourse(
+                benchmark=benchmark,
+                composition=composition,
+                panel=frozen_network_panel("resnet50"),
+                replicate_seed=replicate_seed,
+            )
+        ),
+        recombination_evaluation_allocation_mode=(
+            RECOMBINATION_EVALUATION_ALLOCATION_MODE
+        ),
+        portfolio_selector_override_factory=(
+            None
+            if PORTFOLIO_SELECTOR_MODE != "outcome_conditioned"
+            else lambda benchmark: _outcome_conditioned_selector(
+                runner=outcome_runner,
+                benchmark=benchmark,
+                audit_artifact_store=InMemoryArtifactStore(),
+            )
+        ),
+        contextual_incumbent_source_id=(
+            PROTECTED_ACQUISITION_SOURCE_ID
+            if PROTECTED_ACQUISITION_MODE != "off"
+            else "primary"
+        ),
     )
     summary = run.summary()
+    outcome_summary = summary
+    protected_source_counts = [
+        sum(
+            finite_variation_source_id(option) == "numerical_acquisition"
+            for option in request.finite_variation_contract.options
+        )
+        for request, _ in run.selector.results
+    ]
     contextual_histories = [
         thaw_json(request.context)["campaign_contextual_history"]
         for request, _ in run.selector.results
@@ -1003,30 +1949,72 @@ def _construction_probe(replicate_seed: int) -> dict[str, object]:
     ]
     contextual_counts = [len(value["actions"]) for value in contextual_histories]
     contextual_by_cutoff = _contextual_history_counts_by_cutoff(contextual_histories)
-    memory_path_audit = _g5_memory_path_audit(summary)
+    memory_path_audit = _g5_memory_path_audit(
+        summary,
+        reflection_receipts=run.execution.reflection_receipts,
+    )
     expected_proposal_support = _proposal_support_policy()
-    proposal_support_policy_bound = all(
-        result.supplemental_audit is not None
-        and (
-            ("proposal_support" not in thaw_json(result.supplemental_audit.payload))
-            if expected_proposal_support is None
-            else (
-                thaw_json(result.supplemental_audit.payload)
-                .get("proposal_support", {})
-                .get("policy")
-                == {
-                    "policy_id": expected_proposal_support.policy_id,
-                    "policy_version": expected_proposal_support.policy_version,
-                    "definition_sha256": (expected_proposal_support.definition_sha256),
-                }
-            )
+    candidate_universe_policy_bound = all(
+        _candidate_universe_binding_valid(
+            result,
+            proposal_support_policy=expected_proposal_support,
         )
         for _, result in run.selector.results
     )
+    stage_occurrences = tuple(
+        value.candidate_occurrence_count for value in run.execution.stage_receipts
+    )
+    recombination_occurrences = tuple(
+        value.candidate_occurrence_count
+        for value in run.execution.stage_receipts
+        if value.kind.value == "recombination"
+    )
+    capacity_recourse_stages = _capacity_recourse_stage_records(run)
+    anchor_residual_identification = _anchor_residual_identification_assessment(
+        run.execution.stage_receipts
+    )
+    active_selector_runner_calls = (
+        outcome_runner.calls
+        if PORTFOLIO_SELECTOR_MODE == "outcome_conditioned"
+        else getattr(run.calibrated_runner, "calls", None)
+    )
     gates = {
         "six_generations": summary["generations_completed"] == GENERATION_COUNT,
-        "planned_candidate_occurrences_exact": (
-            summary["candidate_occurrences"] == PLANNED_CANDIDATE_OCCURRENCES
+        "candidate_occurrence_capacity_envelope_respected": (
+            MANDATORY_CANDIDATE_OCCURRENCES
+            <= summary["candidate_occurrences"]
+            <= PLANNED_CANDIDATE_OCCURRENCES
+        ),
+        "typed_recombination_capacity_accounted": (
+            len(recombination_occurrences) == len(RECOMBINATION_GENERATIONS)
+            and sum(recombination_occurrences)
+            == summary["candidate_occurrences"] - MANDATORY_CANDIDATE_OCCURRENCES
+            and all(
+                0
+                <= value
+                <= PARENTS_PER_PORTFOLIO * RECOMBINATIONS_PER_PARENT
+                for value in recombination_occurrences
+            )
+            and sum(recombination_occurrences) > 0
+        ),
+        "capacity_complete_recombination_stages": (
+            PROTECTED_ACQUISITION_MODE == "off"
+            or (
+                len(capacity_recourse_stages) == len(RECOMBINATION_GENERATIONS)
+                and all(
+                    value["capacity_complete"] is True
+                    and value["realized_candidate_occurrences"]
+                    == value["planned_candidate_occurrences"]
+                    for value in capacity_recourse_stages
+                )
+            )
+        ),
+        "recombination_allocation_mode_exact": (
+            len(capacity_recourse_stages) == len(RECOMBINATION_GENERATIONS)
+            and all(
+                _capacity_allocation_record_matches_preregistered_mode(value)
+                for value in capacity_recourse_stages
+            )
         ),
         "seven_logical_calls": summary["logical_agent_calls"] == PLANNED_LOGICAL_CALLS,
         "six_k8_selector_calls": (
@@ -1034,10 +2022,12 @@ def _construction_probe(replicate_seed: int) -> dict[str, object]:
             and summary["k8_typed_proposals"] == 6
             and summary["direct_portfolio_selections"] == 0
         ),
-        "one_g2_reflection": summary["reflection_generations"] == [2],
-        "canonical_reflection_replays": summary["canonical_reflection_records"] == 1,
-        "g5_memory_path_typed_and_audited": memory_path_audit["workflow_path_valid"]
-        is True,
+        "reflection_evidence_path_authenticated": (
+            memory_path_audit["reflection_path_valid"] is True
+        ),
+        "reflection_memory_path_typed_and_audited": (
+            memory_path_audit["workflow_path_valid"] is True
+        ),
         "authenticated_mutation_observation_count_exact": (
             summary["authenticated_action_observations"] == 6 * PORTFOLIO_WIDTH
         ),
@@ -1046,28 +2036,29 @@ def _construction_probe(replicate_seed: int) -> dict[str, object]:
             and summary["forecast_calibration_observations"] == 6 * PORTFOLIO_WIDTH * 3
         ),
         "prior_only_contextual_feedback_reaches_later_waves": (
-            contextual_counts[:2] == [0, 0]
-            and all(value > 0 for value in contextual_counts[2:])
-            and list(contextual_by_cutoff) == ["1", "3", "5"]
-            and all(
-                action["wave_index"] < history["cutoff_wave_index_exclusive"]
-                for history in contextual_histories
-                for action in history["actions"]
+            _prior_only_contextual_feedback_gate(
+                contextual_histories,
+                contextual_by_cutoff,
             )
         ),
         "provider_and_docker_free": (
             summary["provider_calls"] == 0 and summary["docker_calls"] == 0
         ),
-        "full_support_policy_bound": all(
-            result.supplemental_audit is not None
-            and thaw_json(result.supplemental_audit.payload)["allocator_policy"][
-                "definition_sha256"
-            ]
-            == _allocation_policy_identity()[2]
+        "active_selector_live_scope_path_provider_free": (
+            outcome_summary["generations_completed"] == GENERATION_COUNT
+            and outcome_summary["selector_calls"]
+            == PARENTS_PER_PORTFOLIO * len(PORTFOLIO_GENERATIONS)
+            and outcome_summary["provider_calls"] == 0
+            and outcome_summary["docker_calls"] == 0
+            and type(active_selector_runner_calls) is int
+            and active_selector_runner_calls > 0
+        ),
+        "active_selector_policy_bound": all(
+            _selector_policy_binding_valid(result)
             for _, result in run.selector.results
         ),
         "proposal_support_policy_bound_when_configured": (
-            proposal_support_policy_bound
+            candidate_universe_policy_bound
         ),
         "archive_context_arm_exact": (
             all(value is None for value in archive_contexts)
@@ -1087,13 +2078,44 @@ def _construction_probe(replicate_seed: int) -> dict[str, object]:
                 for value in archive_contexts
             )
         ),
+        "protected_acquisition_composed_every_selector_request": (
+            PROTECTED_ACQUISITION_MODE == "off"
+            or (
+                len(protected_source_counts) == 6
+                and all(value >= 1 for value in protected_source_counts)
+            )
+        ),
     }
+    if anchor_residual_identification is not None:
+        gates.update(
+            {
+                f"anchor_residual_{name}": passed
+                for name, passed in anchor_residual_identification.gates.items()
+            }
+        )
     return {
         "schema_version": 1,
         "replicate_seed": replicate_seed,
         "all_gates_pass": all(gates.values()),
         "gates": gates,
         "summary": summary,
+        "outcome_conditioned_scope_probe": {
+            "summary": outcome_summary,
+            "forecast_runner_calls": active_selector_runner_calls,
+            "active_selector_runner": (
+                "outcome_conditioned_forecast_runner"
+                if PORTFOLIO_SELECTOR_MODE == "outcome_conditioned"
+                else "calibrated_residual_proposal_runner"
+            ),
+        },
+        "stage_candidate_occurrences": list(stage_occurrences),
+        "recombination_candidate_occurrences": list(recombination_occurrences),
+        "capacity_recourse_stages": capacity_recourse_stages,
+        "anchor_residual_identification": (
+            None
+            if anchor_residual_identification is None
+            else anchor_residual_identification.to_record()
+        ),
         "contextual_history_action_counts": contextual_counts,
         "contextual_history_action_counts_by_cutoff": contextual_by_cutoff,
         "g5_memory_path_audit": memory_path_audit,
@@ -1113,6 +2135,12 @@ def _construction_probe(replicate_seed: int) -> dict[str, object]:
             )
             for value in archive_contexts
         ],
+        "protected_acquisition": {
+            "configuration": _protected_acquisition_config_record(),
+            "numerical_option_counts_by_selector_request": (
+                protected_source_counts
+            ),
+        },
         "selection_decisions": [
             {
                 "request_sha256": request.request_sha256,
@@ -1142,6 +2170,338 @@ def _construction_probe(replicate_seed: int) -> dict[str, object]:
     }
 
 
+def _construction_probe_contract(probe: dict[str, object]) -> dict[str, object]:
+    """Project a probe onto reproducible health and construction evidence.
+
+    The auxiliary outcome-conditioned assay creates fresh candidate occurrence
+    identifiers.  Their internally authenticated receipts are valuable inside
+    one run but cannot be byte-identical between prepare and live executions.
+    Bind the deterministic health evidence and policy identities, excluding
+    bulky candidate transcripts and their fresh occurrence identifiers.
+
+    The full probe remains an immutable run artifact.  Preregistration needs a
+    compact *contract* that can be reproduced before credential access in both
+    ``prepare`` and ``live``.  Copying the multi-megabyte selection transcript
+    into that contract is both semantically wrong (occurrence identifiers are
+    intentionally fresh) and exceeds the bounded typed-JSON trust boundary.
+    """
+
+    if type(probe) is not dict:
+        raise TypeError("construction probe must be an exact object")
+    scope = probe.get("outcome_conditioned_scope_probe")
+    if type(scope) is not dict:
+        raise TypeError("construction probe is missing its outcome scope")
+    summary = scope.get("summary")
+    if type(summary) is not dict:
+        raise TypeError("outcome scope is missing its summary")
+    stable_summary_fields = (
+        "status",
+        "execution_mode",
+        "scientific_claim",
+        "generations_completed",
+        "candidate_occurrences",
+        "planned_candidate_occurrences",
+        "unique_evaluations",
+        "physical_evaluator_calls",
+        "evaluator_calls",
+        "provider_calls",
+        "docker_calls",
+        "logical_agent_calls",
+        "selector_calls",
+        "canonical_reflection_records",
+        "outcome_feedback_receipts",
+        "forecast_calibration_observations",
+        "authenticated_action_observations",
+        "bounded_g5_dose_request_count",
+        "bounded_g5_dose_result_count",
+        "bounded_g5_dose_assessments_pass",
+        "typed_recourse_receipts",
+    )
+    missing = tuple(name for name in stable_summary_fields if name not in summary)
+    if missing:
+        raise ValueError(f"outcome scope lacks stable fields: {missing!r}")
+    top_summary = probe.get("summary")
+    if type(top_summary) is not dict:
+        raise TypeError("construction probe is missing its top-level summary")
+    top_missing = tuple(
+        name for name in stable_summary_fields if name not in top_summary
+    )
+    if top_missing:
+        raise ValueError(f"construction probe lacks stable fields: {top_missing!r}")
+
+    decisions = probe.get("selection_decisions")
+    if type(decisions) is not list:
+        raise TypeError("construction probe selection decisions must be an array")
+    selection_construction: list[dict[str, object]] = []
+    for index, entry in enumerate(decisions):
+        if type(entry) is not dict:
+            raise TypeError(f"selection decision {index} must be an exact object")
+        decision = entry.get("decision")
+        supplemental = entry.get("supplemental_audit")
+        if type(decision) is not dict or type(supplemental) is not dict:
+            raise TypeError(f"selection decision {index} lacks its audit records")
+        members = decision.get("members")
+        payload = supplemental.get("payload")
+        if type(members) is not list or type(payload) is not dict:
+            raise TypeError(f"selection decision {index} has malformed payload")
+        audit_kind = supplemental.get("audit_kind")
+        if audit_kind in {
+            "acquisition_certified_residual_portfolio_k8_to_k4",
+            "regret_bounded_information_portfolio_k8_to_k4",
+        }:
+            allocator_policy = payload.get("allocator_policy")
+            allocation = payload.get("allocation")
+            original = payload.get("original_k8_response")
+            resolved = payload.get("resolved_k4_decision")
+            common_pool = payload.get("common_candidate_pool")
+            invariants = payload.get("invariants")
+            selected_role_join = payload.get("selected_role_join")
+            if not all(
+                type(value) is dict
+                for value in (
+                    allocator_policy,
+                    allocation,
+                    original,
+                    resolved,
+                    common_pool,
+                    invariants,
+                )
+            ) or type(selected_role_join) is not list:
+                raise TypeError(
+                    f"selection decision {index} lacks certified construction evidence"
+                )
+            original_members = original.get("members")
+            resolved_members = resolved.get("members")
+            pool_option_ids = common_pool.get("option_ids")
+            required_option_ids = common_pool.get("required_option_ids")
+            pool_state = common_pool.get("state")
+            if (
+                type(original_members) is not list
+                or type(resolved_members) is not list
+                or type(pool_option_ids) is not list
+                or type(required_option_ids) is not list
+                or type(pool_state) is not dict
+            ):
+                raise TypeError(
+                    f"selection decision {index} has malformed certified cardinality evidence"
+                )
+            wave_index = pool_state.get("wave_index")
+            if type(wave_index) is not int or wave_index < 1:
+                raise TypeError(
+                    f"selection decision {index} lacks a certified wave index"
+                )
+            selection_construction.append(
+                {
+                    "member_count": len(members),
+                    "policy_id": decision.get("policy_id"),
+                    "policy_version": decision.get("policy_version"),
+                    "audit_kind": audit_kind,
+                    "audit_schema_version": payload.get("schema_version"),
+                    "wave_index": wave_index,
+                    "campaign_generation": wave_index,
+                    "portfolio_generation_ordinal": (wave_index + 1) // 2,
+                    "proposal_member_count": len(original_members),
+                    "resolved_member_count": len(resolved_members),
+                    "selected_role_join_count": len(selected_role_join),
+                    "candidate_pool_option_count": len(pool_option_ids),
+                    "candidate_pool_required_option_count": len(
+                        required_option_ids
+                    ),
+                    "allocator_policy": {
+                        "policy_id": allocator_policy.get("policy_id"),
+                        "policy_version": allocator_policy.get("policy_version"),
+                        "definition_sha256": allocator_policy.get(
+                            "definition_sha256"
+                        ),
+                    },
+                    "allocation_policy": {
+                        "policy_id": allocation.get("policy_id"),
+                        "policy_version": allocation.get("policy_version"),
+                        "definition_sha256": allocation.get(
+                            "policy_definition_sha256"
+                        ),
+                    },
+                    "reference_member_count": allocation.get(
+                        "reference_member_count"
+                    ),
+                    "feasible_slate_count": allocation.get(
+                        "feasible_slate_count"
+                    ),
+                    "certificate_margin_hex": allocation.get(
+                        "certificate_margin_hex"
+                    ),
+                    "acquisition_regret_hex": allocation.get(
+                        "acquisition_regret_hex"
+                    ),
+                    "acquisition_retention_ratio_hex": allocation.get(
+                        "acquisition_retention_ratio_hex"
+                    ),
+                    "minimum_acquisition_retention_ratio_hex": allocation.get(
+                        "minimum_acquisition_retention_ratio_hex"
+                    ),
+                    "minimum_residual_audit_members": allocation.get(
+                        "minimum_residual_audit_members"
+                    ),
+                    "selected_residual_member_count": allocation.get(
+                        "selected_residual_member_count"
+                    ),
+                    "admissible_slate_count": allocation.get(
+                        "admissible_slate_count"
+                    ),
+                    "selected_broker_value_hex": allocation.get(
+                        "selected_broker_value_hex"
+                    ),
+                    "selected_future_value_authority": (
+                        allocation.get("selected_future_value", {}).get(
+                            "authority"
+                        )
+                        if type(allocation.get("selected_future_value")) is dict
+                        else None
+                    ),
+                    "conditional_return_gap_lower_bound_hex": allocation.get(
+                        "conditional_return_gap_lower_bound_hex"
+                    ),
+                    "certificate_scope": allocation.get("certificate_scope"),
+                    "prior_only": invariants.get("prior_only"),
+                    "only_selected_k4_reaches_evaluator": invariants.get(
+                        "only_selected_k4_reaches_evaluator"
+                    ),
+                }
+            )
+            continue
+        phase = payload.get("phase")
+        allocation = payload.get("allocation")
+        global_wave = payload.get("global_wave_allocation")
+        forecast_projection = payload.get("forecast_universe_projection")
+        required_option_ids = payload.get("required_option_ids")
+        if (
+            type(phase) is not dict
+            or type(allocation) is not dict
+            or type(global_wave) is not dict
+            or type(forecast_projection) is not dict
+            or type(required_option_ids) is not list
+        ):
+            raise TypeError(f"selection decision {index} lacks construction evidence")
+        allocator_policy = allocation.get("allocator_policy")
+        global_policy = global_wave.get("policy")
+        if type(allocator_policy) is not dict or type(global_policy) is not dict:
+            raise TypeError(f"selection decision {index} lacks policy identities")
+        selection_construction.append(
+            {
+                "member_count": len(members),
+                "policy_id": decision.get("policy_id"),
+                "policy_version": decision.get("policy_version"),
+                "audit_kind": supplemental.get("audit_kind"),
+                "audit_schema_version": payload.get("schema_version"),
+                "campaign_generation": phase.get("campaign_generation"),
+                "portfolio_generation_ordinal": phase.get(
+                    "portfolio_generation_ordinal"
+                ),
+                "remaining_portfolio_generations": phase.get(
+                    "remaining_portfolio_generations"
+                ),
+                "current_or_future_outcomes_consulted": phase.get(
+                    "current_or_future_outcomes_consulted"
+                ),
+                "evidence_mode": payload.get("evidence_mode"),
+                "physical_call_count": payload.get("physical_call_count"),
+                "required_option_count": len(required_option_ids),
+                "allocator_policy": allocator_policy,
+                "global_wave_policy": global_policy,
+                "forecast_universe_mode": forecast_projection.get("mode"),
+                "forecast_outcomes_consulted": forecast_projection.get(
+                    "outcomes_consulted"
+                ),
+            }
+        )
+
+    stable_top_level_fields = (
+        "schema_version",
+        "replicate_seed",
+        "all_gates_pass",
+        "gates",
+        "archive_context_projections",
+        "contextual_history_action_counts",
+        "contextual_history_action_counts_by_cutoff",
+        "g5_memory_path_audit",
+        "method",
+        "protected_acquisition",
+        "stage_candidate_occurrences",
+        "recombination_candidate_occurrences",
+        "capacity_recourse_stages",
+        "anchor_residual_identification",
+    )
+    absent = tuple(name for name in stable_top_level_fields if name not in probe)
+    if absent:
+        raise ValueError(f"construction probe lacks contract fields: {absent!r}")
+    return {
+        **{name: probe[name] for name in stable_top_level_fields},
+        "stable_summary": {
+            name: top_summary[name] for name in stable_summary_fields
+        },
+        "selection_construction": selection_construction,
+        "outcome_conditioned_scope_probe": {
+            "forecast_runner_calls": scope.get("forecast_runner_calls"),
+            "stable_summary": {
+                name: summary[name] for name in stable_summary_fields
+            },
+            "ephemeral_candidate_receipts_bound": False,
+        },
+    }
+
+
+def _experiment_profile_preregistration_fields(
+    probe: dict[str, object],
+) -> dict[str, object]:
+    """Expose the shared method identity at the Timeloop launch boundary.
+
+    The construction-probe digest already authenticates these records
+    transitively.  Publishing them directly makes cross-workload conformance
+    inspectable without reconstructing a multi-megabyte probe and prevents a
+    Timeloop result from being mistaken for the shared reference method when
+    its profile is absent or unhealthy.
+    """
+
+    if type(probe) is not dict:
+        raise TypeError("construction probe must be an exact object")
+    summary = probe.get("summary")
+    if type(summary) is not dict:
+        raise TypeError("construction probe is missing its campaign summary")
+    profile = summary.get("experiment_profile")
+    conformance = summary.get("experiment_profile_conformance")
+    if type(profile) is not dict:
+        raise TypeError("construction probe lacks an exact experiment profile")
+    if type(conformance) is not dict:
+        raise TypeError("construction probe lacks exact profile conformance")
+    if conformance.get("pass") is not True:
+        raise ValueError("construction probe experiment profile is not conformant")
+    method_definition_sha256 = profile.get("method_definition_sha256")
+    experiment_definition_sha256 = profile.get("experiment_definition_sha256")
+    if (
+        type(method_definition_sha256) is not str
+        or len(method_definition_sha256) != 64
+    ):
+        raise ValueError("experiment profile has an invalid method identity")
+    if (
+        type(experiment_definition_sha256) is not str
+        or len(experiment_definition_sha256) != 64
+    ):
+        raise ValueError("experiment profile has an invalid experiment identity")
+    if conformance.get("method_definition_sha256") != method_definition_sha256:
+        raise ValueError("profile conformance authenticates another method")
+    if (
+        conformance.get("experiment_definition_sha256")
+        != experiment_definition_sha256
+    ):
+        raise ValueError("profile conformance authenticates another experiment")
+    return {
+        "experiment_profile": profile,
+        "experiment_profile_conformance": conformance,
+        "method_definition_sha256": method_definition_sha256,
+        "experiment_definition_sha256": experiment_definition_sha256,
+    }
+
+
 def _preregistration(
     *,
     replicate_seed: int,
@@ -1153,6 +2513,7 @@ def _preregistration(
     allocation_policy_id, allocation_policy_version, allocation_definition = (
         _allocation_policy_identity()
     )
+    profile_fields = _experiment_profile_preregistration_fields(probe)
     return {
         "schema_version": 1,
         "experiment_id": (
@@ -1173,6 +2534,7 @@ def _preregistration(
         "replicate_seed": replicate_seed,
         "model": MODEL,
         "model_execution_profile": MODEL_EXECUTION_PROFILE.to_record(),
+        **profile_fields,
         "provider_only": list(PROVIDER_ONLY),
         "resolved_provider": RESOLVED_PROVIDER,
         "reasoning_effort": MODEL_EXECUTION_PROFILE.reasoning_effort,
@@ -1194,6 +2556,9 @@ def _preregistration(
             "evaluation_width": PORTFOLIO_WIDTH,
             "portfolio_generations": [1, 3, 5],
             "recombination_generations": [2, 4, 6],
+            "recombination_evaluation_allocation_mode": (
+                RECOMBINATION_EVALUATION_ALLOCATION_MODE.value
+            ),
         },
         "selection_policy": {
             "implementation_mode": PORTFOLIO_SELECTOR_MODE,
@@ -1229,6 +2594,10 @@ def _preregistration(
             "feasibility_witness_mode": FEASIBILITY_WITNESS_MODE.value,
             "archive_context_mode": ARCHIVE_CONTEXT_MODE.value,
         },
+        "protected_acquisition": _protected_acquisition_config_record(),
+        "recombination_evaluation_allocation_mode": (
+            RECOMBINATION_EVALUATION_ALLOCATION_MODE.value
+        ),
         "utility": _utility_spec().to_record(),
         "utility_definition_sha256": _utility_spec().definition_sha256,
         "evaluator": {
@@ -1247,7 +2616,7 @@ def _preregistration(
             "campaign_completes_six_generations": True,
             "candidate_occurrences_match_preregistered_plan": True,
             "logical_agent_calls_equal_7": True,
-            "six_selector_and_one_reflection_responses": True,
+            "physical_provider_responses_match_reflection_evidence_tier": True,
             "every_success_uses_exact_model_provider": True,
             "every_success_matches_profile_reasoning_contract": True,
             "six_outcome_feedback_receipts": True,
@@ -1257,6 +2626,7 @@ def _preregistration(
             "all_successful_objectives_inside_fixed_reference": True,
             "runner_cleanup_released": True,
             "proposal_support_policy_bound_when_configured": True,
+            "protected_acquisition_composed_every_selector_request": True,
         },
         "candidate_quality_endpoints": {
             "primary": "final_all_evaluated_affine_3d_hv_minus_two_seed_hv",
@@ -1269,7 +2639,9 @@ def _preregistration(
         },
         "historical_gate_a": baseline,
         "real_qualification_evidence": qualification,
-        "provider_free_probe_identity_sha256": typed_json_sha256(freeze_json(probe)),
+        "provider_free_probe_identity_sha256": typed_json_sha256(
+            freeze_json(_construction_probe_contract(probe))
+        ),
     }
 
 
@@ -1411,9 +2783,9 @@ class _LiveReflectionExecutor:
             )
         )
         insight_count = min(8, cluster_count)
-        if insight_count < 2:
+        if insight_count < 1:
             raise RuntimeError(
-                "live Timeloop reflection requires at least two exact-action clusters"
+                "live Timeloop reflection requires exact-action evidence"
             )
         request = build_timeloop_v2_identifiable_reflection_request(
             call_id=self.ids.new_llm_call_id(),
@@ -1603,6 +2975,13 @@ def _execute_live(
         if detailed is None:
             raise RuntimeError("Timeloop live benchmark omitted detailed evidence")
 
+        certification_registry = (
+            AcquisitionCertifiedSlateContextRegistry()
+            if NUMERICALLY_CERTIFIED_ACQUISITION
+            else None
+        )
+        allocator = _calibrated_allocator(certification_registry)
+
         api_key = _read_live_api_key()
 
         def progress_sink(value: StructuredStreamProgress) -> None:
@@ -1638,7 +3017,13 @@ def _execute_live(
         generator = PydanticAIAgenticGenerator(runner)
         utility = AffineHypervolumeArchiveUtility3D(_utility_spec())
         portfolio_selector_override = (
-            _outcome_conditioned_selector(runner=runner, benchmark=benchmark)
+            _outcome_conditioned_selector(
+                runner=runner,
+                benchmark=benchmark,
+                audit_artifact_store=FileSystemArtifactStore(
+                    run_dir / "consequence_calibration_audits"
+                ),
+            )
             if PORTFOLIO_SELECTOR_MODE == "outcome_conditioned"
             else None
         )
@@ -1690,7 +3075,7 @@ def _execute_live(
             max_output_tokens=MAX_OUTPUT_TOKENS,
             temperature=TEMPERATURE,
             calibrated_runner=runner,
-            calibrated_allocator=_calibrated_allocator(),
+            calibrated_allocator=allocator,
             portfolio_selector_override=portfolio_selector_override,
             reflection_executor_factory=reflection_factory,
             model_profile_sha256=_model_profile_sha256(),
@@ -1702,6 +3087,30 @@ def _execute_live(
             engine_trace_sink=lambda value: journals["engine"].append(dict(value)),
             archive_utility=utility,
             recombination_utility_binder=_RecombinationUtilityBinder(utility),
+            variation_envelope=_protected_acquisition_envelope(
+                benchmark=benchmark,
+                panel=panel,
+                replicate_seed=replicate_seed,
+                acquisition_certification_context_sink=certification_registry,
+            ),
+            capacity_recourse_factory=(
+                None
+                if PROTECTED_ACQUISITION_MODE == "off"
+                else lambda active_benchmark, active_composition: _capacity_recourse(
+                    benchmark=active_benchmark,
+                    composition=active_composition,
+                    panel=panel,
+                    replicate_seed=replicate_seed,
+                )
+            ),
+            recombination_evaluation_allocation_mode=(
+                RECOMBINATION_EVALUATION_ALLOCATION_MODE
+            ),
+            contextual_incumbent_source_id=(
+                PROTECTED_ACQUISITION_SOURCE_ID
+                if PROTECTED_ACQUISITION_MODE != "off"
+                else "primary"
+            ),
             model_execution_profile=MODEL_EXECUTION_PROFILE,
             evaluator_concurrency=1,
             agent_concurrency=AGENT_CONCURRENCY,
@@ -1710,12 +3119,26 @@ def _execute_live(
 
         base_summary = run.summary()
         expected_proposal_support = _proposal_support_policy()
-        memory_path_audit = _g5_memory_path_audit(base_summary)
+        memory_path_audit = _g5_memory_path_audit(
+            base_summary,
+            reflection_receipts=run.execution.reflection_receipts,
+        )
         stage_occurrences = tuple(
             value.candidate_occurrence_count for value in run.execution.stage_receipts
         )
         stage_unique_evaluations = tuple(
             value.unique_evaluation_count for value in run.execution.stage_receipts
+        )
+        recombination_occurrences = tuple(
+            value.candidate_occurrence_count
+            for value in run.execution.stage_receipts
+            if value.kind.value == "recombination"
+        )
+        capacity_recourse_stages = _capacity_recourse_stage_records(run)
+        anchor_residual_identification = (
+            _anchor_residual_identification_assessment(
+                run.execution.stage_receipts
+            )
         )
         evaluation_accounting = CampaignEvaluationAccounting(
             planned_candidate_occurrences=PLANNED_CANDIDATE_OCCURRENCES,
@@ -1730,6 +3153,11 @@ def _execute_live(
             stage_unique_evaluations=stage_unique_evaluations,
             candidate_occurrences=run.execution.counters.candidate_occurrences,
             unique_evaluations=run.execution.counters.unique_evaluations,
+            minimum_candidate_occurrences=(
+                MANDATORY_CANDIDATE_OCCURRENCES
+                if NUMERICALLY_CERTIFIED_ACQUISITION
+                else None
+            ),
         )
         typed_candidate_infeasible_events = _typed_candidate_infeasible_events(
             run.engine_traces
@@ -1752,17 +3180,9 @@ def _execute_live(
         contextual_by_cutoff = _contextual_history_counts_by_cutoff(
             contextual_histories
         )
-        contextual_feedback_gate = (
-            list(contextual_by_cutoff) == ["1", "3", "5"]
-            and all(len(value) == 2 for value in contextual_by_cutoff.values())
-            and contextual_by_cutoff["1"] == [0, 0]
-            and all(value > 0 for value in contextual_by_cutoff["3"])
-            and all(value > 0 for value in contextual_by_cutoff["5"])
-            and all(
-                action["wave_index"] < history["cutoff_wave_index_exclusive"]
-                for history in contextual_histories
-                for action in history["actions"]
-            )
+        contextual_feedback_gate = _prior_only_contextual_feedback_gate(
+            contextual_histories,
+            contextual_by_cutoff,
         )
         for request, result in run.selector.results:
             journals["responses"].append(
@@ -1855,8 +3275,46 @@ def _execute_live(
             ),
             "six_generations": base_summary["generations_completed"]
             == GENERATION_COUNT,
-            "planned_candidate_occurrences_exact": (
-                base_summary["candidate_occurrences"] == PLANNED_CANDIDATE_OCCURRENCES
+            "candidate_occurrence_plan_respected": (
+                MANDATORY_CANDIDATE_OCCURRENCES
+                <= base_summary["candidate_occurrences"]
+                <= PLANNED_CANDIDATE_OCCURRENCES
+                if NUMERICALLY_CERTIFIED_ACQUISITION
+                else base_summary["candidate_occurrences"]
+                == PLANNED_CANDIDATE_OCCURRENCES
+            ),
+            "typed_recombination_capacity_accounted": (
+                len(recombination_occurrences) == len(RECOMBINATION_GENERATIONS)
+                and sum(recombination_occurrences)
+                == base_summary["candidate_occurrences"]
+                - MANDATORY_CANDIDATE_OCCURRENCES
+                and all(
+                    0
+                    <= value
+                    <= PARENTS_PER_PORTFOLIO * RECOMBINATIONS_PER_PARENT
+                    for value in recombination_occurrences
+                )
+                and sum(recombination_occurrences) > 0
+            ),
+            "capacity_complete_recombination_stages": (
+                PROTECTED_ACQUISITION_MODE == "off"
+                or (
+                    len(capacity_recourse_stages)
+                    == len(RECOMBINATION_GENERATIONS)
+                    and all(
+                        value["capacity_complete"] is True
+                        and value["realized_candidate_occurrences"]
+                        == value["planned_candidate_occurrences"]
+                        for value in capacity_recourse_stages
+                    )
+                )
+            ),
+            "recombination_allocation_mode_exact": (
+                len(capacity_recourse_stages) == len(RECOMBINATION_GENERATIONS)
+                and all(
+                    _capacity_allocation_record_matches_preregistered_mode(value)
+                    for value in capacity_recourse_stages
+                )
             ),
             "exact_evaluation_accounting": True,
             "bounded_cache_reuse": evaluation_accounting.within_cache_reuse_limit(
@@ -1866,12 +3324,19 @@ def _execute_live(
                 evaluator.calls + pre_simulator_infeasible_count
                 == evaluation_accounting.unique_evaluations
             ),
-            "seven_logical_calls": base_summary["logical_agent_calls"]
-            == 7
-            and (
-                runner.calls >= 7
+            "seven_logical_calls_reserved": base_summary["logical_agent_calls"] == 7,
+            "physical_provider_calls_match_evidence_tier": (
+                runner.calls
+                >= len(run.selector.results)
+                + memory_path_audit[
+                    "expected_physical_reflection_provider_calls"
+                ]
                 if PORTFOLIO_SELECTOR_MODE == "outcome_conditioned"
-                else runner.calls == 7
+                else runner.calls
+                == len(run.selector.results)
+                + memory_path_audit[
+                    "expected_physical_reflection_provider_calls"
+                ]
             ),
             "six_selector_responses": len(run.selector.results) == 6,
             "six_outcome_feedback_receipts": (
@@ -1884,13 +3349,24 @@ def _execute_live(
             "prior_only_contextual_feedback_reaches_g3_and_g5": (
                 contextual_feedback_gate
             ),
-            "one_g2_reflection": base_summary["reflection_generations"] == [2],
-            "g5_memory_path_typed_and_audited": memory_path_audit["workflow_path_valid"]
-            is True,
-            "seven_successful_provider_responses": (
-                len(runner.responses) >= 7
+            "reflection_evidence_path_authenticated": (
+                memory_path_audit["reflection_path_valid"] is True
+            ),
+            "reflection_memory_path_typed_and_audited": (
+                memory_path_audit["workflow_path_valid"] is True
+            ),
+            "successful_provider_responses_match_evidence_tier": (
+                len(runner.responses)
+                >= len(run.selector.results)
+                + memory_path_audit[
+                    "expected_physical_reflection_provider_calls"
+                ]
                 if PORTFOLIO_SELECTOR_MODE == "outcome_conditioned"
-                else len(runner.responses) == 7
+                else len(runner.responses)
+                == len(run.selector.results)
+                + memory_path_audit[
+                    "expected_physical_reflection_provider_calls"
+                ]
             ),
             "exact_model_provider_reasoning_contract": exact_route_and_reasoning,
             "outbound_transport_contract": outbound_gate,
@@ -1910,36 +3386,25 @@ def _execute_live(
                 _require_source_closure(source_sha256)["aggregate_sha256"]
                 == source_sha256
             ),
+            "active_selector_policy_bound": all(
+                _selector_policy_binding_valid(result)
+                for _, result in run.selector.results
+            ),
             "proposal_support_policy_bound_when_configured": all(
-                result.supplemental_audit is not None
-                and (
-                    thaw_json(result.supplemental_audit.payload).get("schema_version")
-                    == 1
-                    if PORTFOLIO_SELECTOR_MODE == "outcome_conditioned"
-                    else
-                    (
-                        "proposal_support"
-                        not in thaw_json(result.supplemental_audit.payload)
-                    )
-                    if expected_proposal_support is None
-                    else (
-                        thaw_json(result.supplemental_audit.payload)
-                        .get("proposal_support", {})
-                        .get("policy")
-                        == {
-                            "policy_id": expected_proposal_support.policy_id,
-                            "policy_version": (
-                                expected_proposal_support.policy_version
-                            ),
-                            "definition_sha256": (
-                                expected_proposal_support.definition_sha256
-                            ),
-                        }
-                    )
+                _candidate_universe_binding_valid(
+                    result,
+                    proposal_support_policy=expected_proposal_support,
                 )
                 for _, result in run.selector.results
             ),
         }
+        if anchor_residual_identification is not None:
+            health.update(
+                {
+                    f"anchor_residual_{name}": passed
+                    for name, passed in anchor_residual_identification.gates.items()
+                }
+            )
         status = "completed_healthy" if all(health.values()) else "completed_unhealthy"
         gate_a = _load_gate_a_baseline()
         return {
@@ -1951,6 +3416,9 @@ def _execute_live(
             "method": {
                 "acquisition_mode": ACQUISITION_MODE.value,
                 "execution_label": _acquisition_execution_label(),
+                "recombination_evaluation_allocation_mode": (
+                    RECOMBINATION_EVALUATION_ALLOCATION_MODE.value
+                ),
                 "proposal_support_policy": (
                     None
                     if expected_proposal_support is None
@@ -1971,6 +3439,12 @@ def _execute_live(
             },
             "g5_memory_path_audit": memory_path_audit,
             "evaluation_accounting": evaluation_accounting.to_record(),
+            "capacity_recourse_stages": capacity_recourse_stages,
+            "anchor_residual_identification": (
+                None
+                if anchor_residual_identification is None
+                else anchor_residual_identification.to_record()
+            ),
             "wall_s": (time.perf_counter_ns() - started_ns) / 1e9,
             "provider": {
                 "logical_calls": runner.calls,
@@ -2085,6 +3559,7 @@ def _manifest(
             if _proposal_support_policy() is None
             else _proposal_support_policy().to_record()
         ),
+        "protected_acquisition": _protected_acquisition_config_record(),
         "provider_config": _provider_config(replicate_seed).to_manifest_record(),
         "utility_definition_sha256": _utility_spec().definition_sha256,
     }

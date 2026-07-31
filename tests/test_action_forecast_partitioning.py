@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,6 +28,8 @@ from agent_evolve.application.action_forecast_partitioning import (
     lenient_action_forecast_health_v2_policy,
 )
 from agent_evolve.application.outcome_conditioned_portfolio_selection import (
+    _evidence_mode,
+    _identified_outcome_conditioned_acquisition,
     _resolve_model_authority_health,
 )
 from agent_evolve.core.action_semantics import (
@@ -46,7 +49,11 @@ from agent_evolve.domain.finite_variation import (
     FiniteVariationOption,
 )
 from agent_evolve.domain.ids import LLMCallId
-from agent_evolve.domain.typed_json import FrozenJsonObject, freeze_json, typed_json_sha256
+from agent_evolve.domain.typed_json import (
+    FrozenJsonObject,
+    freeze_json,
+    typed_json_sha256,
+)
 from agent_evolve.ports.action_forecast import (
     ActionForecastBlockPolicy,
     ActionForecastBlockRequest,
@@ -78,6 +85,54 @@ def _sha(value: str) -> str:
 
 
 _FORECAST_POLICY_DEFINITION_SHA256 = _sha("fixture-partitioned-forecast-v1")
+
+
+def test_outcome_conditioned_acquisition_respects_estimand_availability() -> None:
+    assert _identified_outcome_conditioned_acquisition(
+        residual_cell_identified=False,
+        terminal=False,
+    ) == ("target_closure", "directional_affine_bootstrap")
+    assert _identified_outcome_conditioned_acquisition(
+        residual_cell_identified=False,
+        terminal=True,
+    ) == ("target_closure", "directional_affine_bootstrap")
+    assert _identified_outcome_conditioned_acquisition(
+        residual_cell_identified=True,
+        terminal=False,
+    ) == ("role_factorized", "residual_frontier_cell")
+    assert _identified_outcome_conditioned_acquisition(
+        residual_cell_identified=True,
+        terminal=True,
+    ) == (
+        "reliability_adjusted_expected_hypervolume",
+        "residual_frontier_cell",
+    )
+
+
+def test_grounded_forecast_mode_requires_action_specific_evidence_slots() -> None:
+    generic_card = SimpleNamespace(
+        source_binding=object(),
+        finite_action_evidence=(),
+    )
+    grounded_card = SimpleNamespace(
+        source_binding=object(),
+        finite_action_evidence=(object(),),
+    )
+
+    assert _evidence_mode(
+        SimpleNamespace(
+            source_registry=object(),
+            experimental_view_receipt=object(),
+            cards=(generic_card,),
+        )
+    ) is ActionForecastEvidenceMode.CATALOG_ONLY
+    assert _evidence_mode(
+        SimpleNamespace(
+            source_registry=object(),
+            experimental_view_receipt=object(),
+            cards=(generic_card, grounded_card),
+        )
+    ) is ActionForecastEvidenceMode.GROUNDED
 
 
 def test_named_v2_health_factory_restores_frozen_historical_binding() -> None:
@@ -252,9 +307,7 @@ def _draft_for_index(
         quality_lower = quality_upper = 0.0
         probability_valid = 0.8
     else:
-        normalized = (-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 4.0)[
-            index % 8
-        ]
+        normalized = (-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 4.0)[index % 8]
         cost_median = normalized * 10.0
         quality_median = -normalized * 5.0
         cost_lower = cost_upper = 5.0
@@ -312,7 +365,9 @@ def _draft_with_quantized_width_and_confidence(
     return replace(base, metric_forecasts=forecasts)
 
 
-def _block_result(block_request: ActionForecastBlockRequest) -> ActionForecastBlockResult:
+def _block_result(
+    block_request: ActionForecastBlockRequest,
+) -> ActionForecastBlockResult:
     spec = block_request.block
     drafts = tuple(
         _draft_for_index(block_request.request, index)
@@ -340,7 +395,9 @@ def _block_results(
     )
 
 
-def test_exactly_projected_collapsed_metric_cannot_veto_model_authority_health() -> None:
+def test_exactly_projected_collapsed_metric_cannot_veto_model_authority_health() -> (
+    None
+):
     request = _request(option_count=8)
     drafts = []
     for index in range(8):
@@ -426,18 +483,23 @@ def test_layout_is_deterministic_contiguous_complete_and_cell_bounded() -> None:
 
     assert first == second
     assert first.layout_sha256 == second.layout_sha256
-    assert [(block.global_row_start, block.global_row_stop) for block in first.blocks] == [
+    assert [
+        (block.global_row_start, block.global_row_stop) for block in first.blocks
+    ] == [
         (0, 3),
         (3, 6),
         (6, 8),
     ]
     assert all(block.row_count <= 3 for block in first.blocks)
     assert all(block.row_count * len(first.metric_ids) <= 6 for block in first.blocks)
-    assert tuple(
-        identity
-        for block in first.blocks
-        for identity in block.option_identity_sha256s
-    ) == first.option_identity_sha256s
+    assert (
+        tuple(
+            identity
+            for block in first.blocks
+            for identity in block.option_identity_sha256s
+        )
+        == first.option_identity_sha256s
+    )
     block_requests = build_action_forecast_block_requests(request, first)
     assert len({value.block_call_id for value in block_requests}) == 3
     assert block_requests[0].block_call_id == action_forecast_block_call_id(
@@ -634,7 +696,9 @@ def test_queue_agnostic_wave_is_bounded_and_failure_isolated() -> None:
     with pytest.raises(ActionForecastWaveError) as captured:
         asyncio.run(failing_wave.forecast_partitioned(request, layout))
     assert sorted(failing_policy.completed) == [0, 1, 2]
-    assert [value.forecasts.block_index for value in captured.value.successful_results] == [
+    assert [
+        value.forecasts.block_index for value in captured.value.successful_results
+    ] == [
         0,
         2,
     ]
@@ -696,15 +760,12 @@ def test_normalized_health_receipt_detects_obvious_wire_collapse() -> None:
     assert all(value.extreme_median_share == 0.0 for value in first.metric_assessments)
     assert all(value.unit_confidence_share == 0.0 for value in first.metric_assessments)
     assert all(
-        value.to_record()["schema_version"] == 2
-        for value in first.metric_assessments
+        value.to_record()["schema_version"] == 2 for value in first.metric_assessments
     )
 
     collapsed = resolve_action_forecasts(
         request,
-        tuple(
-            _draft_for_index(request, index, collapsed=True) for index in range(8)
-        ),
+        tuple(_draft_for_index(request, index, collapsed=True) for index in range(8)),
         policy_id=_FORECAST_POLICY_ID,
         policy_version=_FORECAST_POLICY_VERSION,
         policy_definition_sha256=_FORECAST_POLICY_DEFINITION_SHA256,
@@ -794,7 +855,7 @@ def test_unit_confidence_concentration_fails_with_nonzero_quantized_widths() -> 
         assert metric.largest_median_bucket_share < 0.95
         assert metric.distinct_cell_signature_count >= 2
         assert metric.passes is False
-        assert metric.to_record()["unit_confidence_share_hex"] == 0.95.hex()
+        assert metric.to_record()["unit_confidence_share_hex"] == (0.95).hex()
 
     varied_drafts = tuple(
         _draft_with_quantized_width_and_confidence(
@@ -874,10 +935,7 @@ def test_block_health_uses_identical_gates_but_distinct_frame_binding() -> None:
     assert block_health.frame_receipt_sha256 == block.receipt_sha256
     assert block_health.request_sha256 == request.request_sha256
     assert block_health.layout_sha256 == layout.layout_sha256
-    assert (
-        block_health.block_request_sha256
-        == block_request.block_request_sha256
-    )
+    assert block_health.block_request_sha256 == block_request.block_request_sha256
     assert block_health.block_spec_sha256 == block_request.block.block_spec_sha256
     assert block_health.block_index == 0
     assert block_health.global_row_start == 0
@@ -909,8 +967,7 @@ def test_block_health_uses_identical_gates_but_distinct_frame_binding() -> None:
     assert subset_health.threshold_applied is block_health.threshold_applied
     assert subset_health.passes is block_health.passes
     assert (
-        subset_health.frame_kind
-        is ActionForecastHealthFrameKind.PARTITION_BLOCK_SUBSET
+        subset_health.frame_kind is ActionForecastHealthFrameKind.PARTITION_BLOCK_SUBSET
     )
     assert subset_health.receipt_sha256 != block_health.receipt_sha256
     assert type(subset_health.subset_binding) is ActionForecastBlockHealthSubsetBinding
@@ -1055,9 +1112,7 @@ def test_unseen_subset_detects_collapse_hidden_by_three_distinct_anchors() -> No
         member_id="memory",
         health_policy=health_policy,
     )
-    unseen_indices = tuple(
-        index for index in range(20) if index not in anchor_indices
-    )
+    unseen_indices = tuple(index for index in range(20) if index not in anchor_indices)
     unseen_health = assess_resolved_action_forecast_block_subset_health(
         block_request,
         block,

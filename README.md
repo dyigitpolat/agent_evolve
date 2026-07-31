@@ -129,7 +129,7 @@ Three environment variables affect behaviour, and none is required:
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `AGENTEVOLVE_MODEL` | model id | `openai:gpt-4o` |
+| `AGENTEVOLVE_MODEL` | model id | `openrouter:openai/gpt-5.6-luna` |
 | `AGENTEVOLVE_HARNESS` | adapter for the `llm` proposer | `pydantic_ai` |
 | `AGENTEVOLVE_TEMPERATURE` | sampling temperature | provider default |
 
@@ -167,16 +167,22 @@ provider call was handed the key back by the very next line.
 | `examples/build_flags/` | none | The regime this tool suits: categorical, constrained, expensive evaluator |
 | `examples/knapsack/` | none | The five obligations, shortest possible; `--compare` runs both arms |
 
+The default model is cheap on purpose -- $0.10 per million input tokens and
+$0.60 per million output -- and `agent_evolve check` prints the model and its
+price before it spends anything, so a default nobody chose cannot bill anyone.
+
 ## Tests
 
 ```bash
 pip install 'agent_evolve[dev]'
-python -m pytest tests/test_public_contract.py     # the public surface, offline
-python -m pytest tests/                            # everything that does not need the research corpus
+python -m pytest tests/              # the shipped package, offline, ~90 seconds
+python -m pytest tests/ -m research  # the research suite; needs the corpus
 ```
 
-Tests that need the research corpus are skipped when it is absent rather than
-breaking collection.
+The default run is what someone who cloned this repository can actually use.
+Tests driving the research campaign scripts are marked `research` and
+deselected; they are also skipped rather than failed when the corpus is
+absent.
 
 ## License
 

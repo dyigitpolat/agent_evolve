@@ -8,10 +8,14 @@ from dataclasses import replace
 import pytest
 
 from agent_evolve import (
+    ANCHOR_HEAVY_36_OFFSPRING_SCALE_SHAPE,
     DelayedPortfolioCampaignPreset,
     CampaignExperimentProfile,
     PortfolioCampaignBehavior,
     REFERENCE_36_OFFSPRING_SCALE_SHAPE,
+    REFERENCE_HEAVY_B32_SCALE_SHAPE,
+    REFERENCE_HEAVY_B40_SCALE_SHAPE,
+    SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES,
     WorkloadKit,
     campaign_seed,
 )
@@ -19,7 +23,10 @@ from agent_evolve.integrations.pydantic_ai.model_execution_profile import (
     DEEPSEEK_V4_PRO_STREAMLAKE_XHIGH_NATIVE_JSON,
 )
 from agent_evolve.workload_prompt import WorkloadPromptArm
-from agent_evolve.campaign_presets import EQUAL_60_OFFSPRING_SCALE_SHAPES
+from agent_evolve.campaign_presets import (
+    EQUAL_36_OFFSPRING_SCALE_SHAPES,
+    EQUAL_60_OFFSPRING_SCALE_SHAPES,
+)
 from agent_evolve.agentic import AgenticBenchmark
 from agent_evolve.application.evolution_campaign import (
     ArchiveUtilitySnapshot,
@@ -180,6 +187,49 @@ def test_three_named_scale_shapes_hold_offspring_and_total_opportunity_constant(
             expected_stages[name]
         )
         assert budget.max_unique_evaluations == 62
+
+
+def test_equal_b38_shapes_trade_recombination_for_anchor_capacity_exactly() -> None:
+    assert tuple(EQUAL_36_OFFSPRING_SCALE_SHAPES) == (
+        "g6_k4_r2",
+        "g6_k5_r1",
+    )
+    expected_stages = {
+        "g6_k4_r2": (8, 4, 8, 4, 8, 4),
+        "g6_k5_r1": (10, 2, 10, 2, 10, 2),
+    }
+    for name, shape in EQUAL_36_OFFSPRING_SCALE_SHAPES.items():
+        assert shape.planned_offspring_occurrences == 36
+        preset = DelayedPortfolioCampaignPreset.scale_shape(
+            shape,
+            outer_seed=41,
+        )
+        protocol = preset.protocol(required_seed_count=2)
+        budget = preset.budget(required_seed_count=2)
+        steps = SealedCutoffDelayedAdmissionCadence().build(protocol).steps
+        assert tuple(value.planned_candidate_evaluations for value in steps) == (
+            expected_stages[name]
+        )
+        assert budget.max_unique_evaluations == 38
+
+    assert ANCHOR_HEAVY_36_OFFSPRING_SCALE_SHAPE == (
+        EQUAL_36_OFFSPRING_SCALE_SHAPES["g6_k5_r1"]
+    )
+
+
+def test_reference_heavy_b40_shape_is_not_mislabeled_as_equal_b38() -> None:
+    shape = SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES["g7_k4_r1"]
+
+    assert shape == REFERENCE_HEAVY_B40_SCALE_SHAPE
+    assert shape.portfolio_generation_count == 4
+    assert shape.recombination_generation_count == 3
+    assert shape.planned_offspring_occurrences == 38
+    assert shape.shape_id not in EQUAL_36_OFFSPRING_SCALE_SHAPES
+
+    screen = SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES["g6_k4_r1"]
+    assert screen == REFERENCE_HEAVY_B32_SCALE_SHAPE
+    assert screen.planned_offspring_occurrences == 30
+    assert screen.shape_id not in EQUAL_36_OFFSPRING_SCALE_SHAPES
 
 
 def test_preset_prepares_workload_kit_without_provider_or_evaluator_work() -> None:

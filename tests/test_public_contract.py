@@ -217,3 +217,120 @@ def test_validation_message_reaches_the_failure_record():
     )
     assert failed and "at most 15" in (failed[0].error_message or "")
     assert p.evaluations == 0, "an invalid candidate must not reach the evaluator"
+
+
+# -- the harness contract is enforced, not merely declared ------------------
+
+
+def test_a_harness_with_a_wrong_signature_fails_at_class_definition():
+    """The defect this enforcement exists for.
+
+    A proposer shipped with three wrong arities. HarnessBase inherited abc.ABC
+    while marking nothing abstract, so nothing checked, and the only symptom
+    was a TypeError from inside the loop after the run had begun.
+    """
+    from agent_evolve.harness.base import HarnessBase, HarnessContractError
+
+    with pytest.raises(HarnessContractError) as caught:
+
+        class WrongArity(HarnessBase):
+            id = "wrong"
+
+            def generate_initial(self, n):
+                return []
+
+            def regenerate(self, a, b, c, d):
+                return []
+
+            def generate_offspring(self, a, b, c, d):
+                return []
+
+            def regenerate_offspring(self, a, b, c, d):  # loop passes 5
+                return []
+
+            def failure_insights(self, failed_str):  # loop passes 2
+                return []
+
+            def constraint_instruction(self, failed_str, previous=None):
+                return ""
+
+            def performance_insights(self, stats, pareto, previous=None):
+                return ""
+
+    message = str(caught.value)
+    assert "regenerate_offspring" in message and "failure_insights" in message
+    assert "generate_initial" not in message, "a correct operation was reported as wrong"
+
+
+def test_a_harness_missing_an_operation_fails_at_class_definition():
+    from agent_evolve.harness.base import HarnessBase, HarnessContractError
+
+    with pytest.raises(HarnessContractError, match="not implemented"):
+
+        class Incomplete(HarnessBase):
+            id = "incomplete"
+
+            def generate_initial(self, n):
+                return []
+
+
+def test_the_shipped_proposers_satisfy_the_contract():
+    from agent_evolve.integrations.pydantic_ai.harness import PydanticAIHarness
+    from agent_evolve.proposers import RandomProposer
+
+    assert RandomProposer.id == "random"
+    assert PydanticAIHarness.id
+
+
+def test_var_positional_satisfies_any_operation():
+    """A forwarding adapter must not be rejected for being general."""
+    from agent_evolve.harness.base import HarnessBase
+
+    class Forwarding(HarnessBase):
+        id = "forwarding"
+
+        def generate_initial(self, *args):
+            return []
+
+        def regenerate(self, *args):
+            return []
+
+        def generate_offspring(self, *args):
+            return []
+
+        def regenerate_offspring(self, *args):
+            return []
+
+        def failure_insights(self, *args):
+            return []
+
+        def constraint_instruction(self, *args):
+            return ""
+
+        def performance_insights(self, *args):
+            return ""
+
+    assert Forwarding.id == "forwarding"
+
+
+# -- the default model is cheap, and visible -------------------------------
+
+
+def test_the_default_model_is_the_cheap_route_and_carries_a_price():
+    from agent_evolve.settings import AgentEvolveSettings, model_price
+
+    default = AgentEvolveSettings().model
+    price = model_price(default)
+    assert price is not None, f"the default model {default!r} ships without a published price"
+    inp, out = price
+    assert inp <= 1.0 and out <= 5.0, f"the default model is not cheap: ${inp}/M in, ${out}/M out"
+
+
+def test_check_names_the_model_and_its_price_before_spending():
+    from agent_evolve.cli import _model_line
+
+    line = _model_line(None)
+    assert "(default)" in line, "a default nobody saw is a default nobody consented to"
+    assert "/M in" in line and "/M out" in line
+    assert _model_line("some:other-model").startswith("model some:other-model")
+    assert "(default)" not in _model_line("some:other-model")

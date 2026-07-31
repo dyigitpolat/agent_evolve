@@ -101,7 +101,25 @@ from agent_evolve.agentic import (  # noqa: E402
 from agent_evolve.application.agentic_evolution import (  # noqa: E402
     EvolutionCandidate,
 )
-from agent_evolve.application.budgeted_optimizer import OptimizerBudget  # noqa: E402
+from agent_evolve.application.budgeted_optimizer import (  # noqa: E402
+    OptimizerBudget,
+    OptimizerState,
+    pareto_archive_snapshot_hash,
+)
+from agent_evolve.application.campaign_variation_envelope import (  # noqa: E402
+    CampaignVariationEnvelopeLane,
+    CampaignVariationEnvelopeRequest,
+    campaign_variation_envelope_context_record,
+    validate_campaign_variation_envelope_result,
+)
+from agent_evolve.application.finite_acquisition_variation_envelope import (  # noqa: E402
+    PROTECTED_ACQUISITION_SOURCE_ID,
+    ProtectedFiniteAcquisitionVariationEnvelope,
+)
+from agent_evolve.application.finite_acquisition_capacity_recourse import (  # noqa: E402
+    FiniteAcquisitionCapacityRecourse,
+)
+from agent_evolve.application.pareto_archive import ParetoArchive  # noqa: E402
 from agent_evolve.application.calibrated_campaign import (  # noqa: E402
     CalibratedCampaignBindingFactory,
     equal_weight_slate_objectives,
@@ -115,10 +133,19 @@ from agent_evolve.application.action_forecast_partitioning import (  # noqa: E40
 from agent_evolve.application.composition_portfolio_selection import (
     CompositionPortfolioSelectionPolicy,
 )
+from agent_evolve.application.empirical_consequence_calibration import (  # noqa: E402
+    HierarchicalEmpiricalConsequenceCalibrationPolicy,
+)
+from agent_evolve.application.global_wave_action_allocation import (  # noqa: E402
+    BarrierGlobalWaveActionAllocationCoordinator,
+    GlobalRoleBalancedWaveActionAllocationPolicy,
+)
 from agent_evolve.application.outcome_conditioned_portfolio_selection import (  # noqa: E402
     OUTCOME_CONDITIONED_PORTFOLIO_POLICY_DEFINITION_SHA256,
     OutcomeConditionedPortfolioSelectionPolicy,
+    outcome_conditioned_contextual_allocation_realization,
     outcome_conditioned_selected_predictions,
+    outcome_conditioned_selected_source_ids,
 )
 from agent_evolve.application.campaign_diagnostic_blocks import (  # noqa: E402
     CampaignDiagnosticSupportCardInput,
@@ -141,8 +168,13 @@ from agent_evolve.application.campaign_execution import (  # noqa: E402
     CampaignArchiveCutoffReceipt,
     CampaignExecutionEvent,
     CampaignJournalAck,
+    CampaignReflectionStatus,
     CampaignStageRequest,
     EvolutionCampaignScheduler,
+)
+from agent_evolve.application.anchor_residual_identification import (  # noqa: E402
+    AnchorResidualIdentificationContract,
+    project_anchor_residual_selection_audits,
 )
 from agent_evolve.application.campaign_generation_audit import (  # noqa: E402
     TransactionalPortfolioGenerationAuditor,
@@ -216,6 +248,7 @@ from agent_evolve.application.portfolio_campaign_runtime import (  # noqa: E402
     CommittedRegistryIdentifiableReflectionEvidenceSource,
     CAMPAIGN_ARCHIVE_CONTEXT_KEY,
     CAMPAIGN_FRONTIER_TARGET_KEY,
+    CAMPAIGN_VARIATION_ENVELOPE_KEY,
 )
 from agent_evolve.application.campaign_selector_context_extension import (  # noqa: E402
     CampaignSelectorContextExtension,
@@ -285,12 +318,15 @@ from agent_evolve.integrations.pydantic_ai.campaign_acquisition import (  # noqa
     campaign_evidence_calibrated_source_mix_from_environment,
     campaign_minimum_intervention_projection_from_environment,
     campaign_operator_assay_minimum_from_environment,
+    campaign_regret_bounded_information_controls_from_environment,
     campaign_residual_frontier_planning_from_environment,
     campaign_selector_policy_definition_sha256,
 )
 from agent_evolve.integrations.pydantic_ai.calibrated_portfolio_selection import (  # noqa: E402
     CalibratedPortfolioAllocator,
     CalibratedPortfolioFeasibilityWitnessMode,
+    PydanticAIAcquisitionCertifiedResidualPortfolioSelectionPolicy,
+    PydanticAIRegretBoundedInformationPortfolioSelectionPolicy,
     PydanticAIConstraintDecoupledHorizonPortfolioSelectionPolicy,
     PydanticAIConstraintDecoupledTargetConditionedPortfolioSelectionPolicy,
     PydanticAIContextualSearchAllocationPortfolioSelectionPolicy,
@@ -308,8 +344,17 @@ from agent_evolve.integrations.pydantic_ai.model_execution_profile import (  # n
     OpenRouterModelExecutionProfile,
     openrouter_model_execution_profile,
 )
+from agent_evolve.integrations.botorch import (  # noqa: E402
+    build_isolated_botorch_qlognehvi,
+)
+from agent_evolve.integrations.botorch.subprocess_qlognehvi_batch import (  # noqa: E402
+    build_isolated_botorch_qlognehvi_batch_score,
+)
 from agent_evolve.campaign_profiles import CampaignExperimentProfile  # noqa: E402
-from agent_evolve.campaign_presets import PortfolioScaleShape  # noqa: E402
+from agent_evolve.campaign_presets import (  # noqa: E402
+    SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES,
+    PortfolioScaleShape,
+)
 from agent_evolve.campaign_variation_topology import (  # noqa: E402
     CampaignVariationTopology,
     CampaignVariationTopologyMode,
@@ -352,13 +397,18 @@ from agent_evolve.policies.reward.affine_hypervolume import (  # noqa: E402
     AffineObjectiveAxis,
 )
 from agent_evolve.policies.reward.contextual_marginal_utility import (  # noqa: E402
-    FixedReferenceContextualMarginalUtilityProjector,
+    ExactCoalitionShapleyContextualUtilityProjector,
 )
 from agent_evolve.policies.selection.finite_option_prompt_projection import (  # noqa: E402
     FiniteOptionPromptProjectionPolicy,
 )
 from agent_evolve.policies.selection.forecast_calibration import (  # noqa: E402
     ForecastCalibrationScope,
+)
+from agent_evolve.policies.selection.acquisition_certified_slate import (  # noqa: E402
+    AcquisitionCertifiedSlateContextRegistry,
+    AcquisitionCertifiedSlateContextSink,
+    AcquisitionCertifiedSlatePolicy,
 )
 from agent_evolve.policies.selection.meaningful_direction import (  # noqa: E402
     AbsoluteToleranceDirectionAdjudicator,
@@ -409,10 +459,14 @@ from agent_evolve.ports.decision_metric_projection import (  # noqa: E402
     DecisionMetricProjection,
 )
 from agent_evolve.ports.variation_source import (  # noqa: E402
+    finite_variation_source_id,
     finite_variation_source_ids,
 )
 from agent_evolve.ports.parent_measurement import (  # noqa: E402
     ParentMeasurementProjection,
+)
+from agent_evolve.ports.finite_acquisition import (  # noqa: E402
+    FiniteAcquisitionObjective,
 )
 from agent_evolve.ports.structured_generator import (  # noqa: E402
     StructuredStreamCleanupPolicy,
@@ -446,13 +500,20 @@ from examples.benchmarks.boils_abc.finite_variation_catalog import (  # noqa: E4
     FINITE_CATALOG_ID,
     BoilsFiniteVariationCatalog,
 )
+from examples.benchmarks.boils_abc.finite_acquisition_space import (  # noqa: E402
+    BoilsFiniteAcquisitionSpace,
+)
 from examples.benchmarks.boils_abc.global_restart_catalog import (  # noqa: E402
     BoilsGlobalRestartVariationCatalog,
 )
 from agent_evolve.policies.variation.source_union_finite_catalog import (  # noqa: E402
+    SourceExposureFiniteVariationCatalog,
     SourceUnionFiniteVariationCatalog,
 )
 from agent_evolve.provider_accounting import measure_provider_usage  # noqa: E402
+from agent_evolve.policies.variation.multiscale_restart_catalog import (  # noqa: E402
+    GenericMultiscaleRestartFiniteVariationCatalog,
+)
 from examples.development.durable_run_artifacts import (  # noqa: E402
     BatchedDurableJsonlJournal,
     DurableJsonlJournal,
@@ -503,10 +564,72 @@ if (
 ACTION_FORECAST_BLOCK_ROWS = int(_ACTION_FORECAST_BLOCK_ROWS_RAW)
 ACTION_FORECAST_PARTITION_DEFINITION_SHA256 = hashlib.sha256(
     b"agent-evolve:generic-campaign-action-forecast-partition:v1;"
-    + f"rows={ACTION_FORECAST_BLOCK_ROWS};cells-per-row=objective-count".encode(
-        "ascii"
-    )
+    + f"rows={ACTION_FORECAST_BLOCK_ROWS};cells-per-row=objective-count".encode("ascii")
 ).hexdigest()
+
+PROTECTED_ACQUISITION_MODE = os.environ.get(
+    "AGENT_EVOLVE_PROTECTED_ACQUISITION_MODE",
+    "off",
+)
+if PROTECTED_ACQUISITION_MODE not in {"off", "botorch_qlognehvi"}:
+    raise ValueError(
+        "AGENT_EVOLVE_PROTECTED_ACQUISITION_MODE must be off or "
+        "botorch_qlognehvi"
+    )
+
+
+def _bounded_integer_environment(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = os.environ.get(name, str(default))
+    if not raw.isascii() or not raw.isdigit():
+        raise ValueError(f"{name} must contain decimal digits")
+    value = int(raw)
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must lie in [{minimum}, {maximum}]")
+    return value
+
+
+PROTECTED_ACQUISITION_POOL_SIZE = _bounded_integer_environment(
+    "AGENT_EVOLVE_PROTECTED_ACQUISITION_POOL_SIZE",
+    8192,
+    minimum=16,
+    maximum=65_536,
+)
+PROTECTED_ACQUISITION_BATCH_SIZE = _bounded_integer_environment(
+    "AGENT_EVOLVE_PROTECTED_ACQUISITION_BATCH_SIZE",
+    2,
+    minimum=2,
+    maximum=8,
+)
+PROTECTED_ACQUISITION_SOURCE_MINIMUM = _bounded_integer_environment(
+    "AGENT_EVOLVE_PROTECTED_ACQUISITION_SOURCE_MINIMUM",
+    1,
+    minimum=1,
+    maximum=7,
+)
+PROTECTED_ACQUISITION_MC_SAMPLES = _bounded_integer_environment(
+    "AGENT_EVOLVE_PROTECTED_ACQUISITION_MC_SAMPLES",
+    128,
+    minimum=16,
+    maximum=4096,
+)
+MINIMUM_DISTINCT_EVALUATION_FAMILIES = (
+    None if PROTECTED_ACQUISITION_MODE != "off" else 3
+)
+PINNED_BOTORCH_PYTHON = Path(
+    os.environ.get(
+        "AGENT_EVOLVE_BOTORCH_PYTHON",
+        str(
+            WORKSPACE_ROOT
+            / "baselines/agent_evolve_aaai_2027/botorch_env/bin/python"
+        ),
+    )
+)
 FEASIBILITY_WITNESS_MODE = CalibratedPortfolioFeasibilityWitnessMode(
     os.environ.get("AGENT_EVOLVE_FEASIBILITY_WITNESS_MODE", "canonical")
 )
@@ -518,6 +641,15 @@ ACQUISITION_MODE = CampaignAcquisitionMode(
         "AGENT_EVOLVE_ACQUISITION_MODE",
         "model_top_k" if COMMON_POOL_ACQUISITION else "full_support",
     )
+)
+NUMERICALLY_CERTIFIED_ACQUISITION = ACQUISITION_MODE in {
+    CampaignAcquisitionMode.ACQUISITION_CERTIFIED,
+    CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION,
+}
+REGRET_BOUNDED_CONTROLS = (
+    campaign_regret_bounded_information_controls_from_environment(os.environ)
+    if ACQUISITION_MODE is CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION
+    else None
 )
 OPERATOR_ASSAY_MINIMUM = campaign_operator_assay_minimum_from_environment(os.environ)
 CONSTRAINT_DECOUPLED_ACQUISITION = (
@@ -536,9 +668,7 @@ RESIDUAL_FRONTIER_PLANNING = campaign_residual_frontier_planning_from_environmen
     os.environ
 )
 if RESIDUAL_FRONTIER_PLANNING and not CONTEXTUAL_SEARCH_ALLOCATION:
-    raise ValueError(
-        "residual frontier planning requires contextual search allocation"
-    )
+    raise ValueError("residual frontier planning requires contextual search allocation")
 if CONTEXTUAL_SEARCH_ALLOCATION and not EVIDENCE_CALIBRATED_SOURCE_MIX:
     raise ValueError(
         "contextual search allocation requires evidence-calibrated source mix"
@@ -547,24 +677,30 @@ if EVIDENCE_CALIBRATED_SOURCE_MIX and not MINIMUM_INTERVENTION_PROJECTION:
     raise ValueError("evidence-calibrated source mix requires minimum intervention")
 if MINIMUM_INTERVENTION_PROJECTION and not CONSTRAINT_DECOUPLED_ACQUISITION:
     raise ValueError("minimum-intervention projection requires constraint decoupling")
-if (
-    CONSTRAINT_DECOUPLED_ACQUISITION
-    and ACQUISITION_MODE
-    not in {
-        CampaignAcquisitionMode.HORIZON_BOUNDED,
-        CampaignAcquisitionMode.TARGET_CONDITIONED,
-    }
-):
+if CONSTRAINT_DECOUPLED_ACQUISITION and ACQUISITION_MODE not in {
+    CampaignAcquisitionMode.HORIZON_BOUNDED,
+    CampaignAcquisitionMode.TARGET_CONDITIONED,
+    CampaignAcquisitionMode.ACQUISITION_CERTIFIED,
+    CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION,
+}:
     raise ValueError(
         "constraint-decoupled acquisition requires horizon_bounded or "
-        "target_conditioned mode"
+        "target_conditioned, acquisition_certified, or regret_bounded_information mode"
+    )
+if NUMERICALLY_CERTIFIED_ACQUISITION and (
+    PROTECTED_ACQUISITION_MODE != "botorch_qlognehvi"
+    or PROTECTED_ACQUISITION_BATCH_SIZE != 8
+    or not CONSTRAINT_DECOUPLED_ACQUISITION
+):
+    raise ValueError(
+        "numerically certified acquisition requires protected qLogNEHVI batch 8 and "
+        "constraint-decoupled authority"
     )
 ARCHIVE_CONTEXT_MODE = AffineFrontierContextMode(
     os.environ.get("AGENT_EVOLVE_ARCHIVE_CONTEXT_MODE", "off")
 )
 _TARGET_CONDITIONED_FREEZE_PATH = (
-    WORKSPACE_ROOT
-    / "papers/agent_evolve_aaai_2027/research_artifacts/data/"
+    WORKSPACE_ROOT / "papers/agent_evolve_aaai_2027/research_artifacts/data/"
     "trap_portable_profile_v1.json"
 )
 
@@ -578,7 +714,14 @@ def _target_conditioned_specification() -> TargetConditionedCampaignSpecificatio
 def _frontier_target_allocator():
     """Bind the target geometry to the explicit T-RAP or T-RAP+ identity."""
 
-    if RESIDUAL_FRONTIER_PLANNING:
+    # Outcome-conditioned action forecasts require an authenticated target in
+    # raw objective units.  The residual allocator publishes that port-level
+    # representation (and a prior-only directional bootstrap when the archive
+    # has no positive residual cell); the legacy affine allocator intentionally
+    # publishes normalized geometry only.  Make the compatible choice at the
+    # composition root so an environment switch cannot create a late runtime
+    # type mismatch after expensive seed evaluations.
+    if RESIDUAL_FRONTIER_PLANNING or PORTFOLIO_SELECTOR_MODE == "outcome_conditioned":
         return ResidualHypervolumeFrontierTargetAllocator()
     if (
         CONSTRAINT_DECOUPLED_ACQUISITION
@@ -640,11 +783,38 @@ if GLOBAL_LOCAL_INITIAL_DESIGN and not COMMON_POOL_ACQUISITION:
         "the shared-initial-design treatment requires task_keyed_common_pool"
     )
 REQUIRED_SEED_COUNT = 10 if GLOBAL_LOCAL_INITIAL_DESIGN else 2
-GENERATION_COUNT = 5 if GLOBAL_LOCAL_INITIAL_DESIGN else 6
-PORTFOLIO_GENERATIONS = (1, 3, 5)
-RECOMBINATION_GENERATIONS = (2, 4) if GLOBAL_LOCAL_INITIAL_DESIGN else (2, 4, 6)
+_SCALE_SHAPE_ID = os.environ.get(
+    "AGENT_EVOLVE_SCALE_SHAPE",
+    os.environ.get("AGENT_EVOLVE_B38_SCALE_SHAPE", "g6_k4_r2"),
+).strip()
+if GLOBAL_LOCAL_INITIAL_DESIGN:
+    if _SCALE_SHAPE_ID != "g6_k4_r2":
+        raise ValueError(
+            "AGENT_EVOLVE_SCALE_SHAPE is incompatible with the sealed "
+            "shared-initial-design treatment"
+        )
+    CAMPAIGN_SCALE_SHAPE = PortfolioScaleShape("g5_k4_r1", 5, 2, 4, 1)
+elif COMMON_POOL_ACQUISITION:
+    try:
+        CAMPAIGN_SCALE_SHAPE = SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES[
+            _SCALE_SHAPE_ID
+        ]
+    except KeyError as error:
+        raise ValueError(
+            "AGENT_EVOLVE_SCALE_SHAPE must name a registered small-budget "
+            "shape: " + ", ".join(SMALL_BUDGET_CAMPAIGN_SCALE_SHAPES)
+        ) from error
+else:
+    if _SCALE_SHAPE_ID != "g6_k4_r2":
+        raise ValueError(
+            "AGENT_EVOLVE_SCALE_SHAPE requires task_keyed_common_pool"
+        )
+    CAMPAIGN_SCALE_SHAPE = PortfolioScaleShape("g6_k8_r2", 6, 2, 8, 2)
+GENERATION_COUNT = CAMPAIGN_SCALE_SHAPE.generation_count
+PORTFOLIO_GENERATIONS = tuple(range(1, GENERATION_COUNT + 1, 2))
+RECOMBINATION_GENERATIONS = tuple(range(2, GENERATION_COUNT + 1, 2))
 PARENTS_PER_PORTFOLIO = 2
-PORTFOLIO_WIDTH = 4 if COMMON_POOL_ACQUISITION else 8
+PORTFOLIO_WIDTH = CAMPAIGN_SCALE_SHAPE.portfolio_width
 CALIBRATED_PROPOSAL_WIDTH = 8
 COMMON_CANDIDATE_POOL_SIZE = _candidate_pool_size_from_environment(8)
 VARIATION_TOPOLOGY = CampaignVariationTopology.from_environment(os.environ)
@@ -654,6 +824,8 @@ if (
         CampaignAcquisitionMode.OPERATOR_STRATIFIED,
         CampaignAcquisitionMode.HORIZON_BOUNDED,
         CampaignAcquisitionMode.TARGET_CONDITIONED,
+        CampaignAcquisitionMode.ACQUISITION_CERTIFIED,
+        CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION,
     }
     and VARIATION_TOPOLOGY.mode is not CampaignVariationTopologyMode.HIERARCHICAL_R2
 ):
@@ -668,17 +840,13 @@ if (
 COMPOSITE_OPTION_COUNT = VARIATION_TOPOLOGY.max_composite_options
 COMPOSITION_SELECTION_EXPOSURE = VARIATION_TOPOLOGY.selection_exposure
 REQUIRED_COMPOSITE_PROPOSALS = VARIATION_TOPOLOGY.required_composite_proposals
-RECOMBINATIONS_PER_PARENT = 1 if GLOBAL_LOCAL_INITIAL_DESIGN else 2
-CAMPAIGN_SCALE_SHAPE = PortfolioScaleShape(
-    "g5_k4_r1" if GLOBAL_LOCAL_INITIAL_DESIGN else "g6_k4_r2",
-    GENERATION_COUNT,
-    PARENTS_PER_PORTFOLIO,
-    PORTFOLIO_WIDTH,
-    RECOMBINATIONS_PER_PARENT,
-)
+RECOMBINATIONS_PER_PARENT = CAMPAIGN_SCALE_SHAPE.recombinations_per_parent
 PLANNED_UNIQUE_EVALUATIONS = REQUIRED_SEED_COUNT + PARENTS_PER_PORTFOLIO * (
     len(PORTFOLIO_GENERATIONS) * PORTFOLIO_WIDTH
     + len(RECOMBINATION_GENERATIONS) * RECOMBINATIONS_PER_PARENT
+)
+MANDATORY_CANDIDATE_OCCURRENCES = REQUIRED_SEED_COUNT + PARENTS_PER_PORTFOLIO * (
+    len(PORTFOLIO_GENERATIONS) * PORTFOLIO_WIDTH
 )
 # Single source of truth for the journals this run declares. The manifest seals
 # this exact mapping and the provider-traffic witness counts from it, so a claim
@@ -723,6 +891,15 @@ PLANNED_LOGICAL_CALLS = (
     PLANNED_SELECTION_LOGICAL_CALLS + PLANNED_REFLECTION_LOGICAL_CALLS
 )
 EVALUATOR_CONCURRENCY = 8
+# Concurrent campaigns must not silently lease the same last-N CPUs.  The
+# offset selects a disjoint block from the end of the process affinity mask and
+# is sealed through the evaluator settings in preparation/preregistration.
+EVALUATOR_AFFINITY_OFFSET = _bounded_integer_environment(
+    "AGENT_EVOLVE_EVALUATOR_AFFINITY_OFFSET",
+    0,
+    minimum=0,
+    maximum=4096,
+)
 AGENT_CONCURRENCY = MODEL_EXECUTION_PROFILE.effective_max_connections(default=3)
 AGENT_QUEUE_CAPACITY = 8
 PARTITIONED_RETRY_BUDGET = (
@@ -734,6 +911,8 @@ PARTITIONED_RETRY_BUDGET = (
         CampaignAcquisitionMode.OPERATOR_STRATIFIED,
         CampaignAcquisitionMode.HORIZON_BOUNDED,
         CampaignAcquisitionMode.TARGET_CONDITIONED,
+        CampaignAcquisitionMode.ACQUISITION_CERTIFIED,
+        CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION,
     }
     else None
 )
@@ -747,20 +926,27 @@ MAX_BACKOFF_NS = 30_000_000_000
 
 
 def _finite_variation_catalog():
-    local = VARIATION_TOPOLOGY.decorate(BoilsFiniteVariationCatalog())
-    if (
-        PORTFOLIO_SELECTOR_MODE == "outcome_conditioned"
-        or (
-            CONSTRAINT_DECOUPLED_ACQUISITION
-            and (
-                ACQUISITION_MODE is CampaignAcquisitionMode.TARGET_CONDITIONED
-                or CONTEXTUAL_SEARCH_ALLOCATION
-            )
+    atomic = BoilsFiniteVariationCatalog()
+    local = VARIATION_TOPOLOGY.decorate(atomic)
+    if PORTFOLIO_SELECTOR_MODE == "outcome_conditioned" or (
+        CONSTRAINT_DECOUPLED_ACQUISITION
+        and (
+            ACQUISITION_MODE is CampaignAcquisitionMode.TARGET_CONDITIONED
+            or CONTEXTUAL_SEARCH_ALLOCATION
         )
     ):
         return SourceUnionFiniteVariationCatalog(
             primary_catalog=local,
-            source_catalogs=(BoilsGlobalRestartVariationCatalog(),),
+            source_catalogs=(
+                SourceExposureFiniteVariationCatalog(
+                    BoilsGlobalRestartVariationCatalog(),
+                    evaluation_source_minimum=None,
+                ),
+                SourceExposureFiniteVariationCatalog(
+                    GenericMultiscaleRestartFiniteVariationCatalog(atomic),
+                    evaluation_source_minimum=None,
+                ),
+            ),
         )
     return local
 
@@ -768,18 +954,25 @@ def _finite_variation_catalog():
 def _require_pairwise_disjoint_evaluation_patches() -> bool:
     """Keep the legacy diversity constraint outside independent T-RAP+ probes."""
 
-    return not CONSTRAINT_DECOUPLED_ACQUISITION
+    return not (
+        CONSTRAINT_DECOUPLED_ACQUISITION
+        or PROTECTED_ACQUISITION_MODE != "off"
+    )
 
 
-def _contextual_joint_capability_projector(
-) -> FiniteContractContextualJointCapabilityProjector:
+def _contextual_joint_capability_projector() -> (
+    FiniteContractContextualJointCapabilityProjector
+):
     """Bind generic finite-structure constraints used by this workload adapter."""
 
     return FiniteContractContextualJointCapabilityProjector(
-        min_distinct_families=3,
+        min_distinct_families=MINIMUM_DISTINCT_EVALUATION_FAMILIES,
         require_pairwise_disjoint_parent_patches=(
             _require_pairwise_disjoint_evaluation_patches()
         ),
+        operator_exposure_bounds=(("atomic", 1, PORTFOLIO_WIDTH),),
+        minimum_single_path_interventions=1,
+        protect_future_recombination_opportunities=True,
         require_declared_source_floor_options=True,
     )
 
@@ -821,6 +1014,12 @@ PROTOCOL_ID = (
             CampaignAcquisitionMode.TARGET_CONDITIONED: (
                 "boils_generic_target_conditioned_g6_v1"
             ),
+            CampaignAcquisitionMode.ACQUISITION_CERTIFIED: (
+                "boils_generic_acquisition_certified_residual_g6_v1"
+            ),
+            CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION: (
+                "boils_generic_regret_bounded_information_g6_v1"
+            ),
         }[ACQUISITION_MODE]
         if COMMON_POOL_ACQUISITION
         else "boils_generic_calibrated_g6_delayed_identifiable_v2"
@@ -860,6 +1059,98 @@ MEMORY_AGGREGATION_ID = "affine_archive_joint_wave_gain"
 MEMORY_AGGREGATION_DEFINITION_SHA256 = hashlib.sha256(
     b"agent-evolve:affine-archive-joint-wave-gain:v1"
 ).hexdigest()
+
+
+def _acquisition_objectives() -> tuple[FiniteAcquisitionObjective, ...]:
+    """Return the single metric contract shared by acquisition and recourse."""
+
+    return tuple(
+        sorted(
+            (
+                FiniteAcquisitionObjective(
+                    "total_levels",
+                    "min",
+                    0.0,
+                    LEVEL_REFERENCE,
+                ),
+                FiniteAcquisitionObjective(
+                    "total_lut_count",
+                    "min",
+                    0.0,
+                    LUT_REFERENCE,
+                ),
+            ),
+            key=lambda value: value.metric_id,
+        )
+    )
+
+
+def _protected_acquisition_envelope(
+    bundle: "_Bundle",
+) -> ProtectedFiniteAcquisitionVariationEnvelope | None:
+    """Compose the optional workload-neutral numerical proposal expert."""
+
+    if PROTECTED_ACQUISITION_MODE == "off" or bundle.arm != "live":
+        return None
+    if PROTECTED_ACQUISITION_BATCH_SIZE < (
+        PARENTS_PER_PORTFOLIO * PROTECTED_ACQUISITION_SOURCE_MINIMUM
+    ):
+        raise ValueError(
+            "protected acquisition batch cannot satisfy every parent-lane floor"
+        )
+    acquisition = build_isolated_botorch_qlognehvi(
+        python_executable=PINNED_BOTORCH_PYTHON,
+        source_root=AGENT_EVOLVE_ROOT / "src",
+        mc_samples=PROTECTED_ACQUISITION_MC_SAMPLES,
+        maximum_optimizer_batch_size=2048,
+        timeout_s=900.0,
+    )
+    context_sink = None
+    if type(bundle.coordinator.allocator) is AcquisitionCertifiedSlatePolicy:
+        candidate_sink = bundle.coordinator.allocator.context_provider
+        if not isinstance(candidate_sink, AcquisitionCertifiedSlateContextSink):
+            raise TypeError("acquisition-certified allocator needs a context sink")
+        context_sink = candidate_sink
+    return ProtectedFiniteAcquisitionVariationEnvelope(
+        objectives=_acquisition_objectives(),
+        space=BoilsFiniteAcquisitionSpace(),
+        acquisition=acquisition,
+        phenotype_identity=bundle.benchmark.phenotype_identity,
+        acquisition_certification_context_sink=context_sink,
+        pool_size=PROTECTED_ACQUISITION_POOL_SIZE,
+        protected_batch_size=PROTECTED_ACQUISITION_BATCH_SIZE,
+        source_minimum_per_lane=PROTECTED_ACQUISITION_SOURCE_MINIMUM,
+        seed=OUTER_SEED,
+        source_id="numerical_acquisition",
+        option_family="acquisition",
+        operator_id="global",
+    )
+
+
+def _capacity_recourse(
+    bundle: "_Bundle",
+    composition: object,
+) -> FiniteAcquisitionCapacityRecourse | None:
+    """Fill live-arm stage undercapacity from the current real archive."""
+
+    if PROTECTED_ACQUISITION_MODE == "off" or bundle.arm != "live":
+        return None
+    return FiniteAcquisitionCapacityRecourse(
+        objectives=_acquisition_objectives(),
+        space=BoilsFiniteAcquisitionSpace(),
+        acquisition=build_isolated_botorch_qlognehvi(
+            python_executable=PINNED_BOTORCH_PYTHON,
+            source_root=AGENT_EVOLVE_ROOT / "src",
+            mc_samples=PROTECTED_ACQUISITION_MC_SAMPLES,
+            maximum_optimizer_batch_size=2048,
+            timeout_s=900.0,
+        ),
+        phenotype_identity=bundle.benchmark.phenotype_identity,
+        engine=getattr(composition, "engine", None),
+        hard_feasibility=bundle.benchmark.hard_feasibility,
+        pool_size=PROTECTED_ACQUISITION_POOL_SIZE,
+        seed=OUTER_SEED + 10_000_019,
+    )
 
 
 def _sha(value: str) -> str:
@@ -1069,16 +1360,21 @@ def _expected_forecast_feedback_counts(arm: str) -> tuple[int, int]:
 
 
 def _provider_response_telemetry_gate(
-    *, arm: str, outcome_rows: tuple[dict[str, object], ...]
+    *,
+    arm: str,
+    outcome_rows: tuple[dict[str, object], ...],
+    expected_provider_calls: int,
 ) -> bool:
     """Verify terminal route and profile-specific reasoning for every live call."""
 
     if arm == "control":
         return not outcome_rows
+    if type(expected_provider_calls) is not int or expected_provider_calls < 0:
+        raise ValueError("expected_provider_calls must be non-negative")
     if arm != "live" or (
-        len(outcome_rows) < PLANNED_LOGICAL_CALLS
+        len(outcome_rows) < expected_provider_calls
         if PORTFOLIO_SELECTOR_MODE == "outcome_conditioned"
-        else len(outcome_rows) != PLANNED_LOGICAL_CALLS
+        else len(outcome_rows) != expected_provider_calls
     ):
         return False
     for row in outcome_rows:
@@ -1113,9 +1409,11 @@ def _affinity_sets(count: int) -> tuple[tuple[int, ...], ...]:
     if type(count) is not int or count <= 0:
         raise ValueError("evaluator concurrency must be a positive integer")
     allowed = tuple(sorted(os.sched_getaffinity(0)))
-    if len(allowed) < count:
+    end = len(allowed) - EVALUATOR_AFFINITY_OFFSET
+    start = end - count
+    if start < 0 or end > len(allowed):
         raise RuntimeError("insufficient CPU affinity for BOiLS evaluator leases")
-    return tuple((cpu,) for cpu in allowed[-count:])
+    return tuple((cpu,) for cpu in allowed[start:end])
 
 
 def _source_paths() -> tuple[Path, ...]:
@@ -1214,6 +1512,22 @@ def _reference_variation_topology_binding(implementation: object):
 
 
 def _allocator() -> CalibratedPortfolioAllocator:
+    certification_registry = (
+        AcquisitionCertifiedSlateContextRegistry()
+        if NUMERICALLY_CERTIFIED_ACQUISITION
+        else None
+    )
+    certification_scorer = (
+        build_isolated_botorch_qlognehvi_batch_score(
+            python_executable=PINNED_BOTORCH_PYTHON,
+            source_root=AGENT_EVOLVE_ROOT / "src",
+            mc_samples=PROTECTED_ACQUISITION_MC_SAMPLES,
+            maximum_score_batch_size=512,
+            timeout_s=900.0,
+        )
+        if NUMERICALLY_CERTIFIED_ACQUISITION
+        else None
+    )
     return build_campaign_acquisition_allocator(
         ACQUISITION_MODE,
         common_pool_enabled=COMMON_POOL_ACQUISITION,
@@ -1234,6 +1548,33 @@ def _allocator() -> CalibratedPortfolioAllocator:
             _target_conditioned_specification().profile
             if ACQUISITION_MODE is CampaignAcquisitionMode.TARGET_CONDITIONED
             else None
+        ),
+        acquisition_certification_context_provider=certification_registry,
+        acquisition_batch_scorer=certification_scorer,
+        regret_minimum_acquisition_retention_ratio=(
+            1.0
+            if REGRET_BOUNDED_CONTROLS is None
+            else REGRET_BOUNDED_CONTROLS.minimum_acquisition_retention_ratio
+        ),
+        regret_minimum_residual_audit_members=(
+            0
+            if REGRET_BOUNDED_CONTROLS is None
+            else REGRET_BOUNDED_CONTROLS.minimum_residual_audit_members
+        ),
+        regret_future_value_policy=(
+            None
+            if REGRET_BOUNDED_CONTROLS is None
+            else REGRET_BOUNDED_CONTROLS.future_value_policy
+        ),
+        regret_calibration_error_bound=(
+            None
+            if REGRET_BOUNDED_CONTROLS is None
+            else REGRET_BOUNDED_CONTROLS.calibration_error_bound
+        ),
+        regret_allow_development_assay=(
+            False
+            if REGRET_BOUNDED_CONTROLS is None
+            else REGRET_BOUNDED_CONTROLS.allow_development_assay
         ),
     )
 
@@ -1279,8 +1620,16 @@ def _selection_contract_label() -> str:
             if CONSTRAINT_DECOUPLED_ACQUISITION
             else "target_conditioned_realizable_k8_to_k4"
         ),
+        CampaignAcquisitionMode.ACQUISITION_CERTIFIED: (
+            "acquisition_certified_residual_k8_to_k4"
+        ),
+        CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION: (
+            "regret_bounded_information_k8_to_k4"
+        ),
     }[ACQUISITION_MODE]
-    return f"contextual_source_operator_{base}" if CONTEXTUAL_SEARCH_ALLOCATION else base
+    return (
+        f"contextual_source_operator_{base}" if CONTEXTUAL_SEARCH_ALLOCATION else base
+    )
 
 
 def _common_candidate_pool_policy() -> TaskKeyedCommonCandidatePoolPolicy | None:
@@ -1335,7 +1684,9 @@ def _provider_config() -> ProgressAwareOpenRouterConfig:
         supports_forced_tool_choice=(
             MODEL_EXECUTION_PROFILE.supports_forced_tool_choice
         ),
-        retry_mode=(ProgressAwareRetryMode.OPAQUE_HTTP_400_AND_BOUNDED_SCHEMA_REPAIR),
+        retry_mode=(
+            ProgressAwareRetryMode.FIRST_EVENT_RESILIENT_BOUNDED_SCHEMA_REPAIR
+        ),
     )
 
 
@@ -1561,7 +1912,7 @@ def _target_conditioned_controller(
         selected_context=(
             lambda wave, result: coordinator.decode_target_conditioned_context(result)
         ),
-        marginal_utility=FixedReferenceContextualMarginalUtilityProjector(
+        marginal_utility=ExactCoalitionShapleyContextualUtilityProjector(
             bundle.utility
         ),
     )
@@ -1626,6 +1977,7 @@ def _outcome_conditioned_selector(
     *,
     runner: Any,
     bundle: _Bundle,
+    audit_artifact_store: Any,
 ) -> OutcomeConditionedPortfolioSelectionPolicy:
     """Compose the workload-neutral all-action policy for BOiLS.
 
@@ -1648,16 +2000,33 @@ def _outcome_conditioned_selector(
         partition_policy=ActionForecastPartitionPolicyBinding(
             policy_id="generic_campaign_action_forecast_blocks",
             policy_version=1,
-            policy_definition_sha256=(
-                ACTION_FORECAST_PARTITION_DEFINITION_SHA256
-            ),
+            policy_definition_sha256=(ACTION_FORECAST_PARTITION_DEFINITION_SHA256),
             max_rows_per_block=ACTION_FORECAST_BLOCK_ROWS,
             max_metric_cells_per_block=(
                 ACTION_FORECAST_BLOCK_ROWS * len(OBJECTIVE_IDS)
             ),
         ),
         action_semantics_factory=None,
+        consequence_calibrator=HierarchicalEmpiricalConsequenceCalibrationPolicy(
+            ledger=bundle.feedback_ledger,
+            scope=_outcome_conditioned_calibration_scope(bundle),
+            audit_artifact_store=audit_artifact_store,
+        ),
         metric_projector=None,
+        wave_action_coordinator=BarrierGlobalWaveActionAllocationCoordinator(
+            policy=GlobalRoleBalancedWaveActionAllocationPolicy(),
+            expected_lane_count=2,
+        ),
+        contextual_allocation_provider=(
+            lambda request: (
+                bundle.coordinator.binding_for(request).contextual_allocation
+            )
+        ),
+        candidate_pool_provider=(
+            lambda request: bundle.coordinator.binding_for(
+                request
+            ).common_candidate_pool
+        ),
         risk_aversion=0.5,
         diversity_weight=0.05,
         beam_width=256,
@@ -1671,14 +2040,11 @@ def _outcome_conditioned_calibration_scope(
 
     source = bundle.binding_factory.scope
     source.revalidate()
-    return ForecastCalibrationScope(
-        model_profile_sha256=source.model_profile_sha256,
+    return source.for_policy_frame(
         prompt_definition_sha256=ACTION_FORECAST_POLICY_DEFINITION_SHA256,
         selector_policy_definition_sha256=(
             OUTCOME_CONDITIONED_PORTFOLIO_POLICY_DEFINITION_SHA256
         ),
-        benchmark_sha256=source.benchmark_sha256,
-        session_sha256=source.session_sha256,
     )
 
 
@@ -1843,7 +2209,7 @@ def _prepare_bundle(
                 object(),
             ),
             reflection_supervision=CampaignReflectionSupervisionPolicy(
-                ReflectionFailureMode.FAIL_AT_NEXT_STAGE_BOUNDARY
+                ReflectionFailureMode.BEST_EFFORT_DEGRADED
             ),
             archive_utility=utility,
         )
@@ -1901,7 +2267,10 @@ def _prepare_bundle(
             )
             for wave in prepared.schedule.reflection_waves
         )
-        != ((2, 4, 1),)
+        != tuple(
+            (generation, generation + 2, 1)
+            for generation in REFLECTION_SOURCE_GENERATIONS
+        )
         or prepared.schedule.planned_candidate_evaluations
         + protocol.required_seed_count
         != PLANNED_UNIQUE_EVALUATIONS
@@ -2303,7 +2672,7 @@ class _WaveFactory:
             cards=cards,
             portfolio_size=PORTFOLIO_WIDTH,
             required_metric_ids=OBJECTIVE_IDS,
-            min_distinct_families=3,
+            min_distinct_families=MINIMUM_DISTINCT_EVALUATION_FAMILIES,
             # The calibrated slate must administer every assigned card across
             # the evaluated K8, but unrelated exploratory members may remain
             # card-unclaimed. Requiring a claim on every member would make a
@@ -2736,8 +3105,24 @@ class _WaveFactory:
             context.parent_lane.lane_id: coordinator.require_projected_context(context)
             for context in contexts
         }
+        if all(value is None for value in diagnostic_by_lane.values()):
+            return tuple(
+                self._bootstrap_wave(
+                    context,
+                    status="typed_e0_no_reflected_memory_available",
+                    evidence={
+                        "evidence_tier": "e0",
+                        "eligible_reflection_receipt_count": 0,
+                        "memory_dose_administered": False,
+                        "memory_credit_issued": False,
+                    },
+                )
+                for context in contexts
+            )
         if any(value is None for value in diagnostic_by_lane.values()):
-            raise RuntimeError("G5 requires exactly one admitted reflection")
+            raise RuntimeError(
+                "G5 diagnostic memory availability differs across parent lanes"
+            )
         diagnostic_receipts = {
             value.exposure.receipt_sha256
             for value in diagnostic_by_lane.values()
@@ -3076,7 +3461,16 @@ class _WaveFactory:
                 },
             )
         if not exposures:
-            raise RuntimeError("G5 did not receive the G4-admitted reflection")
+            return self._bootstrap_wave(
+                context,
+                status="typed_e0_no_reflected_memory_available",
+                evidence={
+                    "evidence_tier": "e0",
+                    "eligible_reflection_receipt_count": 0,
+                    "memory_dose_administered": False,
+                    "memory_credit_issued": False,
+                },
+            )
         raise RuntimeError(
             "live G5 reflected memory requires atomic compatibility-aware "
             "batch construction"
@@ -3533,6 +3927,11 @@ def _all_wave_probe(
             start=1,
         )
     )
+    archive_model = ParetoArchive(bundle.benchmark.objectives)
+    for parent in parents:
+        archive_model.consider(parent)
+    archive_snapshot = archive_model.snapshot()
+    variation_envelope = _protected_acquisition_envelope(bundle)
     reflection = _reflection_probe(bundle, parents)
     known = tuple(
         sorted(
@@ -3590,8 +3989,17 @@ def _all_wave_probe(
                 "agent-evolve:contextual-search-campaign:"
                 + bundle.prepared.preparation_sha256
             ),
+            incumbent_source_id=(
+                PROTECTED_ACQUISITION_SOURCE_ID
+                if PROTECTED_ACQUISITION_MODE != "off"
+                else "primary"
+            ),
             joint_capability_projector=_contextual_joint_capability_projector(),
+            available_operator_ids=("atomic", "composite", "global"),
             frontier_target_allocator=_frontier_target_allocator(),
+            require_objective_space_targets=(
+                PORTFOLIO_SELECTOR_MODE == "outcome_conditioned"
+            ),
         )
         if bundle.arm == "live" and CONTEXTUAL_SEARCH_ALLOCATION
         else None
@@ -3631,15 +4039,74 @@ def _all_wave_probe(
                 f"boils-prepare-prior-audit-{generation}"
             ),
         )
-        generation_contexts: list[CampaignPortfolioWaveContext] = []
-        for slot, parent in enumerate(parents):
-            variation = bundle.workload_ports.catalog.bind(
-                session.benchmark, parent.configuration, known
+        base_variations = tuple(
+            bundle.workload_ports.catalog.bind(
+                session.benchmark,
+                parent.configuration,
+                known,
             )
+            for parent in parents
+        )
+        variations = base_variations
+        variation_envelope_record: dict[str, object] | None = None
+        if variation_envelope is not None:
+            envelope_request = CampaignVariationEnvelopeRequest(
+                campaign_scope_sha256=TASK_SHA256,
+                generation=generation,
+                evaluation_slots_per_lane=PORTFOLIO_WIDTH,
+                state=OptimizerState(
+                    generation=generation - 1,
+                    candidates=parents,
+                    archive=archive_snapshot,
+                    archive_snapshot_hash=pareto_archive_snapshot_hash(
+                        archive_snapshot
+                    ),
+                    unique_evaluations=len(parents),
+                    logical_llm_calls=0,
+                ),
+                archive_utility=utility,
+                lanes=tuple(
+                    sorted(
+                        (
+                            CampaignVariationEnvelopeLane(
+                                lane_id=lane_id,
+                                parent=parent,
+                                base_variation=variation,
+                            )
+                            for lane_id, parent, variation in zip(
+                                ("elite", "explorer"),
+                                parents,
+                                base_variations,
+                                strict=True,
+                            )
+                        ),
+                        key=lambda value: value.lane_id,
+                    )
+                ),
+            )
+            envelope_result = variation_envelope.enrich(envelope_request)
+            validate_campaign_variation_envelope_result(
+                policy=variation_envelope,
+                request=envelope_request,
+                result=envelope_result,
+            )
+            enriched_by_lane = {
+                value.lane_id: value.variation for value in envelope_result.lanes
+            }
+            variations = tuple(
+                enriched_by_lane[lane_id] for lane_id in ("elite", "explorer")
+            )
+            variation_envelope_record = (
+                campaign_variation_envelope_context_record(envelope_result)
+            )
+        generation_contexts: list[CampaignPortfolioWaveContext] = []
+        for slot, (parent, base_variation, variation) in enumerate(
+            zip(parents, base_variations, variations, strict=True)
+        ):
             context = bundle.workload_ports.evidence.context(
                 session,
                 parent.configuration,
-                variation,
+                base_variation,
                 memory_projection,
             )
             parent_measurement = bind_parent_measurement(
@@ -3648,10 +4115,22 @@ def _all_wave_probe(
                 projection=bundle.parent_measurement_projection,
             )
             context = attach_parent_measurement_to_context(context, parent_measurement)
+            if variation_envelope_record is not None:
+                envelope_context = thaw_json(context)
+                if type(envelope_context) is not dict:
+                    raise TypeError("preparation context must be an object")
+                if CAMPAIGN_VARIATION_ENVELOPE_KEY in envelope_context:
+                    raise ValueError(
+                        "preparation context uses the reserved variation-envelope key"
+                    )
+                envelope_context[CAMPAIGN_VARIATION_ENVELOPE_KEY] = (
+                    variation_envelope_record
+                )
+                context = _object(envelope_context)
             cards = bundle.workload_ports.evidence.cards(
                 session,
                 parent.configuration,
-                variation,
+                base_variation,
                 memory_projection,
             )
             generation_contexts.append(
@@ -3743,6 +4222,15 @@ def _all_wave_probe(
                 "evaluation_width": PORTFOLIO_WIDTH,
                 "variation_source_ids": list(
                     finite_variation_source_ids(variation.contract)
+                ),
+                "numerical_acquisition_option_count": sum(
+                    finite_variation_source_id(option) == "numerical_acquisition"
+                    for option in variation.contract.options
+                ),
+                "variation_envelope_result_sha256": (
+                    None
+                    if variation_envelope_record is None
+                    else variation_envelope_record["result_sha256"]
                 ),
                 "contextual_allocation": (
                     None
@@ -3955,9 +4443,7 @@ def _all_wave_probe(
                 and len(row["variation_source_ids"]) >= 2
                 and {
                     value[0]
-                    for value in row["contextual_allocation"][
-                        "source_target_counts"
-                    ]
+                    for value in row["contextual_allocation"]["source_target_counts"]
                 }
                 == set(row["variation_source_ids"])
                 for row in rows
@@ -3975,9 +4461,7 @@ def _all_wave_probe(
                 )
                 == PARENTS_PER_PORTFOLIO
                 and len(
-                    plan["stage_allocation"]["decision"][
-                        "joint_capability_selection"
-                    ]
+                    plan["stage_allocation"]["decision"]["joint_capability_selection"]
                 )
                 == PARENTS_PER_PORTFOLIO
                 for plan in contextual_plans
@@ -3986,6 +4470,16 @@ def _all_wave_probe(
             else not contextual_plans
         ),
         "reflection_construction": reflection["all_gates_pass"],
+        "protected_acquisition_composed_every_bootstrap_wave": (
+            variation_envelope is None
+            or all(
+                "numerical_acquisition" in row["variation_source_ids"]
+                and row["numerical_acquisition_option_count"]
+                >= PROTECTED_ACQUISITION_SOURCE_MINIMUM
+                and row["variation_envelope_result_sha256"] is not None
+                for row in bootstrap_rows
+            )
+        ),
     }
     return {
         "status": "provider_credential_abc_free_all_wave_construction",
@@ -4105,6 +4599,22 @@ def _manifest(
                 VARIATION_TOPOLOGY.hierarchical_composition_required_proposals
             ),
             "variation_topology": VARIATION_TOPOLOGY.to_record(),
+            "protected_acquisition": {
+                "mode": PROTECTED_ACQUISITION_MODE,
+                "pool_size": PROTECTED_ACQUISITION_POOL_SIZE,
+                "batch_size": PROTECTED_ACQUISITION_BATCH_SIZE,
+                "source_minimum_per_lane": (
+                    PROTECTED_ACQUISITION_SOURCE_MINIMUM
+                ),
+                "mc_samples": PROTECTED_ACQUISITION_MC_SAMPLES,
+                "space": {
+                    "space_id": BoilsFiniteAcquisitionSpace().space_id,
+                    "space_version": BoilsFiniteAcquisitionSpace().space_version,
+                    "definition_sha256": (
+                        BoilsFiniteAcquisitionSpace().definition_sha256
+                    ),
+                },
+            },
             "objectives": list(OBJECTIVE_IDS),
             "real_evaluator_receipts": "evaluator_receipts/",
             "real_evaluator_observations": "real_evaluator_observations.jsonl",
@@ -4478,6 +4988,16 @@ def _preregistration_contract(
             )
         ),
         "engine_evaluation_width": PORTFOLIO_WIDTH,
+        "protected_acquisition": {
+            "mode": PROTECTED_ACQUISITION_MODE,
+            "pool_size": PROTECTED_ACQUISITION_POOL_SIZE,
+            "batch_size": PROTECTED_ACQUISITION_BATCH_SIZE,
+            "source_minimum_per_lane": PROTECTED_ACQUISITION_SOURCE_MINIMUM,
+            "mc_samples": PROTECTED_ACQUISITION_MC_SAMPLES,
+            "space_definition_sha256": (
+                BoilsFiniteAcquisitionSpace().definition_sha256
+            ),
+        },
         "selection_policy": {
             "selector_policy_definition_sha256": (_selector_policy_definition_sha256()),
             "prompt_definition_sha256": (
@@ -4750,7 +5270,13 @@ async def _execute(
         )
         generator = PydanticAIAgenticGenerator(runner)
         selector = (
-            _outcome_conditioned_selector(runner=runner, bundle=bundle)
+            _outcome_conditioned_selector(
+                runner=runner,
+                bundle=bundle,
+                audit_artifact_store=FileSystemArtifactStore(
+                    run_dir / "consequence_calibration_audits"
+                ),
+            )
             if PORTFOLIO_SELECTOR_MODE == "outcome_conditioned"
             # The composition policy makes no provider call: it spans the
             # proposal sources and draws uniformly inside them. It is wired at
@@ -4762,6 +5288,10 @@ async def _execute(
         expected_selector_type = (
             PydanticAIContextualSearchAllocationPortfolioSelectionPolicy
             if CONTEXTUAL_SEARCH_ALLOCATION
+            else PydanticAIRegretBoundedInformationPortfolioSelectionPolicy
+            if ACQUISITION_MODE is CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION
+            else PydanticAIAcquisitionCertifiedResidualPortfolioSelectionPolicy
+            if ACQUISITION_MODE is CampaignAcquisitionMode.ACQUISITION_CERTIFIED
             else PydanticAIConstraintDecoupledTargetConditionedPortfolioSelectionPolicy
             if (
                 CONSTRAINT_DECOUPLED_ACQUISITION
@@ -4848,9 +5378,7 @@ async def _execute(
     )
     contextual_ledger = (
         ContextualSearchLedger()
-        if bundle.arm == "live"
-        and CONTEXTUAL_SEARCH_ALLOCATION
-        and PORTFOLIO_SELECTOR_MODE == "calibrated"
+        if bundle.arm == "live" and CONTEXTUAL_SEARCH_ALLOCATION
         else None
     )
     contextual_scope_sha256 = _sha(
@@ -4862,8 +5390,17 @@ async def _execute(
         else CampaignContextualSearchPlanner(
             ledger=contextual_ledger,
             campaign_scope_sha256=contextual_scope_sha256,
+            incumbent_source_id=(
+                PROTECTED_ACQUISITION_SOURCE_ID
+                if PROTECTED_ACQUISITION_MODE != "off"
+                else "primary"
+            ),
             joint_capability_projector=_contextual_joint_capability_projector(),
+            available_operator_ids=("atomic", "composite", "global"),
             frontier_target_allocator=_frontier_target_allocator(),
+            require_objective_space_targets=(
+                PORTFOLIO_SELECTOR_MODE == "outcome_conditioned"
+            ),
         )
     )
     wave_factory = _WaveFactory(
@@ -4917,8 +5454,7 @@ async def _execute(
         raise RuntimeError("runtime policies differ from preparation")
     outcome_conditioned_scope = (
         _outcome_conditioned_calibration_scope(bundle)
-        if bundle.arm == "live"
-        and PORTFOLIO_SELECTOR_MODE == "outcome_conditioned"
+        if bundle.arm == "live" and PORTFOLIO_SELECTOR_MODE == "outcome_conditioned"
         else None
     )
     calibrated_outcome_updater = (
@@ -4948,19 +5484,42 @@ async def _execute(
                 else {
                     "contextual_ledger": contextual_ledger,
                     "selected_search_sources": (
-                        lambda wave, result: (
+                        (
+                            lambda wave, result: (
+                                outcome_conditioned_selected_source_ids(
+                                    wave=wave,
+                                    result=result,
+                                )
+                            )
+                        )
+                        if outcome_conditioned_scope is not None
+                        else lambda wave, result: (
                             bundle.coordinator.decode_selected_source_ids(result)
                         )
                     ),
                     "selected_allocation_realization": (
-                        lambda wave, result: (
+                        (
+                            lambda wave, result: (
+                                outcome_conditioned_contextual_allocation_realization(
+                                    allocation=(
+                                        bundle.coordinator.binding_for(
+                                            wave.selection_request
+                                        ).contextual_allocation
+                                    ),
+                                    wave=wave,
+                                    result=result,
+                                )
+                            )
+                        )
+                        if outcome_conditioned_scope is not None
+                        else lambda wave, result: (
                             bundle.coordinator.decode_contextual_allocation_realization(
                                 result
                             )
                         )
                     ),
                     "contextual_marginal_utility": (
-                        FixedReferenceContextualMarginalUtilityProjector(bundle.utility)
+                        ExactCoalitionShapleyContextualUtilityProjector(bundle.utility)
                     ),
                     "contextual_campaign_scope_sha256": (contextual_scope_sha256),
                 }
@@ -4982,6 +5541,8 @@ async def _execute(
         parent_selector=bundle.parent_selector,
         wave_factory=wave_factory,
         task_sha256=TASK_SHA256,
+        variation_envelope=_protected_acquisition_envelope(bundle),
+        capacity_recourse=_capacity_recourse(bundle, composition),
         parent_measurement_projection=bundle.parent_measurement_projection,
         archive_context_projector=runtime_archive_context_projector,
         memory_estimand_projector=wave_factory.diagnostic_coordinator,
@@ -4998,7 +5559,9 @@ async def _execute(
         ),
         contextual_search_planner=contextual_planner,
         frontier_target_allocator=(
-            ResidualHypervolumeFrontierTargetAllocator()
+            None
+            if contextual_planner is not None
+            else ResidualHypervolumeFrontierTargetAllocator()
             if PORTFOLIO_SELECTOR_MODE == "outcome_conditioned"
             else _frontier_target_allocator()
             if target_controller is not None
@@ -5034,6 +5597,24 @@ async def _execute(
     source_after = _require_source_closure(expected_source_sha256)
     stage_counts = [value.candidate_occurrence_count for value in result.stage_receipts]
     stage_unique = [value.unique_evaluation_count for value in result.stage_receipts]
+    completed_reflections = tuple(
+        value
+        for value in result.reflection_receipts
+        if value.status is CampaignReflectionStatus.COMPLETED
+    )
+    abstained_reflections = tuple(
+        value
+        for value in result.reflection_receipts
+        if value.status is CampaignReflectionStatus.ABSTAINED
+    )
+    failed_reflections = tuple(
+        value
+        for value in result.reflection_receipts
+        if value.status is CampaignReflectionStatus.FAILED
+    )
+    reflection_abstention_records = tuple(
+        thaw_json(value.quarantined_result) for value in abstained_reflections
+    )
     evaluation_accounting = CampaignEvaluationAccounting(
         planned_candidate_occurrences=PLANNED_UNIQUE_EVALUATIONS,
         seed_occurrences=(result.counters.candidate_occurrences - sum(stage_counts)),
@@ -5044,6 +5625,11 @@ async def _execute(
         stage_unique_evaluations=tuple(stage_unique),
         candidate_occurrences=result.counters.candidate_occurrences,
         unique_evaluations=result.counters.unique_evaluations,
+        minimum_candidate_occurrences=(
+            MANDATORY_CANDIDATE_OCCURRENCES
+            if NUMERICALLY_CERTIFIED_ACQUISITION
+            else None
+        ),
     )
     detailed_receipts = [
         candidate.detailed_evaluation.payload.receipt
@@ -5053,11 +5639,12 @@ async def _execute(
     ]
     candidate_outcomes = _candidate_outcome_accounting(runtime.history)
     all_candidate_outcomes_terminal_and_typed = (
-        candidate_outcomes["evaluated_count"] == PLANNED_UNIQUE_EVALUATIONS
+        candidate_outcomes["evaluated_count"]
+        == result.counters.candidate_occurrences
         and candidate_outcomes["runtime_failure_count"] == 0
         and candidate_outcomes["scored_count"]
         + candidate_outcomes["typed_candidate_infeasible_count"]
-        == PLANNED_UNIQUE_EVALUATIONS
+        == result.counters.candidate_occurrences
     )
     outbound = tuple(
         validate_openrouter_outbound_request_manifest_record(
@@ -5085,6 +5672,12 @@ async def _execute(
     provider_response_gate = _provider_response_telemetry_gate(
         arm=bundle.arm,
         outcome_rows=outcome_rows,
+        expected_provider_calls=(
+            0
+            if bundle.arm == "control"
+            else len(PORTFOLIO_GENERATIONS) * PARENTS_PER_PORTFOLIO
+            + len(completed_reflections)
+        ),
     )
     provider_response_telemetry = [
         row["authenticated_record"]["response"]
@@ -5133,6 +5726,7 @@ async def _execute(
             "applied_exact_lane_supported_optimization_memory",
             "applied_signed_advisory_optimization_memory",
             "no_lane_support_for_reflected_memory",
+            "typed_e0_no_reflected_memory_available",
         }
     )
     memory_trial_count = len(bundle.memory.trials)
@@ -5270,6 +5864,10 @@ async def _execute(
         ),
         reflection_typed_exclusions=sum(
             int(value["typed_exclusion_count"]) for value in reflection_records
+        )
+        + sum(
+            int(value["observation_count"])
+            for value in reflection_abstention_records
         ),
         forecast_enabled=bundle.arm == "live",
         planned_selector_receipts=(
@@ -5316,18 +5914,54 @@ async def _execute(
             ),
         )
     )
+    anchor_residual_identification = (
+        None
+        if bundle.arm != "live"
+        or REGRET_BOUNDED_CONTROLS is None
+        or REGRET_BOUNDED_CONTROLS.minimum_residual_audit_members == 0
+        else AnchorResidualIdentificationContract(
+            expected_selector_calls=(
+                len(PORTFOLIO_GENERATIONS) * PARENTS_PER_PORTFOLIO
+            ),
+            portfolio_width=PORTFOLIO_WIDTH,
+            minimum_residual_members=(
+                REGRET_BOUNDED_CONTROLS.minimum_residual_audit_members
+            ),
+            exact_residual_members=(
+                REGRET_BOUNDED_CONTROLS.minimum_residual_audit_members
+            ),
+        ).assess(
+            project_anchor_residual_selection_audits(result.stage_receipts)
+        )
+    )
     health = {
         "exact_generations": result.counters.generations_completed == GENERATION_COUNT,
         "exact_evaluation_accounting": True,
         "bounded_cache_reuse": evaluation_accounting.within_cache_reuse_limit(
             MAX_CACHE_REUSE_OCCURRENCES
         ),
-        "exact_stage_counts": stage_counts == expected_stage_counts,
+        "candidate_occurrences_within_frozen_capacity": (
+            MANDATORY_CANDIDATE_OCCURRENCES
+            <= result.counters.candidate_occurrences
+            <= PLANNED_UNIQUE_EVALUATIONS
+        ),
+        "stage_occurrences_within_typed_operator_capacity": all(
+            count == expected_stage_counts[generation - 1]
+            if generation in PORTFOLIO_GENERATIONS
+            else 0 <= count <= expected_stage_counts[generation - 1]
+            for generation, count in enumerate(stage_counts, start=1)
+        ),
+        "reflection_block_completed_or_typed_e0": (
+            not failed_reflections
+            and len(completed_reflections) + len(abstained_reflections)
+            == len(REFLECTION_SOURCE_GENERATIONS)
+        ),
         "exact_logical_calls": result.counters.logical_agent_calls
         == PLANNED_LOGICAL_CALLS,
         "real_evaluator_observations": bundle.evaluator_observer.calls
         == evaluation_accounting.unique_evaluations,
-        "real_detailed_receipts": len(detailed_receipts) == PLANNED_UNIQUE_EVALUATIONS,
+        "real_detailed_receipts": len(detailed_receipts)
+        == evaluation_accounting.unique_evaluations,
         "all_candidate_outcomes_terminal_and_typed": (
             all_candidate_outcomes_terminal_and_typed
         ),
@@ -5341,9 +5975,13 @@ async def _execute(
             eligible_receipt_counts[1] == (0, 0)
             and eligible_receipt_counts[3] == (0, 0)
         ),
-        "g5_first_reflection_consumer": eligible_receipt_counts[5] == (1, 1),
-        "one_g2_typed_delayed_reflection": (
-            len(reflection_records) == 1
+        "g5_reflection_visibility_matches_evidence_tier": (
+            eligible_receipt_counts[5]
+            == ((0, 0) if abstained_reflections else (1, 1))
+        ),
+        "one_g2_typed_delayed_reflection_or_e0": (
+            bool(abstained_reflections)
+            or len(reflection_records) == 1
             and reflection_records[0]["source_generation"] == 2
             and reflection_records[0]["origin_cutoff_event_index"] == 1
             and portfolio_evidence_accounting.exact_reflection_contrast_accounting
@@ -5352,8 +5990,10 @@ async def _execute(
             and len(result.reflection_receipts) == 1
             and result.reflection_receipts[0].source_generation == 2
         ),
-        "one_g4_test_admission": (
-            len(result.test_admission_receipts) == 1
+        "g4_test_admission_matches_evidence_tier": (
+            not result.test_admission_receipts
+            if abstained_reflections
+            else len(result.test_admission_receipts) == 1
             and result.test_admission_receipts[0].barrier_generation == 4
         ),
         "no_terminal_reflection": tuple(
@@ -5362,7 +6002,9 @@ async def _execute(
         )
         == (2,),
         "g5_memory_behavior_typed": (
-            len(g5_records) == 2
+            bool(abstained_reflections)
+            and memory_trial_count == 0
+            or len(g5_records) == 2
             and set(g5_memory_statuses).issubset(allowed_g5_statuses)
             and (
                 bundle.arm == "control"
@@ -5391,7 +6033,9 @@ async def _execute(
             )
         ),
         "g5_memory_treatment_conforms": (
-            bundle.arm == "control"
+            bool(abstained_reflections)
+            and memory_trial_count == 0
+            or bundle.arm == "control"
             or (
                 matched_g5_memory_lane_count == 2
                 and _is_exact_active_neutral_arm_pair(matched_arms)
@@ -5427,7 +6071,8 @@ async def _execute(
             )
         ),
         "g5_matched_control_observation_realized": (
-            bundle.arm == "control"
+            bool(abstained_reflections)
+            or bundle.arm == "control"
             or matched_g5_memory_lane_count == 0
             or (
                 matched_g5_memory_lane_count == 2
@@ -5452,7 +6097,8 @@ async def _execute(
             )
         ),
         "typed_no_full_matching_evidence_if_infeasible": (
-            bundle.arm == "control"
+            bool(abstained_reflections)
+            or bundle.arm == "control"
             or matched_g5_memory_lane_count == 2
             or (
                 matched_g5_memory_lane_count == 0
@@ -5466,7 +6112,8 @@ async def _execute(
             )
         ),
         "typed_lane_support_evidence_if_matched_recourse": (
-            bundle.arm == "control"
+            bool(abstained_reflections)
+            or bundle.arm == "control"
             or matched_g5_memory_lane_count == 2
             or (
                 matched_g5_memory_lane_count == 0
@@ -5531,16 +6178,20 @@ async def _execute(
         "target_conditioned_closed_loop": (
             target_controller is None
             or (
-                target_controller.state.cutoff_generation
-                == PORTFOLIO_GENERATIONS[-1]
+                target_controller.state.cutoff_generation == PORTFOLIO_GENERATIONS[-1]
                 and target_controller.state.selected_observation_count
-                == len(PORTFOLIO_GENERATIONS)
-                * PARENTS_PER_PORTFOLIO
-                * PORTFOLIO_WIDTH
+                == len(PORTFOLIO_GENERATIONS) * PARENTS_PER_PORTFOLIO * PORTFOLIO_WIDTH
             )
         ),
         "cleanup_released": result.cleanup_receipt.released,
     }
+    if anchor_residual_identification is not None:
+        health.update(
+            {
+                f"anchor_residual_{name}": passed
+                for name, passed in anchor_residual_identification.gates.items()
+            }
+        )
     status = "completed_healthy" if all(health.values()) else "completed_unhealthy"
     return {
         "schema_version": 1,
@@ -5570,11 +6221,14 @@ async def _execute(
         "stage_candidate_counts": stage_counts,
         "stage_unique_evaluation_counts": stage_unique,
         "evaluation_accounting": evaluation_accounting.to_record(),
+        "anchor_residual_identification": (
+            None
+            if anchor_residual_identification is None
+            else anchor_residual_identification.to_record()
+        ),
         "provider_calls": 0 if bundle.arm == "control" else len(outbound),
         "target_conditioned_state": (
-            None
-            if target_controller is None
-            else target_controller.state.to_record()
+            None if target_controller is None else target_controller.state.to_record()
         ),
         "provider_response_telemetry": provider_response_telemetry,
         "evaluator_observation_count": bundle.evaluator_observer.calls,

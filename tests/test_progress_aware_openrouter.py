@@ -9,8 +9,10 @@ from agent_evolve.integrations.pydantic_ai.async_generator import (
 )
 from agent_evolve.integrations.pydantic_ai import progress_aware_openrouter as live
 from agent_evolve.integrations.pydantic_ai.queued_runner import (
+    BoundedPrestreamAndSchemaRepairRetryClassifier,
     ExactPayloadAttemptPolicy,
     ExactTransportSchemaRepairAttemptPolicy,
+    FirstEventResilientBoundedSchemaRepairRetryClassifier,
     NonRepeatingStreamTransportRetryClassifier,
     OpaqueHTTP400AndBoundedSchemaRepairRetryClassifier,
     OpaqueHTTP400AndSchemaRepairOnceRetryClassifier,
@@ -305,10 +307,10 @@ def test_composite_schema_repair_mode_is_manifest_bound_and_wired_without_networ
 
     queue = config.to_manifest_record()["queue"]
     assert queue["retry_classifier"] == ("opaque_http_400_and_schema_repair_once")
-    assert queue["attempt_request_policy"] == ("exact_transport_schema_repair_v3")
+    assert queue["attempt_request_policy"] == ("exact_transport_schema_repair_v4")
     repair = queue["schema_repair_policy"]
     assert repair["policy_id"] == "structured_output_schema_repair"
-    assert repair["policy_version"] == 3
+    assert repair["policy_version"] == 4
     assert len(repair["policy_sha256"]) == 64
     live.create_progress_aware_openrouter_runner(
         api_key="offline-injected-key",
@@ -354,9 +356,9 @@ def test_bounded_schema_repair_mode_is_manifest_bound_and_wired_without_network(
         "opaque_http_400_and_bounded_schema_repair"
     )
     assert queue["attempt_request_policy"] == (
-        "exact_transport_schema_repair_v3"
+        "exact_transport_schema_repair_v4"
     )
-    assert queue["schema_repair_policy"]["policy_version"] == 3
+    assert queue["schema_repair_policy"]["policy_version"] == 4
     live.create_progress_aware_openrouter_runner(
         api_key="offline-injected-key",
         config=config,
@@ -365,6 +367,99 @@ def test_bounded_schema_repair_mode_is_manifest_bound_and_wired_without_network(
     )
     assert type(captured["retry_classifier"]) is (
         OpaqueHTTP400AndBoundedSchemaRepairRetryClassifier
+    )
+    assert type(captured["attempt_request_policy"]) is (
+        ExactTransportSchemaRepairAttemptPolicy
+    )
+
+
+def test_first_event_resilient_mode_is_manifest_bound_and_wired_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        live.PydanticAIStructuredGenerator,
+        "openrouter",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        live,
+        "create_production_queued_runner",
+        lambda **kwargs: captured.update(kwargs) or object(),
+    )
+    config = live.ProgressAwareOpenRouterConfig(
+        **{
+            field: getattr(_config(), field)
+            for field in _config().__dataclass_fields__
+            if field != "retry_mode"
+        },
+        retry_mode=(
+            live.ProgressAwareRetryMode.FIRST_EVENT_RESILIENT_BOUNDED_SCHEMA_REPAIR
+        ),
+    )
+
+    queue = config.to_manifest_record()["queue"]
+    assert queue["retry_classifier"] == (
+        "first_event_resilient_bounded_schema_repair"
+    )
+    assert queue["attempt_request_policy"] == (
+        "exact_transport_schema_repair_v4"
+    )
+    assert queue["schema_repair_policy"]["policy_version"] == 4
+    live.create_progress_aware_openrouter_runner(
+        api_key="offline-injected-key",
+        config=config,
+        progress_sink=lambda _row: None,
+        outcome_sink=lambda _row: None,
+    )
+    assert type(captured["retry_classifier"]) is (
+        FirstEventResilientBoundedSchemaRepairRetryClassifier
+    )
+    assert type(captured["attempt_request_policy"]) is (
+        ExactTransportSchemaRepairAttemptPolicy
+    )
+
+
+def test_bounded_prestream_mode_is_manifest_bound_and_wired_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        live.PydanticAIStructuredGenerator,
+        "openrouter",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        live,
+        "create_production_queued_runner",
+        lambda **kwargs: captured.update(kwargs) or object(),
+    )
+    config = live.ProgressAwareOpenRouterConfig(
+        **{
+            field: getattr(_config(), field)
+            for field in _config().__dataclass_fields__
+            if field != "retry_mode"
+        },
+        retry_mode=(
+            live.ProgressAwareRetryMode.BOUNDED_PRESTREAM_AND_SCHEMA_REPAIR
+        ),
+    )
+
+    queue = config.to_manifest_record()["queue"]
+    assert queue["retry_classifier"] == (
+        "bounded_prestream_and_schema_repair"
+    )
+    assert queue["attempt_request_policy"] == (
+        "exact_transport_schema_repair_v4"
+    )
+    live.create_progress_aware_openrouter_runner(
+        api_key="offline-injected-key",
+        config=config,
+        progress_sink=lambda _row: None,
+        outcome_sink=lambda _row: None,
+    )
+    assert type(captured["retry_classifier"]) is (
+        BoundedPrestreamAndSchemaRepairRetryClassifier
     )
     assert type(captured["attempt_request_policy"]) is (
         ExactTransportSchemaRepairAttemptPolicy

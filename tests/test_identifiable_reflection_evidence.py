@@ -7,6 +7,7 @@ import hashlib
 import pytest
 
 from agent_evolve.application.identifiable_reflection_evidence import (
+    NoIdentifiableMutationEvidenceError,
     ReflectionEvidenceExclusionReason,
     ReflectionFalsificationFeedback,
     cluster_identifiable_mutation_reflection_hypotheses,
@@ -297,7 +298,10 @@ def test_projection_excludes_oversized_local_intervention_values() -> None:
 
 
 def test_action_semantics_path_mismatch_is_not_identifiable() -> None:
-    with pytest.raises(ValueError, match="no identifiable mutation evidence"):
+    with pytest.raises(
+        NoIdentifiableMutationEvidenceError,
+        match="no identifiable mutation evidence",
+    ) as captured:
         project_identifiable_reflection_evidence(
             (_observation(name="mismatch", event_index=2, action_paths=("$.y",)),),
             campaign_sha256=_sha("campaign"),
@@ -306,6 +310,21 @@ def test_action_semantics_path_mismatch_is_not_identifiable() -> None:
             prior_cutoff_event_index_exclusive=1,
             sealed_cutoff_event_index_inclusive=2,
         )
+    assert captured.value.to_record() == {
+        "schema_version": 1,
+        "evidence_tier": "e0",
+        "status": "abstained_no_identifiable_mutation_evidence",
+        "observation_count": 1,
+        "identifiable_contrast_count": 0,
+        "exclusions": [
+            {
+                "reason": "malformed_action_semantics",
+                "count": 1,
+            }
+        ],
+        "provider_calls": 0,
+        "publishable_reflection_content": False,
+    }
 
 
 @pytest.mark.parametrize(

@@ -54,7 +54,9 @@ agent_evolve = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --import-mode=importlib"
+# Default run = the shipped package, offline, in seconds. The research suite
+# needs the corpus and is opt-in: pytest -m research
+addopts = "-q --import-mode=importlib -m 'not research'"
 pythonpath = [".", "tests"]
 markers = [
     "research: needs the research corpus, which is not part of the distribution",

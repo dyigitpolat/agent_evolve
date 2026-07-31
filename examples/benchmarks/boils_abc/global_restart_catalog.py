@@ -16,17 +16,18 @@ from agent_evolve.policies.variation.source_union_finite_catalog import (
     EVALUATION_SOURCE_METADATA_KEY,
     EVALUATION_SOURCE_MINIMUM_METADATA_KEY,
 )
+from agent_evolve.ports.variation_source import VARIATION_OPERATOR_METADATA_KEY
 
 from .actions import ACTION_IDS, SEQUENCE_LENGTH, CandidateConfig
 
 
 GLOBAL_RESTART_CATALOG_ID = "boils_abc_global_restart"
-GLOBAL_RESTART_CATALOG_VERSION = 1
+GLOBAL_RESTART_CATALOG_VERSION = 2
 GLOBAL_RESTART_FAMILY = "global_restart"
 GLOBAL_RESTART_SOURCE_ID = "global_restart"
 GLOBAL_RESTART_RADII = (5, 10, 15, 20)
 GLOBAL_RESTARTS_PER_RADIUS = 4
-_DEFINITION_DOMAIN = b"agent-evolve:boils-abc-global-restart:def:v1\x00"
+_DEFINITION_DOMAIN = b"agent-evolve:boils-abc-global-restart:def:v2\x00"
 _POSITION_DOMAIN = b"agent-evolve:boils-abc-global-restart:position:v1\x00"
 _ACTION_DOMAIN = b"agent-evolve:boils-abc-global-restart:action:v1\x00"
 
@@ -46,6 +47,7 @@ _DEFINITION = {
     "catalog_id": GLOBAL_RESTART_CATALOG_ID,
     "catalog_version": GLOBAL_RESTART_CATALOG_VERSION,
     "source_id": GLOBAL_RESTART_SOURCE_ID,
+    "evaluation_operator": "global",
     "sequence_length": SEQUENCE_LENGTH,
     "action_ids": list(ACTION_IDS),
     "hamming_radii": list(GLOBAL_RESTART_RADII),
@@ -143,6 +145,7 @@ class BoilsGlobalRestartVariationCatalog:
                         ),
                         metadata=(
                             ("changed_coordinate_count", str(radius)),
+                            (VARIATION_OPERATOR_METADATA_KEY, "global"),
                             (
                                 EVALUATION_SOURCE_METADATA_KEY,
                                 GLOBAL_RESTART_SOURCE_ID,

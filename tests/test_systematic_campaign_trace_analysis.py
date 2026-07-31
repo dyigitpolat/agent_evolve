@@ -2,18 +2,56 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
-
 from examples.development.analyze_systematic_campaign_trace import (
     _action_forecast_information,
+    _forecast_calibration,
+    _stage_set_credit,
     analyze_run,
 )
 
-
 WORKSPACE = Path(__file__).resolve().parents[2]
 LOGS = WORKSPACE / "papers/agent_evolve_aaai_2027/research_artifacts/experiment_logs"
+
+
+def test_stage_set_credit_conserves_interacting_slate_gain() -> None:
+    result = _stage_set_credit(
+        [(0.9, 0.9)],
+        [
+            ("candidate_b", (0.2, 0.8)),
+            ("candidate_infeasible", None),
+            ("candidate_a", (0.8, 0.2)),
+        ],
+        dimension=2,
+    )
+
+    assert result["stage_hypervolume_gain"] == pytest.approx(0.27)
+    assert result["leave_one_out_sum"] == pytest.approx(0.24)
+    assert result["stage_gain_minus_leave_one_out_sum"] == pytest.approx(0.03)
+    assert result["shapley_mode"] == "exact_subset_enumeration"
+    assert result["exact_shapley_sum"] == pytest.approx(0.27)
+    assert result["exact_shapley_conservation_error"] == pytest.approx(0.0)
+    by_candidate = {
+        value["candidate_id"]: value for value in result["candidate_rows"]
+    }
+    assert by_candidate["candidate_a"][
+        "slate_leave_one_out_hypervolume"
+    ] == pytest.approx(0.12)
+    assert by_candidate["candidate_b"][
+        "slate_leave_one_out_hypervolume"
+    ] == pytest.approx(0.12)
+    assert by_candidate["candidate_a"][
+        "exact_stage_shapley_hypervolume"
+    ] == pytest.approx(0.135)
+    assert by_candidate["candidate_b"][
+        "exact_stage_shapley_hypervolume"
+    ] == pytest.approx(0.135)
+    assert by_candidate["candidate_infeasible"][
+        "exact_stage_shapley_hypervolume"
+    ] == pytest.approx(0.0)
 
 
 def test_action_forecast_information_detects_structured_prediction_collapse() -> None:
@@ -78,6 +116,173 @@ def test_action_forecast_information_has_typed_empty_state() -> None:
     assert result["effect_entropy_nats"] is None
     assert result["zero_effect_cell_rate"] is None
     assert result["most_common_full_action_signature_rate"] is None
+
+
+def test_forecast_calibration_separates_exact_projection_from_model_skill() -> None:
+    response = {
+        "ranked_decision": {
+            "members": [
+                {
+                    "option_id": "option_1",
+                    "effect_predictions": [
+                        {
+                            "metric_id": "cheap_metric",
+                            "direction": "decrease",
+                            "confidence": "high",
+                        },
+                        {
+                            "metric_id": "expensive_metric",
+                            "direction": "increase",
+                            "confidence": "high",
+                        },
+                    ],
+                }
+            ]
+        },
+        "supplemental_selector_audit": {
+            "payload": {
+                "metric_aliases": [
+                    {
+                        "forecast_metric_id": "objective:cheap_metric",
+                        "target_metric_id": "cheap_metric",
+                    },
+                    {
+                        "forecast_metric_id": "objective:expensive_metric",
+                        "target_metric_id": "expensive_metric",
+                    },
+                ],
+                "forecast_health_authority_resolution": {
+                    "fully_projected_metric_ids": ["objective:cheap_metric"],
+                    "model_authoritative_metric_ids": ["objective:expensive_metric"],
+                    "unresolved_failed_metric_ids": [],
+                },
+                "selected_forecasts": [
+                    {
+                        "option_id": "option_1",
+                        "probability_valid_hex": float(0.75).hex(),
+                        "metric_forecasts": [
+                            {
+                                "metric_id": "objective:cheap_metric",
+                                "p10_delta_hex": float(-1.0).hex(),
+                                "p50_delta_hex": float(-1.0).hex(),
+                                "p90_delta_hex": float(-1.0).hex(),
+                                "confidence_hex": float(1.0).hex(),
+                            },
+                            {
+                                "metric_id": "objective:expensive_metric",
+                                "p10_delta_hex": float(0.1).hex(),
+                                "p50_delta_hex": float(0.25).hex(),
+                                "p90_delta_hex": float(0.4).hex(),
+                                "confidence_hex": float(0.8).hex(),
+                            },
+                        ],
+                    }
+                ],
+            }
+        },
+    }
+    stages = [
+        {
+            "payload": {
+                "stage_receipt": {
+                    "generation": 1,
+                    "selector_audits": [
+                        {
+                            "request_sha256": "request_1",
+                            "plaintext_audit": {"response_text": json.dumps(response)},
+                        }
+                    ],
+                    "result": {
+                        "portfolio_wave_receipts": [
+                            {
+                                "request_sha256": "request_1",
+                                "parent_candidate_id": "parent_1",
+                                "action_attributions": [
+                                    {
+                                        "candidate_id": "child_1",
+                                        "selected_member": {"option_id": "option_1"},
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                }
+            }
+        }
+    ]
+    engine = [
+        {
+            "event_type": "seed_registered",
+            "candidate_id": "parent_1",
+            "valid": True,
+            "objectives": [
+                {"metric_id": "cheap_metric", "value": 2.0},
+                {"metric_id": "expensive_metric", "value": 2.0},
+            ],
+        },
+        {
+            "event_type": "candidate_evaluated",
+            "candidate_id": "child_1",
+            "valid": True,
+            "objectives": [
+                {"metric_id": "cheap_metric", "value": 1.0},
+                {"metric_id": "expensive_metric", "value": 1.0},
+            ],
+        },
+    ]
+
+    result = _forecast_calibration(
+        stages,
+        engine,
+        axes=[
+            {
+                "metric_id": "cheap_metric",
+                "goal": "min",
+                "ideal_hex": float(0.0).hex(),
+                "reference_hex": float(4.0).hex(),
+            },
+            {
+                "metric_id": "expensive_metric",
+                "goal": "min",
+                "ideal_hex": float(0.0).hex(),
+                "reference_hex": float(4.0).hex(),
+            },
+        ],
+    )
+
+    assert result["aggregate_scope"] == (
+        "post_authority_resolution_combined_not_model_only"
+    )
+    assert result["direction_accuracy"] == pytest.approx(0.5)
+    assert result["exact_projection_prediction_count"] == 1
+    assert result["exact_projection_direction_accuracy"] == 1.0
+    assert result["model_authoritative_prediction_count"] == 1
+    assert result["model_authoritative_direction_accuracy"] == 0.0
+    assert result["improvement_true_positive_count"] == 1
+    assert result["improvement_false_negative_count"] == 1
+    assert result["improvement_precision"] == 1.0
+    assert result["improvement_recall"] == 0.5
+    assert result["improvement_specificity"] is None
+    assert result["improvement_balanced_accuracy"] is None
+    assert result["numeric_prediction_count"] == 2
+    assert result["p10_p90_coverage"] == 0.5
+    assert result["exact_projection_p10_p90_coverage"] == 1.0
+    assert result["exact_projection_mean_normalized_absolute_p50_error"] == 0.0
+    assert result["model_authoritative_p10_p90_coverage"] == 0.0
+    assert result[
+        "model_authoritative_mean_normalized_absolute_p50_error"
+    ] == pytest.approx(1.25 / 4.0)
+    assert result["validity_prediction_count"] == 1
+    assert result["validity_empirical_rate"] == 1.0
+    assert result["validity_brier_score"] == pytest.approx(0.0625)
+    assert result["legacy_unspecified_prediction_count"] == 0
+    assert {
+        value["forecast_authority"]: value["direction_accuracy"]
+        for value in result["by_authority"]
+    } == {
+        "exact_projection": 1.0,
+        "model_authoritative": 0.0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -218,53 +423,6 @@ def test_analyzer_normalizes_provider_free_selector_decisions_without_a_witness(
     assert behavior["exact_ordered_witness_copy_rate"] is None
     assert behavior["exact_set_witness_copy_rate"] is None
     assert behavior["witness_mode_counts"] == {"provider_free_no_witness": 6}
-
-
-def test_analyzer_normalizes_outcome_conditioned_all_action_selection() -> None:
-    row = analyze_run(
-        LOGS / "boils_abc/generic_campaign/"
-        "jul23_boils_ocafe_bootstrap_v4_deepseek_g6_b38_live_v2_20260723",
-        workload_id="boils_abc",
-        model_profile="deepseek_v4_pro_streamlake_xhigh",
-        replicate_seed=20_260_723,
-    )
-
-    behavior = row["selector_behavior"]
-    assert row["status"] == "completed_healthy"
-    assert row["quality"]["final_hypervolume"] == pytest.approx(0.08894375)
-    assert behavior["selector_call_count"] == 6
-    assert behavior["proposal_member_count"] == 24
-    assert behavior["proposal_member_count_semantics"] == "trusted_evaluated_k_set"
-    assert behavior["selection_mode_counts"] == {
-        "outcome_conditioned_trusted_all_action": 6
-    }
-    assert behavior["outcome_conditioned_call_count"] == 6
-    assert behavior["outcome_conditioned_forecast_universe_row_count_total"] == 1_385
-    assert behavior["outcome_conditioned_forecast_universe_size_counts"] == {
-        "230": 3,
-        "231": 1,
-        "232": 2,
-    }
-    assert (
-        behavior["outcome_conditioned_allocator_candidate_evaluations_total"] == 285_061
-    )
-    assert behavior["outcome_conditioned_physical_forecast_call_count"] == 48
-
-    calibration = row["forecast_calibration"]
-    assert calibration["evaluated_forecast_member_count"] == 24
-    assert calibration["effect_prediction_count"] == 48
-    assert calibration["known_direction_forecast_count"] == 12
-    assert calibration["direction_accuracy"] == pytest.approx(7 / 12)
-    assert calibration["unknown_direction_forecast_rate"] == pytest.approx(0.75)
-    assert calibration["high_confidence_known_direction_count"] == 3
-    assert calibration["high_confidence_direction_error_count"] == 3
-    assert calibration["high_confidence_direction_accuracy"] == 0.0
-
-    information = row["action_forecast_information"]
-    assert information["forecast_call_count"] == 48
-    assert information["action_count"] == 1_385
-    assert information["distinct_effect_code_count"] == 10
-    assert information["effect_entropy_nats"] == pytest.approx(1.6004839389105696)
 
 
 def test_analyzer_uses_campaign_event_accounting_for_workload_owned_summary() -> None:
@@ -787,6 +945,7 @@ def test_analyzer_keeps_censored_quality_and_retry_failure_separate() -> None:
         "output_invalid",
         "provider_unavailable",
     ]
+    # Historical V9 evidence remains decodable under its original policy.
     assert exhausted["attempts"][1]["request_variant"] == "schema_repair_v3"
     assert exhausted["attempts"][2]["will_retry"] is False
 

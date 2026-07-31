@@ -21,9 +21,6 @@ from agent_evolve.agentic import (
 from agent_evolve.application.campaign_learning_runtime import (
     CampaignReflectionLearningRecordCodec,
 )
-from agent_evolve.application.campaign_execution import (
-    CampaignExecutionContractError,
-)
 from agent_evolve.application.detailed_evaluation import (
     DetailedEvaluationPayload,
     EvaluatorIdentity,
@@ -58,17 +55,36 @@ from examples.benchmarks.timeloop_codesign.v2.problem_def import (
     TimeloopV2CoDesignProblem,
 )
 from examples.development.run_timeloop_v2_provider_free_campaign import (
+    PARENTS_PER_PORTFOLIO as PROVIDER_FREE_PARENTS_PER_PORTFOLIO,
+    PORTFOLIO_GENERATIONS as PROVIDER_FREE_PORTFOLIO_GENERATIONS,
     _DeterministicEvaluator,
     _ProviderFreeCalibratedRunner,
+    _family_bounded_evaluation_witness,
+    _profile_portfolio_selection_implementation,
     run_provider_free_timeloop_campaign,
     run_timeloop_campaign,
 )
 from examples.development.run_timeloop_v2_frontier_probe_live import (
+    PARENTS_PER_PORTFOLIO as LIVE_PARENTS_PER_PORTFOLIO,
+    PORTFOLIO_GENERATIONS as LIVE_PORTFOLIO_GENERATIONS,
+    _allocation_policy_identity,
+    _construction_probe_contract,
+    _experiment_profile_preregistration_fields,
     _g5_memory_path_audit,
+    _candidate_universe_binding_valid,
     _portfolio_candidate_infeasible_count,
+    _provider_free_schema_string_enum,
     _pre_simulator_infeasible_count,
+    _selector_policy_binding_valid,
     _typed_candidate_infeasible_events,
 )
+
+
+def test_live_audit_imports_its_parent_cardinality_dependency() -> None:
+    """Prevent a ten-minute construction traversal from ending in NameError."""
+
+    assert LIVE_PARENTS_PER_PORTFOLIO == PROVIDER_FREE_PARENTS_PER_PORTFOLIO == 2
+    assert LIVE_PORTFOLIO_GENERATIONS == PROVIDER_FREE_PORTFOLIO_GENERATIONS
 
 
 def _sha(value: str) -> str:
@@ -79,6 +95,367 @@ def _object(value: dict[str, object]) -> FrozenJsonObject:
     frozen = freeze_json(value)
     assert type(frozen) is FrozenJsonObject
     return frozen
+
+
+def test_provider_free_forecast_schema_resolves_single_and_multiple_codes() -> None:
+    schema = {
+        "$defs": {
+            "one": {"type": "string", "const": "e0"},
+            "many": {"type": "string", "enum": ["e0", "e1"]},
+        }
+    }
+
+    assert _provider_free_schema_string_enum(schema, {"$ref": "#/$defs/one"}) == (
+        "e0",
+    )
+    assert _provider_free_schema_string_enum(schema, {"$ref": "#/$defs/many"}) == (
+        "e0",
+        "e1",
+    )
+
+
+def test_live_audit_decodes_outcome_conditioned_nested_policy_receipt() -> None:
+    from agent_evolve.application.global_wave_action_allocation import (
+        GLOBAL_WAVE_ACTION_ALLOCATION_POLICY_DEFINITION_SHA256,
+        GLOBAL_WAVE_ACTION_ALLOCATION_POLICY_ID,
+        GLOBAL_WAVE_ACTION_ALLOCATION_POLICY_VERSION,
+    )
+    from agent_evolve.application.outcome_conditioned_portfolio_selection import (
+        OUTCOME_CONDITIONED_PORTFOLIO_POLICY_ID,
+        OUTCOME_CONDITIONED_PORTFOLIO_POLICY_VERSION,
+    )
+
+    digest = "a" * 64
+    payload = _object(
+        {
+            "schema_version": 2,
+            "policy_definition_sha256": digest,
+            "allocation": {
+                "allocator_policy": {
+                    "policy_id": "trusted_allocator",
+                    "policy_version": 1,
+                    "definition_sha256": "b" * 64,
+                }
+            },
+            "global_wave_allocation": {
+                "policy": {
+                    "policy_id": GLOBAL_WAVE_ACTION_ALLOCATION_POLICY_ID,
+                    "policy_version": GLOBAL_WAVE_ACTION_ALLOCATION_POLICY_VERSION,
+                    "definition_sha256": (
+                        GLOBAL_WAVE_ACTION_ALLOCATION_POLICY_DEFINITION_SHA256
+                    ),
+                }
+            },
+            "forecast_universe_projection": {
+                "mode": "authenticated_outcome_blind_candidate_pool",
+                "source_contract_sha256": "c" * 64,
+                "forecast_contract_sha256": "d" * 64,
+                "common_candidate_pool_decision_sha256": "e" * 64,
+                "outcomes_consulted": False,
+                "model_or_provider_fields_consulted": False,
+            },
+            "proposal_topology": {
+                "source_contract_sha256": "c" * 64,
+                "proposal_contract_sha256": "d" * 64,
+            },
+        }
+    )
+    result = SimpleNamespace(
+        decision=SimpleNamespace(
+            policy_id=OUTCOME_CONDITIONED_PORTFOLIO_POLICY_ID,
+            policy_version=OUTCOME_CONDITIONED_PORTFOLIO_POLICY_VERSION,
+            policy_definition_sha256=digest,
+        ),
+        supplemental_audit=SimpleNamespace(
+            audit_kind="outcome_conditioned_expert_portfolio",
+            payload=payload,
+        ),
+    )
+    proposal_support = SimpleNamespace(
+        policy_id="unused_legacy_policy",
+        policy_version=1,
+        definition_sha256="f" * 64,
+    )
+
+    assert _selector_policy_binding_valid(result)
+    assert _candidate_universe_binding_valid(
+        result,
+        proposal_support_policy=proposal_support,
+    )
+
+
+def test_live_audit_decodes_acquisition_certified_rich_policy_receipt() -> None:
+    policy_id, policy_version, definition_sha256 = _allocation_policy_identity()
+    allocator_identity = {
+        "policy_id": policy_id,
+        "policy_version": policy_version,
+        "definition_sha256": definition_sha256,
+    }
+    decision_identity = {
+        "policy_id": "pydantic_ai_acquisition_certified_residual_portfolio",
+        "policy_version": 1,
+        "policy_definition_sha256": _sha("acre-wrapper"),
+    }
+    result = SimpleNamespace(
+        decision=SimpleNamespace(**decision_identity),
+        supplemental_audit=SimpleNamespace(
+            audit_kind="acquisition_certified_residual_portfolio_k8_to_k4",
+            payload=_object(
+                {
+                    "schema_version": 5,
+                    **decision_identity,
+                    "allocator_policy": {
+                        **allocator_identity,
+                        "scorer": {"policy_id": "authenticated-extra-field"},
+                    },
+                    "allocation": {
+                        "policy_id": policy_id,
+                        "policy_version": policy_version,
+                        "policy_definition_sha256": definition_sha256,
+                        "certificate_scope": (
+                            "frozen_strictly_prior_acquisition_not_unseen_outcome"
+                        ),
+                    },
+                }
+            ),
+        ),
+    )
+
+    assert _selector_policy_binding_valid(result)
+
+
+def test_live_audit_decodes_regret_bounded_rich_policy_receipt() -> None:
+    policy_id, policy_version, definition_sha256 = _allocation_policy_identity()
+    allocator_identity = {
+        "policy_id": policy_id,
+        "policy_version": policy_version,
+        "definition_sha256": definition_sha256,
+    }
+    decision_identity = {
+        "policy_id": "pydantic_ai_regret_bounded_information_portfolio",
+        "policy_version": 1,
+        "policy_definition_sha256": _sha("rbie-wrapper"),
+    }
+    result = SimpleNamespace(
+        decision=SimpleNamespace(**decision_identity),
+        supplemental_audit=SimpleNamespace(
+            audit_kind="regret_bounded_information_portfolio_k8_to_k4",
+            payload=_object(
+                {
+                    "schema_version": 5,
+                    **decision_identity,
+                    "allocator_policy": {
+                        **allocator_identity,
+                        "future_value_policy": {
+                            "policy_id": "authenticated-extra-field"
+                        },
+                    },
+                    "allocation": {
+                        "schema_version": 1,
+                        "policy_id": policy_id,
+                        "policy_version": policy_version,
+                        "policy_definition_sha256": definition_sha256,
+                        "certificate_scope": (
+                            "conditional_on_frozen_acquisition_calibration_not_sota"
+                        ),
+                        "reference_option_ids": ["anchor.1", "anchor.2"],
+                        "selected_option_ids": ["anchor.1", "residual.1"],
+                        "selected_future_value": {
+                            "authority": "development_assay"
+                        },
+                    },
+                }
+            ),
+        ),
+    )
+
+    assert _selector_policy_binding_valid(result)
+
+
+def test_preregistration_contract_projects_bulky_ephemeral_transcript() -> None:
+    stable_summary = {
+        "status": "completed",
+        "execution_mode": "deterministic_provider_free_calibrated_double",
+        "scientific_claim": "structural_conformance_only",
+        "generations_completed": 6,
+        "candidate_occurrences": 38,
+        "planned_candidate_occurrences": 38,
+        "unique_evaluations": 38,
+        "physical_evaluator_calls": 38,
+        "evaluator_calls": 38,
+        "provider_calls": 0,
+        "docker_calls": 0,
+        "logical_agent_calls": 7,
+        "selector_calls": 6,
+        "canonical_reflection_records": 1,
+        "outcome_feedback_receipts": 6,
+        "forecast_calibration_observations": 72,
+        "authenticated_action_observations": 24,
+        "bounded_g5_dose_request_count": 0,
+        "bounded_g5_dose_result_count": 0,
+        "bounded_g5_dose_assessments_pass": True,
+        "typed_recourse_receipts": 1,
+    }
+    decision = {
+        "request_sha256": "ephemeral-a",
+        "decision": {
+            "policy_id": "outcome_conditioned_expert_portfolio",
+            "policy_version": 8,
+            "members": [{}, {}, {}, {}],
+        },
+        "supplemental_audit": {
+            "audit_kind": "outcome_conditioned_expert_portfolio",
+            "payload": {
+                "schema_version": 2,
+                "phase": {
+                    "campaign_generation": 1,
+                    "portfolio_generation_ordinal": 1,
+                    "remaining_portfolio_generations": 2,
+                    "current_or_future_outcomes_consulted": False,
+                },
+                "allocation": {
+                    "allocator_policy": {
+                        "policy_id": "allocator",
+                        "policy_version": 3,
+                        "definition_sha256": "a" * 64,
+                    }
+                },
+                "global_wave_allocation": {
+                    "policy": {
+                        "policy_id": "global_wave",
+                        "policy_version": 6,
+                        "definition_sha256": "b" * 64,
+                    }
+                },
+                "forecast_universe_projection": {
+                    "mode": "authenticated_outcome_blind_candidate_pool",
+                    "outcomes_consulted": False,
+                },
+                "required_option_ids": [],
+                "evidence_mode": "catalog_only",
+                "physical_call_count": 7,
+                "ephemeral_candidate_transcript": [
+                    list(range(1_000)) for _ in range(51)
+                ],
+            },
+        },
+    }
+    probe = {
+        "schema_version": 1,
+        "replicate_seed": 20260724,
+        "all_gates_pass": True,
+        "gates": {"six_generations": True},
+        "archive_context_projections": [],
+        "contextual_history_action_counts": [0, 0, 4, 4, 8, 8],
+        "contextual_history_action_counts_by_cutoff": {"g1": 0, "g3": 4, "g5": 8},
+        "g5_memory_path_audit": {"passes": True},
+        "method": {"acquisition_mode": "horizon_bounded"},
+        "protected_acquisition": {"enabled": True},
+        "stage_candidate_occurrences": [8, 4, 8, 4, 8, 4],
+        "recombination_candidate_occurrences": [4, 4, 4],
+        "capacity_recourse_stages": [],
+        "anchor_residual_identification": None,
+        "summary": stable_summary,
+        "selection_decisions": [decision],
+        "outcome_conditioned_scope_probe": {
+            "forecast_runner_calls": 42,
+            "summary": stable_summary,
+        },
+    }
+
+    with pytest.raises(ValueError, match="max_nodes"):
+        freeze_json(probe)
+    contract = _construction_probe_contract(probe)
+    assert freeze_json(contract)
+    assert "selection_decisions" not in contract
+    assert contract["selection_construction"][0]["member_count"] == 4
+
+
+def test_timeloop_preregistration_exposes_shared_method_identity() -> None:
+    method_sha256 = "a" * 64
+    experiment_sha256 = "b" * 64
+    profile = {
+        "method_definition_sha256": method_sha256,
+        "experiment_definition_sha256": experiment_sha256,
+        "method": {"workload_specific_fields": []},
+    }
+    conformance = {
+        "pass": True,
+        "method_definition_sha256": method_sha256,
+        "experiment_definition_sha256": experiment_sha256,
+    }
+
+    assert _experiment_profile_preregistration_fields(
+        {
+            "summary": {
+                "experiment_profile": profile,
+                "experiment_profile_conformance": conformance,
+            }
+        }
+    ) == {
+        "experiment_profile": profile,
+        "experiment_profile_conformance": conformance,
+        "method_definition_sha256": method_sha256,
+        "experiment_definition_sha256": experiment_sha256,
+    }
+
+
+def test_family_witness_is_jointly_embeddable_in_proposal_partition() -> None:
+    options = tuple(
+        SimpleNamespace(option_id=option_id, family=family)
+        for option_id, family in (
+            ("a2", "f3"),
+            ("c0", "f0"),
+            ("c1", "f1"),
+            ("c2", "f2"),
+            ("a3", "f4"),
+            ("a4", "f5"),
+            ("a0", "f6"),
+            ("a1", "f7"),
+        )
+    )
+    contract = SimpleNamespace(options=options, __post_init__=lambda: None)
+
+    witness = _family_bounded_evaluation_witness(
+        contract,
+        tuple(option.option_id for option in options),
+        portfolio_size=4,
+        min_distinct_families=4,
+        family_exposure_bounds=(),
+        embedding_required_option_ids=("a0", "a1"),
+        embedding_composite_option_ids=("c0", "c1", "c2"),
+        embedding_composite_capacity=2,
+        embedding_total_capacity=8,
+    )
+
+    assert witness == ("a2", "c0", "c1", "a3")
+
+
+def test_runtime_selector_override_does_not_replace_profile_allocator() -> None:
+    class _RuntimeSelector:
+        def select(self) -> None:
+            return None
+
+    allocator = object()
+    runtime_selector = _RuntimeSelector()
+
+    bound = _profile_portfolio_selection_implementation(
+        selected_allocator=allocator,  # type: ignore[arg-type]
+        runtime_selector_override=runtime_selector,
+    )
+
+    assert bound is allocator
+
+
+def test_reference_profile_rejects_missing_engine_allocator() -> None:
+    with pytest.raises(
+        ValueError,
+        match="reference profile requires an engine-owned allocator",
+    ):
+        _profile_portfolio_selection_implementation(
+            selected_allocator=None,
+            runtime_selector_override=None,
+        )
 
 
 def test_operator_stratified_reference_transport_binds_exact_allocator() -> None:
@@ -135,7 +512,7 @@ print(json.dumps({
     assert record["method_id"] == "agent_evolve_operator_stratified_successor"
     assert record["method_version"] == 6
     assert record["method_definition_sha256"] == (
-        "77a0db7bb8ce09f69e892a86c010cb656eabd152f5504590cde98dd8b3d620a8"
+        "372d26c4f5d29fa0a7036e91b1fb18878ea4c9fe0e5c7c34ce2f352ab30c28a5"
     )
     assert record["portfolio_selection"]["policy_id"] == (
         "operator_stratified_hierarchical_k8_engine_k4"
@@ -224,7 +601,7 @@ print(json.dumps({
     assert record["method_id"] == "agent_evolve_stagnation_aware_successor"
     assert record["method_version"] == 8
     assert record["method_definition_sha256"] == (
-        "2630a887dec8bb6a87909a7924e638262489e185bc970e61ed624a96e8d320e2"
+        "2483021e3d8753916ca057924d92703a613bf65684e0ee60d6bd1eaee4576a4f"
     )
     assert record["portfolio_selection"]["policy_id"] == (
         "horizon_bounded_hierarchical_k8_engine_k4"
@@ -324,7 +701,10 @@ def completed_run():
 def test_timeloop_completes_the_delayed_g6_composition(completed_run) -> None:
     run = completed_run
     counters = run.execution.counters
-    memory_path_audit = _g5_memory_path_audit(run.summary())
+    memory_path_audit = _g5_memory_path_audit(
+        run.summary(),
+        reflection_receipts=run.execution.reflection_receipts,
+    )
 
     assert counters.generations_completed == 6
     assert counters.candidate_occurrences == 62
@@ -351,10 +731,19 @@ def test_timeloop_completes_the_delayed_g6_composition(completed_run) -> None:
         for entry in run.memory.entries[1:]
     )
     assert memory_path_audit == {
-        "schema_version": 1,
+        "schema_version": 2,
+        "reflection_receipt_count": 1,
+        "completed_reflection_receipt_count": 1,
+        "abstained_reflection_receipt_count": 0,
+        "failed_reflection_receipt_count": 0,
+        "typed_e0_receipt_authenticated": False,
+        "e1_reflection_publication_valid": True,
         "active_neutral_assay_realized": True,
         "typed_no_shared_support_recourse_realized": False,
+        "typed_e0_memory_free_recourse_realized": False,
+        "reflection_path_valid": True,
         "workflow_path_valid": True,
+        "expected_physical_reflection_provider_calls": 1,
         "memory_effect_claim_available": True,
     }
 
@@ -631,6 +1020,47 @@ def test_timeloop_randomizes_one_active_and_one_neutral_g5_lane(
     assert {value.arm.value for value in plan.assignments} == {"m", "n"}
 
 
+def test_timeloop_singleton_reflection_cohort_can_span_matched_control_lanes(
+    monkeypatch,
+) -> None:
+    """One supported card is sufficient for a two-lane active/neutral block.
+
+    Lane count controls randomized experimental units, not the minimum number
+    of distinct hypotheses.  Numerical/global proposals can legitimately
+    leave only one identifiable local contrast; rejecting that cohort would
+    couple the memory lifecycle to a particular proposal mixture.
+    """
+
+    from examples.development import run_timeloop_v2_provider_free_campaign as module
+
+    original_cluster = module.cluster_identifiable_mutation_reflection_hypotheses
+    monkeypatch.setattr(
+        module,
+        "cluster_identifiable_mutation_reflection_hypotheses",
+        lambda contrasts: original_cluster(contrasts)[:1],
+    )
+    run = run_provider_free_timeloop_campaign()
+
+    assert len(run.reflection_executor.records) == 1
+    reflection = CampaignReflectionLearningRecordCodec.decode(
+        run.reflection_executor.records[0]
+    )
+    assert len(reflection.insights) == 1
+    assert len(run.wave_factory.matched_control_plans) == 1
+    assert len(run.wave_factory.recourse_receipts) == 0
+    assert len(run.wave_factory.matched_support_resolutions) == 1
+    assert run.wave_factory.matched_support_resolutions[0].eligible
+    assert {
+        value.arm.value
+        for value in run.wave_factory.matched_control_plans[0].assignments
+    } == {"m", "n"}
+    assert {
+        record["status"]
+        for record in run.wave_factory.wave_records
+        if record["generation"] == 5
+    } == {"applied_randomized_active_neutral_arm"}
+
+
 def test_provider_free_common_pool_preserves_required_memory_dose_action(
     completed_run,
 ) -> None:
@@ -673,11 +1103,19 @@ def test_timeloop_contradictory_reflection_fails_before_memory_recourse() -> Non
     # retaining the authenticated action binding.  It is not a valid but
     # unsupported card: the semantic contract must reject it before G5.  The
     # generic valid-card/no-shared-support recourse is covered by Heat2D.
-    with pytest.raises(
-        CampaignExecutionContractError,
-        match="reflection failed at the next durable stage boundary",
-    ):
-        run_provider_free_timeloop_campaign(incompatible_reflection_card=True)
+    run = run_provider_free_timeloop_campaign(incompatible_reflection_card=True)
+
+    assert run.summary()["status"] == "degraded"
+    assert len(run.execution.reflection_receipts) == 1
+    receipt = run.execution.reflection_receipts[0]
+    assert receipt.status.value == "failed"
+    failure = thaw_json(receipt.quarantined_result)
+    assert failure["status"] == "failed"
+    assert failure["failure_type"] == "ValueError"
+    assert failure["publishable_reflection_content"] is False
+    assert run.wave_factory.matched_support_resolutions == []
+    assert run.wave_factory.matched_control_plans == []
+    assert run.wave_factory.recourse_receipts == []
 
 
 class _OneCandidateInfeasibleDetailedEvaluator:

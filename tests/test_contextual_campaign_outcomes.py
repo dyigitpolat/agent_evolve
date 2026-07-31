@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 
 from agent_evolve.application.contextual_campaign_outcomes import (
     observe_contextual_portfolio_outcomes,
@@ -10,6 +11,7 @@ from agent_evolve.application.evolution_campaign import ArchiveUtilitySnapshot
 from agent_evolve.application.portfolio_evolution import PortfolioEvolution
 from agent_evolve.domain.typed_json import freeze_json
 from agent_evolve.policies.reward.contextual_marginal_utility import (
+    ExactCoalitionShapleyContextualUtilityProjector,
     FixedReferenceContextualMarginalUtilityProjector,
 )
 from tests.test_portfolio_evolution import _build_wave
@@ -22,6 +24,9 @@ def _sha(value: str) -> str:
 class _Snapshot:
     def marginal_gain(self, point) -> float:
         return float(max(0.0, min(1.0, 1.0 - point["loss"] / 10.0)))
+
+    def joint_gain(self, points) -> float:
+        return max((self.marginal_gain(point) for point in points), default=0.0)
 
 
 class _ArchiveUtility:
@@ -57,7 +62,19 @@ def test_real_portfolio_result_projects_normalized_contextual_credit() -> None:
     assert sum(value.marginal_utility_share for value in batch.observations) == 1.0
     assert sum(value.positive_marginal_utility for value in batch.observations) == 2
     assert {value.source_id for value in batch.observations} == {"engine", "model"}
-    assert {value.operator_id for value in batch.observations} == {"atomic"}
+    assert {value.operator_id for value in batch.observations} == {
+        "atomic",
+        "composite",
+    }
+    option_by_candidate = {
+        member.materialization.candidate_id.value: member.materialization.option_id
+        for member in result.receipt.members
+    }
+    operator_by_option = {
+        option_by_candidate[observation.candidate_id.value]: observation.operator_id
+        for observation in batch.observations
+    }
+    assert operator_by_option["gamma.xy"] == "composite"
     assert all(value.final_front_persisted is None for value in batch.observations)
     assert all(
         value.useful_descendant_observed is None for value in batch.observations
@@ -82,3 +99,22 @@ def test_real_portfolio_result_projects_normalized_contextual_credit() -> None:
     assert len(utilities) == 1
     assert len(utilities[0]) == 3
     assert all(value >= 0.0 for value in utilities[0])
+
+    shapley = ExactCoalitionShapleyContextualUtilityProjector(
+        _ArchiveUtility()
+    ).project(snapshot=snapshot, results=(result,))
+    scored_points = tuple(
+        outcome.candidate.objective_map
+        for outcome in result.outcomes
+        if outcome.candidate is not None
+    )
+    assert len(shapley) == 1
+    assert len(shapley[0]) == 3
+    assert all(value >= 0.0 for value in shapley[0])
+    assert math.isclose(
+        math.fsum(shapley[0]),
+        _Snapshot().joint_gain(scored_points),
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    )
+    assert math.fsum(shapley[0]) <= math.fsum(utilities[0])

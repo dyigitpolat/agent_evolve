@@ -130,6 +130,26 @@ def _verdict(
     return out
 
 
+def _model_line(model: Optional[str]) -> str:
+    """Name the model and its price before anything is billed.
+
+    A default nobody saw is a default nobody consented to, so the resolved
+    model is printed whether or not the caller chose it, and it is marked as a
+    default when they did not.
+    """
+    from agent_evolve.settings import AgentEvolveSettings, model_price
+
+    resolved = model or AgentEvolveSettings.from_env().model
+    origin = "" if model else "  (default)"
+    price = model_price(resolved)
+    cost = (
+        f"  ${price[0]:.2f}/M in, ${price[1]:.2f}/M out"
+        if price
+        else "  price unknown"
+    )
+    return f"model {resolved}{origin}{cost}"
+
+
 def _cmd_check(args: argparse.Namespace) -> int:
     from agent_evolve.api import optimize
 
@@ -138,7 +158,11 @@ def _cmd_check(args: argparse.Namespace) -> int:
     quiet = (lambda _m: None) if not args.verbose else (lambda m: print(m, flush=True))
 
     print(f"agent_evolve check: {args.problem}")
-    print(f"budget {args.budget} evaluations per run, {args.repeats} baseline runs\n")
+    print(f"budget {args.budget} evaluations per run, {args.repeats} baseline runs")
+    if args.baseline_only:
+        print("baseline only: no model, no credentials, no cost\n")
+    else:
+        print(f"{_model_line(args.model)}\n")
 
     baselines = []
     for i in range(args.repeats):
@@ -179,6 +203,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     from agent_evolve.api import optimize
 
     problem = _load_problem(args.problem)
+    if args.proposer != "random":
+        print(_model_line(args.model))
     result = optimize(
         problem,
         budget=args.budget,

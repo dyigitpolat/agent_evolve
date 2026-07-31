@@ -308,5 +308,8 @@ def test_identifiable_runtime_symbols_are_public() -> None:
         "CampaignReflectionExecutor",
         "CommittedRegistryIdentifiableReflectionEvidenceSource",
     ):
-        assert name in agent_evolve.__all__
+        # ``__all__`` is now the small supported surface; these research
+        # symbols resolve lazily instead. Reachability is the invariant B1
+        # needs -- the measured stack must keep importing what it always did.
+        assert name in agent_evolve.__all__ or name in agent_evolve._LEGACY_EXPORTS
         assert getattr(agent_evolve, name) is not None

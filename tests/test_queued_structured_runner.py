@@ -64,9 +64,12 @@ from agent_evolve.integrations.pydantic_ai.async_generator import (
     classify_generation_exception,
 )
 from agent_evolve.integrations.pydantic_ai.queued_runner import (
+    BoundedOpaqueHTTP400RetryClassifier,
+    BoundedPrestreamAndSchemaRepairRetryClassifier,
     CancelledOutcomePublicationError,
     ExactPayloadAttemptPolicy,
     ExactTransportSchemaRepairAttemptPolicy,
+    FirstEventResilientBoundedSchemaRepairRetryClassifier,
     MAX_SCHEMA_REPAIR_REQUIRED_PATHS,
     MAX_SCHEMA_REPAIR_SCHEMA_NODES,
     MAX_SCHEMA_REPAIR_SUFFIX_UTF8_BYTES,
@@ -570,6 +573,47 @@ def test_opaque_http_400_queue_retry_preserves_provider_payload_exactly() -> Non
     )
 
 
+def test_bounded_opaque_400_recovery_survives_two_identical_rejections() -> None:
+    observed = []
+    opaque = _opaque_http_400()
+    generator = _ScriptedGenerator([opaque, opaque, "response"])
+    runner, _ = _make_runner(
+        generator,
+        max_attempts=3,
+        attempt_request_policy=ExactTransportSchemaRepairAttemptPolicy(),
+        retry_classifier=(
+            BoundedPrestreamAndSchemaRepairRetryClassifier()
+        ),
+        outcome_sink=observed.append,
+    )
+    original = _request(741)
+
+    async def scenario() -> AttemptedStructuredGenerationResponse[_Output]:
+        try:
+            return await runner(original)
+        finally:
+            await runner.aclose()
+
+    response = asyncio.run(scenario())
+
+    assert response.attempt_count == 3
+    assert [_provider_payload_view(item) for item in generator.requests] == [
+        original,
+        original,
+        original,
+    ]
+    attempts = observed[0].telemetry.attempts
+    assert [item.status for item in attempts] == [
+        AttemptStatus.RETRYABLE_FAILURE,
+        AttemptStatus.RETRYABLE_FAILURE,
+        AttemptStatus.SUCCEEDED,
+    ]
+    assert all(
+        item.request_evidence.variant is AttemptRequestVariant.ORIGINAL
+        for item in attempts
+    )
+
+
 def test_composite_recovery_repairs_one_output_invalid_then_succeeds() -> None:
     observed = []
     generator = _ScriptedGenerator(
@@ -608,9 +652,9 @@ def test_composite_recovery_repairs_one_output_invalid_then_succeeds() -> None:
     assert len(generator.requests) == 2
     assert [
         item.request_evidence.variant for item in observed[0].telemetry.attempts
-    ] == [AttemptRequestVariant.ORIGINAL, AttemptRequestVariant.SCHEMA_REPAIR_V3]
+    ] == [AttemptRequestVariant.ORIGINAL, AttemptRequestVariant.SCHEMA_REPAIR_V4]
     assert generator.requests[1].prompt.startswith(generator.requests[0].prompt)
-    assert "STRUCTURED_OUTPUT_SCHEMA_REPAIR_V3" in generator.requests[1].prompt
+    assert "STRUCTURED_OUTPUT_SCHEMA_REPAIR_V4" in generator.requests[1].prompt
 
 
 def test_composite_recovery_keeps_second_output_invalid_terminal() -> None:
@@ -649,7 +693,7 @@ def test_composite_recovery_keeps_second_output_invalid_terminal() -> None:
     assert len(generator.requests) == 2
     assert [
         item.request_evidence.variant for item in observed[0].telemetry.attempts
-    ] == [AttemptRequestVariant.ORIGINAL, AttemptRequestVariant.SCHEMA_REPAIR_V3]
+    ] == [AttemptRequestVariant.ORIGINAL, AttemptRequestVariant.SCHEMA_REPAIR_V4]
     assert observed[0].telemetry.attempts[1].classification.disposition is (
         RetryDisposition.FAIL
     )
@@ -693,8 +737,8 @@ def test_bounded_recovery_resamples_schema_repair_until_attempt_budget() -> None
         item.request_evidence.variant for item in observed[0].telemetry.attempts
     ] == [
         AttemptRequestVariant.ORIGINAL,
-        AttemptRequestVariant.SCHEMA_REPAIR_V3,
-        AttemptRequestVariant.SCHEMA_REPAIR_V3,
+        AttemptRequestVariant.SCHEMA_REPAIR_V4,
+        AttemptRequestVariant.SCHEMA_REPAIR_V4,
     ]
     assert generator.requests[1].prompt != generator.requests[2].prompt
     assert "Repair pass: 1" in generator.requests[1].prompt
@@ -814,7 +858,7 @@ def test_composite_recovery_preserves_opaque_replay_before_schema_repair() -> No
     ] == [
         AttemptRequestVariant.ORIGINAL,
         AttemptRequestVariant.ORIGINAL,
-        AttemptRequestVariant.SCHEMA_REPAIR_V3,
+        AttemptRequestVariant.SCHEMA_REPAIR_V4,
     ]
 
 
@@ -959,8 +1003,8 @@ def test_success_propagates_attempt_count_and_publishes_exact_terminal_outcome()
         attempt.request_evidence.variant for attempt in observed[0].telemetry.attempts
     ] == [
         AttemptRequestVariant.ORIGINAL,
-        AttemptRequestVariant.SCHEMA_REPAIR_V3,
-        AttemptRequestVariant.SCHEMA_REPAIR_V3,
+        AttemptRequestVariant.SCHEMA_REPAIR_V4,
+        AttemptRequestVariant.SCHEMA_REPAIR_V4,
     ]
     assert (
         observed[0].telemetry.attempts[1].request_evidence.prompt_sha256
@@ -1013,7 +1057,7 @@ def test_output_invalid_retry_uses_only_sanitized_schema_repair_guidance() -> No
     assert repaired is not original
     assert repaired.prompt.startswith(original.prompt)
     suffix = repaired.prompt[len(original.prompt) :]
-    assert "STRUCTURED_OUTPUT_SCHEMA_REPAIR_V3" in suffix
+    assert "STRUCTURED_OUTPUT_SCHEMA_REPAIR_V4" in suffix
     assert "schema_validation" in suffix
     assert "field paths from the trusted local output contract" in suffix
     assert '["/answer"]' in suffix
@@ -1041,7 +1085,7 @@ def test_output_invalid_retry_uses_only_sanitized_schema_repair_guidance() -> No
     evidence = [attempt.request_evidence for attempt in observed[0].telemetry.attempts]
     assert [item.variant for item in evidence] == [
         AttemptRequestVariant.ORIGINAL,
-        AttemptRequestVariant.SCHEMA_REPAIR_V3,
+        AttemptRequestVariant.SCHEMA_REPAIR_V4,
     ]
     assert [item.prompt_sha256 for item in evidence] == [
         hashlib.sha256(original.prompt.encode("utf-8")).hexdigest(),
@@ -1049,7 +1093,7 @@ def test_output_invalid_retry_uses_only_sanitized_schema_repair_guidance() -> No
     ]
 
 
-def test_schema_repair_v3_lists_all_nested_required_fields_beyond_issue_cap() -> None:
+def test_schema_repair_v4_lists_all_nested_required_fields_beyond_issue_cap() -> None:
     issue_field_names = tuple(list(_RepairInsight.model_fields)[:8])
     issues = tuple(
         SanitizedValidationIssue(
@@ -1084,7 +1128,7 @@ def test_schema_repair_v3_lists_all_nested_required_fields_beyond_issue_cap() ->
         ),
     )
 
-    assert prepared.evidence.variant is AttemptRequestVariant.SCHEMA_REPAIR_V3
+    assert prepared.evidence.variant is AttemptRequestVariant.SCHEMA_REPAIR_V4
     suffix = prepared.request.prompt[len(request.prompt) :]
     expected_paths = {
         "/insights",
@@ -1129,7 +1173,7 @@ def test_semantic_reason_code_safely_guides_same_schema_repair_retry_variant() -
         ),
     )
 
-    assert prepared.evidence.variant is AttemptRequestVariant.SCHEMA_REPAIR_V3
+    assert prepared.evidence.variant is AttemptRequestVariant.SCHEMA_REPAIR_V4
     suffix = prepared.request.prompt[len(request.prompt) :]
     assert "semantic_constraint at root" in suffix
     assert f"reason={reason_code.value}" in suffix
@@ -1162,7 +1206,7 @@ def test_proposal_support_repair_cannot_crash_attempt_construction() -> None:
         ),
     )
 
-    assert prepared.evidence.variant is AttemptRequestVariant.SCHEMA_REPAIR_V3
+    assert prepared.evidence.variant is AttemptRequestVariant.SCHEMA_REPAIR_V4
     suffix = prepared.request.prompt[len(request.prompt) :]
     assert f"reason={reason_code.value}" in suffix
     assert "every engine-reserved proposal-support option" in suffix
@@ -1223,8 +1267,8 @@ def test_finite_option_repair_restates_complete_trusted_closed_set_and_escalates
     literal_json = json.dumps(allowed, ensure_ascii=True, separators=(",", ":"))
     first_suffix = first_repair.request.prompt[len(request.prompt) :]
     final_suffix = final_repair.request.prompt[len(request.prompt) :]
-    assert first_repair.evidence.variant is AttemptRequestVariant.SCHEMA_REPAIR_V3
-    assert final_repair.evidence.variant is AttemptRequestVariant.SCHEMA_REPAIR_V3
+    assert first_repair.evidence.variant is AttemptRequestVariant.SCHEMA_REPAIR_V4
+    assert final_repair.evidence.variant is AttemptRequestVariant.SCHEMA_REPAIR_V4
     assert f"- /members/*/option_id={literal_json}" in first_suffix
     assert first_suffix.count(literal_json) == 1
     assert "Repair pass: 1" in first_suffix
@@ -1425,12 +1469,12 @@ def test_second_invalid_output_exhausts_without_local_replacement() -> None:
     assert error.outcome.response is None
     assert len(generator.requests) == 2
     assert _provider_payload_view(generator.requests[0]) == original
-    assert "STRUCTURED_OUTPUT_SCHEMA_REPAIR_V3" in generator.requests[1].prompt
+    assert "STRUCTURED_OUTPUT_SCHEMA_REPAIR_V4" in generator.requests[1].prompt
     assert [
         attempt.request_evidence.variant for attempt in error.telemetry.attempts
     ] == [
         AttemptRequestVariant.ORIGINAL,
-        AttemptRequestVariant.SCHEMA_REPAIR_V3,
+        AttemptRequestVariant.SCHEMA_REPAIR_V4,
     ]
 
 
@@ -2090,6 +2134,41 @@ def test_non_repeating_stream_classifier_never_retries_owned_stream_timeout(
     assert classification.sanitized_failure.stream_timeout_phase is phase
 
 
+@pytest.mark.parametrize(
+    ("phase", "expected"),
+    [
+        (StructuredStreamTimeoutPhase.FIRST_EVENT, RetryDisposition.RETRY),
+        (StructuredStreamTimeoutPhase.IDLE, RetryDisposition.FAIL),
+        (StructuredStreamTimeoutPhase.ABSOLUTE, RetryDisposition.FAIL),
+    ],
+)
+def test_first_event_resilient_classifier_retries_only_content_blind_timeout(
+    phase: StructuredStreamTimeoutPhase,
+    expected: RetryDisposition,
+) -> None:
+    classification = FirstEventResilientBoundedSchemaRepairRetryClassifier().classify(
+        StructuredStreamTimeoutError(phase),
+        context=LLMAttemptContext("logical-sample-timeout", 1, 3),
+    )
+
+    assert classification.disposition is expected
+    assert classification.reason is RetryReason.TIMEOUT
+    assert classification.sanitized_failure is not None
+    assert classification.sanitized_failure.stream_timeout_phase is phase
+
+
+def test_first_event_resilient_classifier_never_retries_cleanup_timeout() -> None:
+    classification = FirstEventResilientBoundedSchemaRepairRetryClassifier().classify(
+        StructuredStreamCleanupTimeoutError(
+            StructuredStreamTimeoutPhase.FIRST_EVENT
+        ),
+        context=LLMAttemptContext("logical-sample-cleanup", 1, 3),
+    )
+
+    assert classification.disposition is RetryDisposition.FAIL
+    assert classification.reason is RetryReason.TIMEOUT
+
+
 def _opaque_http_400() -> StructuredGenerationError:
     return StructuredGenerationError(
         kind=GenerationFailureKind.INVALID_REQUEST,
@@ -2122,6 +2201,44 @@ def test_opaque_http_400_policy_retries_only_the_first_opaque_failure() -> None:
     assert first.sanitized_failure.retryable is False
     assert second.disposition is RetryDisposition.FAIL
     assert second.reason is RetryReason.PERMANENT
+
+
+def test_bounded_opaque_http_400_requires_one_unchanged_failure_chain() -> None:
+    classifier = BoundedOpaqueHTTP400RetryClassifier()
+    first = classifier.classify(
+        _opaque_http_400(),
+        context=LLMAttemptContext("bounded-opaque-400", 1, 3),
+    )
+    second = classifier.classify(
+        _opaque_http_400(),
+        context=LLMAttemptContext(
+            "bounded-opaque-400",
+            2,
+            3,
+            previous_failure=first.sanitized_failure,
+        ),
+    )
+    changed = StructuredGenerationError(
+        kind=GenerationFailureKind.INVALID_REQUEST,
+        retryable=False,
+        safe_message="provider rejected invalid request parameters",
+        status_code=400,
+        provider_error_envelope_sha256="4" * 64,
+    )
+    third = classifier.classify(
+        changed,
+        context=LLMAttemptContext(
+            "bounded-opaque-400",
+            3,
+            3,
+            previous_failure=second.sanitized_failure,
+        ),
+    )
+
+    assert first.disposition is RetryDisposition.RETRY
+    assert second.disposition is RetryDisposition.RETRY
+    assert third.disposition is RetryDisposition.FAIL
+    assert third.reason is RetryReason.PERMANENT
 
 
 def test_opaque_http_400_policy_keeps_typed_or_unfingerprinted_400_terminal() -> None:
@@ -2578,7 +2695,7 @@ def test_structured_outcome_record_retains_response_telemetry_not_content() -> N
             "provider_attempt_id": (generator.requests[0].provider_attempt_id.value),
         },
         {
-            "variant": "schema_repair_v3",
+            "variant": "schema_repair_v4",
             "prompt_sha256": hashlib.sha256(
                 generator.requests[1].prompt.encode("utf-8")
             ).hexdigest(),
@@ -3217,7 +3334,7 @@ def test_schema_repair_policy_manifest_is_immutable_and_content_addressed() -> N
 
     assert SchemaRepairAttemptPolicy.manifest is manifest
     assert manifest.policy_id == "structured_output_schema_repair"
-    assert manifest.policy_version == 3
+    assert manifest.policy_version == 4
     assert manifest.max_suffix_utf8_bytes == MAX_SCHEMA_REPAIR_SUFFIX_UTF8_BYTES
     assert manifest.max_schema_nodes == MAX_SCHEMA_REPAIR_SCHEMA_NODES
     assert manifest.max_required_paths == MAX_SCHEMA_REPAIR_REQUIRED_PATHS
@@ -3225,25 +3342,25 @@ def test_schema_repair_policy_manifest_is_immutable_and_content_addressed() -> N
         "b075cad4590f938fcf7624d463a747eb1dda02033747ff15a86891c13c293f00"
     )
     assert manifest.semantic_guidance_sha256 == (
-        "2e09b7e66f56a23ef1bf40b2788b7b767499b094a297f77735db3dd457f4324f"
+        "02f42ffbc8ec5810c74ecf228b598dd2c62dfa2fea3324ac7de11703a2b409b5"
     )
     assert manifest.policy_sha256 == (
-        "dbda83d79337fb8d09c5f82fc24d747b3a2371fd1a807c4672852c2ede83425e"
+        "885e0d4ca1b53e215456212dabed5c286859ee52037cefc5d6081d5c8e32a5c2"
     )
     assert manifest.to_trace_record() == {
         "max_required_paths": 256,
         "max_schema_nodes": 4_096,
         "max_suffix_utf8_bytes": 24_576,
         "policy_id": "structured_output_schema_repair",
-        "policy_version": 3,
+        "policy_version": 4,
         "semantic_guidance_sha256": (
-            "2e09b7e66f56a23ef1bf40b2788b7b767499b094a297f77735db3dd457f4324f"
+            "02f42ffbc8ec5810c74ecf228b598dd2c62dfa2fea3324ac7de11703a2b409b5"
         ),
         "template_sha256": (
             "b075cad4590f938fcf7624d463a747eb1dda02033747ff15a86891c13c293f00"
         ),
         "policy_sha256": (
-            "dbda83d79337fb8d09c5f82fc24d747b3a2371fd1a807c4672852c2ede83425e"
+            "885e0d4ca1b53e215456212dabed5c286859ee52037cefc5d6081d5c8e32a5c2"
         ),
     }
     assert set(_SEMANTIC_REPAIR_GUIDANCE) == set(ValidationIssueReasonCode)
@@ -3251,6 +3368,6 @@ def test_schema_repair_policy_manifest_is_immutable_and_content_addressed() -> N
         AttemptRequestVariant.SCHEMA_REPAIR_V1
     )
     with pytest.raises(ValueError, match="does not authenticate"):
-        replace(manifest, policy_version=4)
+        replace(manifest, policy_version=5)
     with pytest.raises(FrozenInstanceError):
         manifest.policy_version = 2

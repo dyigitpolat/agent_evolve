@@ -34,8 +34,26 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
-_DEFAULT_MODEL = "openai:gpt-4o"
+#: Default model. Cheap by policy, not by accident: a package that defaults to
+#: a frontier model hands a stranger a bill they never chose on their first
+#: run. This route is $0.10 per million input tokens and $0.60 per million
+#: output. Whatever is set here is echoed before any paid call, so nobody is
+#: billed by a default they did not see.
+_DEFAULT_MODEL = "openrouter:openai/gpt-5.6-luna"
 _DEFAULT_HARNESS = "pydantic_ai"
+
+#: Published price per million tokens for the routes we default to or document,
+#: so cost can be shown rather than guessed. Absent from this table means
+#: unknown, and unknown is reported as unknown.
+MODEL_PRICES_PER_MTOK = {
+    "openrouter:openai/gpt-5.6-luna": (0.10, 0.60),
+    "openai/gpt-5.6-luna": (0.10, 0.60),
+}
+
+
+def model_price(model: str):
+    """Return ``(input, output)`` USD per million tokens, or ``None``."""
+    return MODEL_PRICES_PER_MTOK.get(model)
 
 _API_KEYS = ("OPENAI_API_KEY", "GROQ_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY")
 
@@ -245,7 +263,9 @@ __all__ = [
     "CredentialLoad",
     "DOTENV_PATH_VAR",
     "SCRUBBED_VAR",
+    "MODEL_PRICES_PER_MTOK",
     "credentials_present",
+    "model_price",
     "enforce_scrubbed_environment",
     "is_credential_name",
     "load_credentials",

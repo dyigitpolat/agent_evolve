@@ -58,12 +58,17 @@ def test_real_portfolio_result_projects_one_authenticated_observation_per_action
         member_by_evidence = {
             value.outcome_sha256: value for value in result.receipt.members
         }
+        observed_identifiability = set()
         for observation in observations:
             assert observation.event_index == 1
             assert observation.provenance is EvidenceProvenance.DIRECT_MUTATION
-            assert observation.intervention_identifiability is (
+            expected_identifiability = (
                 InterventionIdentifiability.EXACT_SINGLE
+                if len(observation.affected_paths) == 1
+                else InterventionIdentifiability.JOINT_WITHOUT_ABLATION
             )
+            assert observation.intervention_identifiability is expected_identifiability
+            observed_identifiability.add(observation.intervention_identifiability)
             assert observation.mechanism_identifying_design is False
             assert observation.metrics[0].metric_id == "loss"
             member = member_by_evidence[observation.source_evidence_id]
@@ -103,6 +108,10 @@ def test_real_portfolio_result_projects_one_authenticated_observation_per_action
                 observation.action_semantics_definition_sha256
                 == compiler.definition_sha256
             )
+        assert observed_identifiability == {
+            InterventionIdentifiability.EXACT_SINGLE,
+            InterventionIdentifiability.JOINT_WITHOUT_ABLATION,
+        }
 
     asyncio.run(scenario())
 

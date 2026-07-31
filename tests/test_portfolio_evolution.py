@@ -11,12 +11,22 @@ from fractions import Fraction
 import pytest
 from pydantic import BaseModel, ConfigDict
 
+from agent_evolve.application.agentic_portfolio_residual_expert import (
+    AGENTIC_PORTFOLIO_RESIDUAL_EXPERT_ID,
+    AgenticPortfolioBatchResidualExpert,
+    AgenticPortfolioResidualExpert,
+)
 from agent_evolve.application.agentic_evolution import AgenticEvolutionEngine
+from agent_evolve.application.contextual_search_controller import SearchPhase
 from agent_evolve.application.detailed_evaluation import (
     DetailedEvaluationPayload,
     EvaluatorIdentity,
 )
 from agent_evolve.application.insight_memory import InsightMemoryBank
+from agent_evolve.application.materialized_action_broker import (
+    MaterializedActionEvidenceLedger,
+    RegretBrokeredMaterializedActionPolicy,
+)
 from agent_evolve.application.outcome_relation import objective_pareto_outcome_binding
 from agent_evolve.application.portfolio_evolution import (
     PortfolioCandidateFailureEvidence,
@@ -29,6 +39,10 @@ from agent_evolve.application.portfolio_evolution import (
     PortfolioRewardAggregationBinding,
     PortfolioVariationWaveResult,
     PortfolioVariationWaveRequest,
+)
+from agent_evolve.application.residual_portfolio_evolution import (
+    ResidualPortfolioDecisionRequest,
+    ResidualPortfolioEvolution,
 )
 from agent_evolve.core.problem import ObjectiveSpec
 from agent_evolve.domain.finite_variation import (
@@ -267,7 +281,11 @@ class _RankedSelector:
         return PortfolioSelectionResult(decision=decision, telemetry=telemetry)
 
 
-def _contract(parent: FrozenJsonObject) -> FiniteVariationContract:
+def _contract(
+    parent: FrozenJsonObject,
+    *,
+    offset: int = 0,
+) -> FiniteVariationContract:
     parent_sha256 = typed_json_sha256(parent)
     return FiniteVariationContract(
         catalog_id="portfolio_wave_test",
@@ -281,11 +299,31 @@ def _contract(parent: FrozenJsonObject) -> FiniteVariationContract:
                 child_configuration=_frozen_object(child),
                 family=family,
                 description=description,
+                metadata=(
+                    (("evaluation_operator", "composite"),)
+                    if option_id == "gamma.xy"
+                    else ()
+                ),
             )
             for option_id, family, child, description in (
-                ("alpha.x1", "alpha", {"x": 1, "y": 0}, "Set x to one."),
-                ("beta.y1", "beta", {"x": 0, "y": 1}, "Set y to one."),
-                ("gamma.xy", "gamma", {"x": 2, "y": 2}, "Set both to two."),
+                (
+                    "alpha.x1",
+                    "alpha",
+                    {"x": offset + 1, "y": offset},
+                    "Set x to one.",
+                ),
+                (
+                    "beta.y1",
+                    "beta",
+                    {"x": offset, "y": offset + 1},
+                    "Set y to one.",
+                ),
+                (
+                    "gamma.xy",
+                    "gamma",
+                    {"x": offset + 2, "y": offset + 2},
+                    "Set both to two.",
+                ),
             )
         ),
     )
@@ -1087,7 +1125,7 @@ def test_wave_rejects_missing_selector_telemetry_before_evaluation() -> None:
             ids=ids,
             memory=memory,
         )
-        with pytest.raises(ValueError, match="requires exact call telemetry"):
+        with pytest.raises(ValueError, match="absence must be asserted, not inferred"):
             await service.run(wave)
         return selector, problem, memory
 
@@ -1272,3 +1310,178 @@ def test_wave_request_rejects_memory_cards_that_differ_from_selected_refs() -> N
     wave, wrong = asyncio.run(scenario())
     with pytest.raises(ValueError, match="card references"):
         replace(wave, memory_credit=wrong)
+
+
+class _ZeroResidualSlateValue:
+    definition_sha256 = hashlib.sha256(
+        b"test:zero-residual-slate-value"
+    ).hexdigest()
+
+    def value(self, actions):
+        return 0.0
+
+
+class _AlwaysResidualSlateFeasible:
+    definition_sha256 = hashlib.sha256(
+        b"test:always-residual-slate-feasible"
+    ).hexdigest()
+
+    def permits(self, actions):
+        return True
+
+
+def test_agentic_portfolio_residual_expert_evaluates_only_broker_subset() -> None:
+    async def scenario():
+        values = await _build_wave("portfolio_residual_subset")
+        ids, problem, generator, _memory, engine, selector, credited_wave = values
+        wave = replace(credited_wave, memory_credit=None)
+        service = PortfolioEvolution(
+            engine=engine,
+            selector=selector,
+            ids=ids,
+        )
+        campaign_scope_sha256 = hashlib.sha256(
+            b"test:portfolio-residual-campaign"
+        ).hexdigest()
+        prior_state_sha256 = hashlib.sha256(
+            b"test:portfolio-residual-prior-cutoff"
+        ).hexdigest()
+        expert = AgenticPortfolioResidualExpert(
+            portfolio=service,
+            wave=wave,
+            campaign_scope_sha256=campaign_scope_sha256,
+            prior_state_sha256=prior_state_sha256,
+        )
+        request = ResidualPortfolioDecisionRequest(
+            campaign_scope_sha256=campaign_scope_sha256,
+            prior_state_sha256=prior_state_sha256,
+            decision_index=1,
+            phase=SearchPhase.BASIN_EXPANSION,
+            remaining_decisions=3,
+            remaining_evaluations=9,
+            evaluation_slots=1,
+            expert_proposal_slots=(
+                (
+                    AGENTIC_PORTFOLIO_RESIDUAL_EXPERT_ID,
+                    wave.selection_request.portfolio_size,
+                ),
+            ),
+            proposal_context=_frozen_object(
+                {"archive_cutoff": "opaque_to_residual_core"}
+            ),
+            reference_escrow_slots=0,
+        )
+        result = await ResidualPortfolioEvolution(
+            experts=(expert,),
+            broker=RegretBrokeredMaterializedActionPolicy(
+                ledger=MaterializedActionEvidenceLedger(),
+            ),
+            slate_value=_ZeroResidualSlateValue(),
+            slate_feasibility=_AlwaysResidualSlateFeasible(),
+        ).run(request)
+        return problem, generator, selector, result
+
+    problem, generator, selector, result = asyncio.run(scenario())
+
+    assert selector.calls == 1
+    assert generator.calls == 0
+    assert len(result.proposals) == 1
+    assert len(result.proposals[0].actions) == 3
+    assert len(result.evaluations) == 1
+    assert problem.evaluations == 1
+    assert (
+        result.evaluations[0].action.expert_id
+        == AGENTIC_PORTFOLIO_RESIDUAL_EXPERT_ID
+    )
+
+
+def test_agentic_batch_residual_expert_brokers_across_parent_lanes() -> None:
+    async def scenario():
+        values = await _build_wave("portfolio_residual_batch")
+        ids, problem, generator, _memory, engine, selector, credited_wave = values
+        first_wave = replace(credited_wave, memory_credit=None)
+        second_parent = await engine.register_seed(
+            {"x": 10, "y": 10},
+            label="residual_batch_second_parent",
+        )
+        second_wave = replace(
+            first_wave,
+            selection_request=replace(
+                first_wave.selection_request,
+                call_id=ids.new_llm_call_id(),
+                finite_variation_contract=_contract(
+                    second_parent.configuration,
+                    offset=10,
+                ),
+            ),
+            parent=second_parent,
+            label_prefix="portfolio_residual_batch_second",
+        )
+        evaluations_before = problem.evaluations
+        service = PortfolioEvolution(
+            engine=engine,
+            selector=selector,
+            ids=ids,
+        )
+        campaign_scope_sha256 = hashlib.sha256(
+            b"test:portfolio-residual-batch-campaign"
+        ).hexdigest()
+        prior_state_sha256 = hashlib.sha256(
+            b"test:portfolio-residual-batch-prior"
+        ).hexdigest()
+        expert = AgenticPortfolioBatchResidualExpert(
+            portfolio=service,
+            waves=(first_wave, second_wave),
+            campaign_scope_sha256=campaign_scope_sha256,
+            prior_state_sha256=prior_state_sha256,
+        )
+        request = ResidualPortfolioDecisionRequest(
+            campaign_scope_sha256=campaign_scope_sha256,
+            prior_state_sha256=prior_state_sha256,
+            decision_index=1,
+            phase=SearchPhase.BASIN_EXPANSION,
+            remaining_decisions=3,
+            remaining_evaluations=12,
+            evaluation_slots=4,
+            expert_proposal_slots=(
+                (
+                    AGENTIC_PORTFOLIO_RESIDUAL_EXPERT_ID,
+                    expert.proposal_capacity,
+                ),
+            ),
+            proposal_context=_frozen_object(
+                {"parent_lane_count": 2, "archive_cutoff": "opaque"}
+            ),
+            reference_escrow_slots=0,
+        )
+        result = await ResidualPortfolioEvolution(
+            experts=(expert,),
+            broker=RegretBrokeredMaterializedActionPolicy(
+                ledger=MaterializedActionEvidenceLedger(),
+            ),
+            slate_value=_ZeroResidualSlateValue(),
+            slate_feasibility=_AlwaysResidualSlateFeasible(),
+        ).run(request)
+        return (
+            problem,
+            generator,
+            selector,
+            evaluations_before,
+            result,
+        )
+
+    problem, generator, selector, evaluations_before, result = asyncio.run(
+        scenario()
+    )
+
+    assert selector.calls == 2
+    assert generator.calls == 0
+    assert len(result.proposals[0].actions) == 6
+    assert len(result.evaluations) == 4
+    assert problem.evaluations - evaluations_before == 4
+    assert len(
+        {
+            evaluation.action.parent_ids[0]
+            for evaluation in result.evaluations
+        }
+    ) == 2

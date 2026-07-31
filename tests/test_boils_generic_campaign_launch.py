@@ -326,7 +326,9 @@ def test_provider_response_gate_requires_exact_streamlake_reasoning() -> None:
         for index in range(campaign.PLANNED_LOGICAL_CALLS)
     )
     assert campaign._provider_response_telemetry_gate(
-        arm="live", outcome_rows=rows
+        arm="live",
+        outcome_rows=rows,
+        expected_provider_calls=campaign.PLANNED_LOGICAL_CALLS,
     )
     drifted = list(rows)
     drifted[0] = {
@@ -336,10 +338,12 @@ def test_provider_response_gate_requires_exact_streamlake_reasoning() -> None:
         }
     }
     assert not campaign._provider_response_telemetry_gate(
-        arm="live", outcome_rows=tuple(drifted)
+        arm="live",
+        outcome_rows=tuple(drifted),
+        expected_provider_calls=campaign.PLANNED_LOGICAL_CALLS,
     )
     assert campaign._provider_response_telemetry_gate(
-        arm="control", outcome_rows=()
+        arm="control", outcome_rows=(), expected_provider_calls=0
     )
 
 

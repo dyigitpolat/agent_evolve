@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -21,6 +21,8 @@ from agent_evolve.application.portfolio_campaign_runtime import (
     AgenticPortfolioCampaignRuntime,
 )
 from agent_evolve.application.campaign_variation_trace import (
+    CampaignVariationTraceSummary,
+    project_finite_contract_proposal_topology,
     summarize_campaign_variation_trace,
 )
 from agent_evolve.core.problem import ObjectiveSpec
@@ -39,6 +41,7 @@ from agent_evolve.domain.typed_json import (
 from agent_evolve.infrastructure.ids import DeterministicIdFactory
 from agent_evolve.ports.artifact_store import canonical_json_bytes
 from agent_evolve.integrations.pydantic_ai.calibrated_portfolio_selection import (
+    ACQUISITION_CERTIFIED_RESIDUAL_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256,
     CALIBRATED_PORTFOLIO_BASE_INSTRUCTION,
     CALIBRATED_PORTFOLIO_COMMON_POOL_PROMPT_DEFINITION_SHA256,
     CALIBRATED_PORTFOLIO_HIDDEN_WITNESS_PROMPT_DEFINITION_SHA256,
@@ -60,11 +63,14 @@ from agent_evolve.integrations.pydantic_ai.calibrated_portfolio_selection import
     MODEL_ANCHORED_CALIBRATED_PORTFOLIO_SELECTION_POLICY_ID,
     MODEL_ANCHORED_CALIBRATED_PORTFOLIO_SELECTION_POLICY_VERSION,
     OPERATOR_STRATIFIED_CALIBRATED_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256,
+    REGRET_BOUNDED_INFORMATION_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256,
     STRUCTURAL_POSTERIOR_CALIBRATED_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256,
     STRUCTURAL_POSTERIOR_CALIBRATED_PORTFOLIO_SELECTION_POLICY_ID,
     STRUCTURAL_POSTERIOR_CALIBRATED_PORTFOLIO_SELECTION_POLICY_VERSION,
     CalibratedPortfolioFeasibilityWitnessMode,
     PydanticAICalibratedPortfolioSelectionPolicy,
+    PydanticAIAcquisitionCertifiedResidualPortfolioSelectionPolicy,
+    PydanticAIRegretBoundedInformationPortfolioSelectionPolicy,
     PydanticAIConstraintDecoupledHorizonPortfolioSelectionPolicy,
     PydanticAIConstraintDecoupledTargetConditionedPortfolioSelectionPolicy,
     PydanticAIContextualSearchAllocationPortfolioSelectionPolicy,
@@ -98,6 +104,15 @@ from agent_evolve.policies.selection.calibrated_slate import (
     MetricOptimizationGoal,
     SlateMetricObjective,
     SlateStructuralEvidence,
+)
+from agent_evolve.policies.selection.acquisition_certified_slate import (
+    AcquisitionCertifiedSlateContext,
+    AcquisitionCertifiedSlateContextRegistry,
+    AcquisitionCertifiedSlatePolicy,
+)
+from agent_evolve.policies.selection.regret_bounded_slate import (
+    RegretBoundedSlatePolicy,
+    ResidualInformationAssayValuePolicy,
 )
 from agent_evolve.policies.selection.calibrated_portfolio_binding import (
     CalibratedPortfolioAllocationContext,
@@ -161,6 +176,16 @@ from agent_evolve.ports.portfolio_selection import (
     pairwise_disjoint_parent_patch_witness,
     project_family_exposure_bounds_to_pairwise_disjoint_feasibility,
     validate_pairwise_disjoint_parent_patch_selection,
+)
+from agent_evolve.ports.finite_acquisition import (
+    FiniteAcquisitionCandidate,
+    FiniteAcquisitionObjective,
+    FiniteAcquisitionObservation,
+)
+from agent_evolve.ports.finite_acquisition_batch import (
+    FiniteAcquisitionBatchScoreDecision,
+    FiniteAcquisitionBatchScoreRequest,
+    FiniteAcquisitionSlateScore,
 )
 from agent_evolve.ports.contextual_search_allocation import (
     ContextualPortfolioAllocationContract,
@@ -667,6 +692,35 @@ class _ProviderFreeSlateRunner:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _FixtureAcquisitionBatchScorer:
+    weights: tuple[tuple[str, float], ...]
+    policy_id: str = "fixture_acquisition_batch_scorer"
+    policy_version: int = 1
+    definition_sha256: str = _sha("fixture acquisition batch scorer")
+
+    def score(
+        self,
+        request: FiniteAcquisitionBatchScoreRequest,
+    ) -> FiniteAcquisitionBatchScoreDecision:
+        weight_by_id = dict(self.weights)
+        return FiniteAcquisitionBatchScoreDecision(
+            request_sha256=request.request_sha256,
+            policy_id=self.policy_id,
+            policy_version=self.policy_version,
+            policy_definition_sha256=self.definition_sha256,
+            scores=tuple(
+                FiniteAcquisitionSlateScore(
+                    slate=slate,
+                    log_acquisition_value=float(
+                        sum(weight_by_id[value] for value in slate.candidate_ids)
+                    ),
+                )
+                for slate in request.slates
+            ),
+        )
+
+
 class _NoCandidateGenerator:
     async def propose(self, request):
         del request
@@ -897,10 +951,10 @@ def test_campaign_coordinator_seals_prompt_and_strictly_decodes_k4() -> None:
         * 4
     )
     assert coordinator.decode_selected_source_ids(result) == (
-        "model",
-        "model",
-        "model",
-        "model",
+        "primary",
+        "primary",
+        "primary",
+        "primary",
     )
 
     audit = result.supplemental_selection_audit
@@ -2392,6 +2446,62 @@ def test_hierarchical_ranked_union_resolves_exactly_two_engine_composites() -> N
     assert variation_trace["effective_composite_proposal_count_histogram"] == {"2": 1}
     assert canonical_json_bytes(variation_trace)
 
+    option_by_id = {
+        option.option_id: option for option in request.finite_variation_contract.options
+    }
+    proposal_contract = replace(
+        request.finite_variation_contract,
+        options=tuple(option_by_id[value["option_id"]] for value in proposals),
+    )
+    engine_topology = project_finite_contract_proposal_topology(
+        source_contract=request.finite_variation_contract,
+        proposal_contract=proposal_contract,
+    )
+    engine_audit = replace(
+        audit,
+        payload=freeze_json({"proposal_topology": engine_topology}),
+    )
+    engine_result = replace(result, supplemental_audit=engine_audit)
+    engine_trace = summarize_campaign_variation_trace(
+        (engine_result,),
+        required_composite_proposals=2,
+    ).to_record()
+    assert engine_trace["proposal_action_kind_counts"] == {
+        "atomic": 6,
+        "compose_r2": 2,
+    }
+    assert engine_trace["calls"][0]["proposal_provenance"] == (
+        "engine_authenticated_finite_contract"
+    )
+    assert engine_trace["model_original_proposal_call_count"] == 0
+    assert engine_trace["engine_authenticated_proposal_call_count"] == 1
+    assert engine_trace["required_composite_capacity_available_rate"] == 1.0
+
+
+def test_variation_trace_accepts_arbitrary_width_engine_screen() -> None:
+    trace = CampaignVariationTraceSummary(
+        selector_call_count=1,
+        proposal_member_count=64,
+        evaluated_member_count=4,
+        proposal_action_kind_counts=(("atomic", 48), ("compose_r2", 16)),
+        evaluated_action_kind_counts=(("atomic", 4),),
+        hierarchical_call_count=1,
+        model_original_proposal_call_count=0,
+        engine_authenticated_proposal_call_count=1,
+        required_composite_proposals=2,
+        exact_required_composite_call_count=0,
+        required_composite_capacity_available_call_count=1,
+        capacity_projected_call_count=0,
+        effective_composite_proposal_count_histogram=((16, 1),),
+        calls=({"capacity_projected": False},),
+    ).to_record()
+
+    assert trace["schema_version"] == 4
+    assert trace["effective_composite_proposal_count_histogram"] == {"16": 1}
+    assert trace["composite_proposal_count"] == 16
+    assert trace["exact_required_composite_call_rate"] is None
+    assert trace["required_composite_capacity_available_rate"] == 1.0
+
 
 def test_source_mix_replay_honors_authenticated_deferred_proposal_support() -> None:
     """Regression for the shared-N10 post-G1 replay failure.
@@ -2564,6 +2674,8 @@ def test_contextual_search_allocation_enforces_exact_source_operator_slice() -> 
         evaluation_slots=request.portfolio_size,
         source_target_counts=(("engine", 2), ("model", 2)),
         operator_target_counts=(("atomic", 2), ("composite", 2)),
+        minimum_single_path_interventions=1,
+        minimum_disjoint_parent_patch_pairs=2,
     )
     scope = replace(
         legacy_binding.context.scope,
@@ -2629,6 +2741,10 @@ def test_contextual_search_allocation_enforces_exact_source_operator_slice() -> 
     assert projection["exact"] is True
     assert projection["source_l1_deviation"] == 0
     assert projection["operator_l1_deviation"] == 0
+    assert projection["minimum_single_path_interventions"] == 1
+    assert projection["realized_single_path_interventions"] >= 1
+    assert projection["minimum_disjoint_parent_patch_pairs"] == 2
+    assert projection["realized_disjoint_parent_patch_pairs"] >= 2
     assert projection["requested_source_target_counts"] == [
         list(value) for value in allocation.source_target_counts
     ]
@@ -2694,6 +2810,9 @@ def test_contextual_search_allocation_enforces_exact_source_operator_slice() -> 
     assert exact_realization.realized_operator_target_counts == (
         allocation.operator_target_counts
     )
+    assert exact_realization.realized_single_path_interventions >= 1
+    assert exact_realization.requested_minimum_disjoint_parent_patch_pairs == 2
+    assert exact_realization.realized_disjoint_parent_patch_pairs >= 2
 
     impossible = ContextualPortfolioAllocationContract(
         campaign_scope_sha256=allocation.campaign_scope_sha256,
@@ -2812,7 +2931,11 @@ def test_contextual_allocation_uses_variation_source_not_engine_origin() -> None
         slice_id="elite",
         evaluation_slots=request.portfolio_size,
         source_target_counts=(("global_restart", 2), ("primary", 2)),
-        operator_target_counts=(("atomic", 4), ("composite", 0)),
+        operator_target_counts=(
+            ("atomic", 2),
+            ("composite", 0),
+            ("global", 2),
+        ),
     )
     scope = replace(
         legacy_binding.context.scope,
@@ -2866,6 +2989,11 @@ def test_contextual_allocation_uses_variation_source_not_engine_origin() -> None
     assert dict(projection["realized_source_target_counts"]) == {
         "global_restart": 2,
         "primary": 2,
+    }
+    assert dict(projection["realized_operator_target_counts"]) == {
+        "atomic": 2,
+        "composite": 0,
+        "global": 2,
     }
     selected_ids = tuple(value.option_id for value in result.decision.members)
     assert {
@@ -3207,6 +3335,251 @@ def test_horizon_bounded_allocator_tapers_exposure_without_changing_adapter() ->
     )
     assert discovery_decoded.allocation.active_exposure_phase.start_wave_index == 0
     assert terminal_decoded.allocation.active_exposure_phase.start_wave_index == 5
+
+
+def test_acquisition_certified_selector_reserves_anchor_and_replays_replacement() -> (
+    None
+):
+    ids = DeterministicIdFactory("acquisition_certified_selector")
+    request = _boils_request(ids, require_disjoint=False)
+    options = request.finite_variation_contract.options
+    assert len(options) >= 12
+    anchor_ids = tuple(sorted(value.option_id for value in options[:4]))
+    model_ids = tuple(value.option_id for value in options[4:12])
+    promoted_residual_id = model_ids[0]
+
+    legacy_binding = _binding(request)
+    scope = replace(
+        legacy_binding.context.scope,
+        prompt_definition_sha256=calibrated_portfolio_prompt_definition_sha256(
+            constraint_decoupled=True,
+        ),
+        selector_policy_definition_sha256=(
+            ACQUISITION_CERTIFIED_RESIDUAL_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256
+        ),
+    )
+    binding = replace(
+        legacy_binding,
+        context=replace(
+            legacy_binding.context,
+            scope=scope,
+            calibration_snapshot=replace(
+                legacy_binding.context.calibration_snapshot,
+                scope=scope,
+            ),
+        ),
+    )
+    registry = AcquisitionCertifiedSlateContextRegistry()
+    registry.register(
+        AcquisitionCertifiedSlateContext(
+            campaign_scope_sha256=_sha("acquisition certified campaign"),
+            finite_contract_sha256=(
+                request.finite_variation_contract.identity_sha256
+            ),
+            cutoff_index=8,
+            seed=29,
+            objectives=(
+                FiniteAcquisitionObjective(
+                    "total_levels", "min", 0.0, 100.0
+                ),
+                FiniteAcquisitionObjective(
+                    "total_lut_count", "min", 0.0, 20_000.0
+                ),
+            ),
+            observations=(
+                FiniteAcquisitionObservation(
+                    candidate_id="observed.seed",
+                    configuration_sha256=_sha("acquisition observed seed"),
+                    features=(0.0,),
+                    objectives=(
+                        ("total_levels", 75.0),
+                        ("total_lut_count", 10_000.0),
+                    ),
+                ),
+            ),
+            candidates=tuple(
+                FiniteAcquisitionCandidate(
+                    candidate_id=option.option_id,
+                    configuration_sha256=option.child_configuration_sha256,
+                    features=(rank / (len(options) + 1.0),),
+                )
+                for rank, option in enumerate(options, start=1)
+            ),
+            reference_option_ids=anchor_ids,
+        )
+    )
+    anchor_weight = {
+        option_id: float(10 - rank)
+        for rank, option_id in enumerate(anchor_ids)
+    }
+    weights = tuple(
+        sorted(
+            (
+                option.option_id,
+                30.0
+                if option.option_id == promoted_residual_id
+                else anchor_weight.get(option.option_id, 0.0),
+            )
+            for option in options
+        )
+    )
+    allocator = AcquisitionCertifiedSlatePolicy(
+        context_provider=registry,
+        scorer=_FixtureAcquisitionBatchScorer(weights),
+    )
+    coordinator = CalibratedPortfolioCampaignCoordinator(
+        allocator=allocator,
+        constraint_decoupled=True,
+    )
+    coordinator.register(request, binding)
+    selector = coordinator.build_selector(_ProviderFreeSlateRunner(model_ids))
+    assert type(selector) is (
+        PydanticAIAcquisitionCertifiedResidualPortfolioSelectionPolicy
+    )
+
+    result = asyncio.run(selector.select(request))
+
+    audit = result.supplemental_audit
+    assert audit is not None
+    payload = thaw_json(audit.payload)
+    assert type(payload) is dict
+    reconciled_ids = {
+        value["option_id"] for value in payload["original_k8_response"]["members"]
+    }
+    assert set(anchor_ids) <= reconciled_ids
+    allocation = payload["allocation"]
+    assert allocation["reference_option_ids"] == list(anchor_ids)
+    selected_ids = {value.option_id for value in result.decision.members}
+    weakest_anchor = min(anchor_ids, key=anchor_weight.__getitem__)
+    assert selected_ids == {
+        promoted_residual_id,
+        *set(anchor_ids).difference({weakest_anchor}),
+    }
+    assert float.fromhex(allocation["certificate_margin_hex"]) > 0.0
+    decoded = decode_calibrated_portfolio_audit(
+        audit,
+        request=request,
+        binding=binding,
+        allocator=allocator,
+    )
+    assert decoded.allocation.to_record() == allocation
+
+
+def test_regret_bounded_selector_admits_authenticated_residual_inside_envelope() -> (
+    None
+):
+    ids = DeterministicIdFactory("regret_bounded_selector")
+    request = _boils_request(ids, require_disjoint=False)
+    options = request.finite_variation_contract.options
+    assert len(options) >= 12
+    anchor_ids = tuple(sorted(value.option_id for value in options[:4]))
+    model_ids = tuple(value.option_id for value in options[4:12])
+    promoted_residual_id = model_ids[0]
+
+    legacy_binding = _binding(request)
+    scope = replace(
+        legacy_binding.context.scope,
+        prompt_definition_sha256=calibrated_portfolio_prompt_definition_sha256(
+            constraint_decoupled=True,
+        ),
+        selector_policy_definition_sha256=(
+            REGRET_BOUNDED_INFORMATION_PORTFOLIO_SELECTION_POLICY_DEFINITION_SHA256
+        ),
+    )
+    binding = replace(
+        legacy_binding,
+        context=replace(
+            legacy_binding.context,
+            scope=scope,
+            calibration_snapshot=replace(
+                legacy_binding.context.calibration_snapshot,
+                scope=scope,
+            ),
+        ),
+    )
+    registry = AcquisitionCertifiedSlateContextRegistry()
+    registry.register(
+        AcquisitionCertifiedSlateContext(
+            campaign_scope_sha256=_sha("regret bounded campaign"),
+            finite_contract_sha256=request.finite_variation_contract.identity_sha256,
+            cutoff_index=8,
+            seed=31,
+            objectives=(
+                FiniteAcquisitionObjective("total_levels", "min", 0.0, 100.0),
+                FiniteAcquisitionObjective(
+                    "total_lut_count", "min", 0.0, 20_000.0
+                ),
+            ),
+            observations=(
+                FiniteAcquisitionObservation(
+                    candidate_id="observed.seed",
+                    configuration_sha256=_sha("regret observed seed"),
+                    features=(0.0,),
+                    objectives=(
+                        ("total_levels", 75.0),
+                        ("total_lut_count", 10_000.0),
+                    ),
+                ),
+            ),
+            candidates=tuple(
+                FiniteAcquisitionCandidate(
+                    candidate_id=option.option_id,
+                    configuration_sha256=option.child_configuration_sha256,
+                    features=(rank / (len(options) + 1.0),),
+                )
+                for rank, option in enumerate(options, start=1)
+            ),
+            reference_option_ids=anchor_ids,
+        )
+    )
+    weights = tuple(
+        sorted(
+            (
+                option.option_id,
+                0.95
+                if option.option_id == promoted_residual_id
+                else 1.0
+                if option.option_id in anchor_ids
+                else 0.0,
+            )
+            for option in options
+        )
+    )
+    allocator = RegretBoundedSlatePolicy(
+        context_provider=registry,
+        scorer=_FixtureAcquisitionBatchScorer(weights),
+        future_value_policy=ResidualInformationAssayValuePolicy(0.06),
+        minimum_acquisition_retention_ratio=0.95,
+        allow_development_assay=True,
+    )
+    coordinator = CalibratedPortfolioCampaignCoordinator(
+        allocator=allocator,
+        constraint_decoupled=True,
+    )
+    coordinator.register(request, binding)
+    selector = coordinator.build_selector(_ProviderFreeSlateRunner(model_ids))
+    assert type(selector) is PydanticAIRegretBoundedInformationPortfolioSelectionPolicy
+
+    result = asyncio.run(selector.select(request))
+
+    audit = result.supplemental_audit
+    assert audit is not None
+    payload = thaw_json(audit.payload)
+    assert type(payload) is dict
+    allocation = payload["allocation"]
+    assert allocation["reference_option_ids"] == list(anchor_ids)
+    assert allocation["selected_future_value"]["authority"] == "development_assay"
+    assert float.fromhex(allocation["acquisition_regret_hex"]) == pytest.approx(0.05)
+    selected_ids = {value.option_id for value in result.decision.members}
+    assert promoted_residual_id in selected_ids
+    assert len(selected_ids.intersection(anchor_ids)) == 3
+    decoded = decode_calibrated_portfolio_audit(
+        audit,
+        request=request,
+        binding=binding,
+        allocator=allocator,
+    )
+    assert decoded.allocation.to_record() == allocation
 
 
 def test_constraint_decoupled_selector_reconciles_duplicate_infeasible_semantics() -> (

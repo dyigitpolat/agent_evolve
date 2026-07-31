@@ -50,6 +50,7 @@ from .detailed_evaluation import (
     timeloop_v2_evaluator_identity,
 )
 from .finite_variation_catalog import TimeloopV2FiniteVariationCatalog
+from .hard_feasibility import TimeloopV2HardFeasibility
 from .frozen_panels import (
     FROZEN_EXTRACTION_RECEIPT_SHA256,
     FROZEN_NETWORK_PANELS,
@@ -77,6 +78,15 @@ from .runtime_manifest import (
     RuntimeLayerManifest,
     compile_runtime_layer_manifests,
     runtime_layer_manifest_sha256,
+)
+from .residual_portfolio_adapter import (
+    TIMELOOP_V2_RESIDUAL_PHENOTYPE_PROJECTION_ID,
+    TIMELOOP_V2_RESIDUAL_PHENOTYPE_PROJECTION_VERSION,
+    TIMELOOP_V2_SELECTED_ACTION_EVALUATOR_ID,
+    TIMELOOP_V2_SELECTED_ACTION_EVALUATOR_VERSION,
+    TimeloopV2ResidualPhenotypeProjection,
+    TimeloopV2SelectedMaterializedActionEvaluator,
+    timeloop_v2_residual_phenotype_projection_definition_sha256,
 )
 
 __all__ = [
@@ -109,6 +119,7 @@ __all__ = [
     "TimeloopV2Evaluation",
     "TimeloopV2EvaluatorPort",
     "TimeloopV2FiniteVariationCatalog",
+    "TimeloopV2HardFeasibility",
     "TimeloopV2InfeasibleEvaluation",
     "TimeloopV2Settings",
     "TimeloopV2StaticInfeasibleEvaluation",
@@ -116,6 +127,12 @@ __all__ = [
     "TIMELOOP_V2_DETAILED_EVALUATOR_ID",
     "TIMELOOP_V2_DETAILED_EVALUATOR_VERSION",
     "TIMELOOP_V2_DETAILED_RECEIPT_SCHEMA_VERSION",
+    "TIMELOOP_V2_RESIDUAL_PHENOTYPE_PROJECTION_ID",
+    "TIMELOOP_V2_RESIDUAL_PHENOTYPE_PROJECTION_VERSION",
+    "TIMELOOP_V2_SELECTED_ACTION_EVALUATOR_ID",
+    "TIMELOOP_V2_SELECTED_ACTION_EVALUATOR_VERSION",
+    "TimeloopV2ResidualPhenotypeProjection",
+    "TimeloopV2SelectedMaterializedActionEvaluator",
     "WORKLOAD_DEFINITION_SHA256",
     "audit_compiler_injectivity",
     "analyze_static_mapspace_feasibility",
@@ -133,5 +150,6 @@ __all__ = [
     "runtime_layer_manifest_sha256",
     "timeloop_v2_evaluator_context_record",
     "timeloop_v2_evaluator_identity",
+    "timeloop_v2_residual_phenotype_projection_definition_sha256",
     "verify_network_asset",
 ]

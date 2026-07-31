@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from agent_evolve.integrations.pydantic_ai.campaign_acquisition import (
@@ -10,6 +12,7 @@ from agent_evolve.integrations.pydantic_ai.campaign_acquisition import (
     campaign_evidence_calibrated_source_mix_from_environment,
     campaign_minimum_intervention_projection_from_environment,
     campaign_operator_assay_minimum_from_environment,
+    campaign_regret_bounded_information_controls_from_environment,
     campaign_residual_frontier_planning_from_environment,
     campaign_selector_policy_definition_sha256,
 )
@@ -17,6 +20,32 @@ from agent_evolve.policies.selection.full_support_slate import FullSupportSlateP
 from agent_evolve.policies.selection.model_anchored_slate import (
     ModelAnchoredCalibratedSlatePolicy,
 )
+from agent_evolve.policies.selection.regret_bounded_slate import (
+    RegretBoundedSlatePolicy,
+    ResidualInformationAssayValuePolicy,
+)
+
+
+def _sha(value: str) -> str:
+    return hashlib.sha256(value.encode("ascii")).hexdigest()
+
+
+class _ContextProvider:
+    provider_id = "fixture_context_provider"
+    provider_version = 1
+    definition_sha256 = _sha("fixture context provider")
+
+    def context_for(self, finite_contract_sha256: str):
+        raise AssertionError(finite_contract_sha256)
+
+
+class _BatchScorer:
+    policy_id = "fixture_batch_scorer"
+    policy_version = 1
+    definition_sha256 = _sha("fixture batch scorer")
+
+    def score(self, request):
+        raise AssertionError(request)
 from agent_evolve.policies.selection.structural_posterior_slate import (
     HorizonBoundedStructuralPosteriorSlatePolicy,
     OperatorStratifiedStructuralPosteriorSlatePolicy,
@@ -48,6 +77,69 @@ def test_common_pool_acquisition_modes_have_distinct_exact_allocators(
 
     assert type(allocator) is expected_type
     assert len(campaign_selector_policy_definition_sha256(allocator)) == 64
+
+
+def test_regret_bounded_mode_is_generic_and_explicitly_development_gated() -> None:
+    allocator = build_campaign_acquisition_allocator(
+        CampaignAcquisitionMode.REGRET_BOUNDED_INFORMATION,
+        common_pool_enabled=True,
+        acquisition_certification_context_provider=_ContextProvider(),
+        acquisition_batch_scorer=_BatchScorer(),
+        regret_minimum_acquisition_retention_ratio=0.95,
+        regret_minimum_residual_audit_members=1,
+        regret_future_value_policy=ResidualInformationAssayValuePolicy(0.06),
+        regret_allow_development_assay=True,
+    )
+
+    assert type(allocator) is RegretBoundedSlatePolicy
+    assert allocator.minimum_acquisition_retention_ratio == 0.95
+    assert allocator.minimum_residual_audit_members == 1
+    assert allocator.allow_development_assay is True
+    assert len(
+        campaign_selector_policy_definition_sha256(
+            allocator,
+            constraint_decoupled=True,
+        )
+    ) == 64
+    with pytest.raises(ValueError, match="regret controls"):
+        build_campaign_acquisition_allocator(
+            CampaignAcquisitionMode.ACQUISITION_CERTIFIED,
+            common_pool_enabled=True,
+            acquisition_certification_context_provider=_ContextProvider(),
+            acquisition_batch_scorer=_BatchScorer(),
+            regret_minimum_acquisition_retention_ratio=0.95,
+        )
+
+
+def test_regret_controls_are_safe_by_default_and_require_explicit_assay_authority() -> (
+    None
+):
+    safe = campaign_regret_bounded_information_controls_from_environment({})
+    assert safe.minimum_acquisition_retention_ratio == 1.0
+    assert safe.minimum_residual_audit_members == 0
+    assert safe.allow_development_assay is False
+
+    assay = campaign_regret_bounded_information_controls_from_environment(
+        {
+            "AGENT_EVOLVE_REGRET_MINIMUM_ACQUISITION_RETENTION_RATIO": "0.95",
+            "AGENT_EVOLVE_REGRET_MINIMUM_RESIDUAL_AUDIT_MEMBERS": "1",
+            "AGENT_EVOLVE_REGRET_RESIDUAL_ASSAY_VALUE": "0.06",
+            "AGENT_EVOLVE_REGRET_ALLOW_DEVELOPMENT_ASSAY": "1",
+        }
+    )
+    assert assay.minimum_acquisition_retention_ratio == 0.95
+    assert assay.minimum_residual_audit_members == 1
+    assert type(assay.future_value_policy) is ResidualInformationAssayValuePolicy
+    assert assay.allow_development_assay is True
+
+    with pytest.raises(ValueError, match="must agree"):
+        campaign_regret_bounded_information_controls_from_environment(
+            {"AGENT_EVOLVE_REGRET_RESIDUAL_ASSAY_VALUE": "0.06"}
+        )
+    with pytest.raises(ValueError, match="must agree"):
+        campaign_regret_bounded_information_controls_from_environment(
+            {"AGENT_EVOLVE_REGRET_ALLOW_DEVELOPMENT_ASSAY": "1"}
+        )
 
 
 def test_full_support_is_the_only_non_common_pool_acquisition() -> None:

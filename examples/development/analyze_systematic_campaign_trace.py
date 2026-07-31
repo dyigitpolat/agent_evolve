@@ -10,27 +10,38 @@ behavioral endpoints comparable as new domains and model routes are added.
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 import csv
-from decimal import Decimal
 import json
 import math
-from pathlib import Path
 import re
+from collections import Counter
+from decimal import Decimal
+from pathlib import Path
 from statistics import median
 from typing import Any
 
+from agent_evolve.application.campaign_execution import decode_selector_audit_text
+from agent_evolve.application.campaign_variation_envelope import (
+    decode_campaign_variation_envelope_trace_record,
+)
 from agent_evolve.domain.typed_json import FrozenJsonObject, freeze_json
 from agent_evolve.policies.reward import hypervolume_2d, hypervolume_3d
 from agent_evolve.policies.variation.exact_composition_capacity import (
     ExactKCompositionCapacityProjection,
 )
 from agent_evolve.ports.frontier_target import CampaignPortfolioFrontierTarget
-
+from agent_evolve.ports.variation_source import (
+    PRIMARY_VARIATION_SOURCE_ID,
+    VARIATION_DIVERSITY_SIGNATURE_METADATA_KEY,
+    VARIATION_OPERATOR_METADATA_KEY,
+    VARIATION_SOURCE_METADATA_KEY,
+    VARIATION_SOURCE_RANK_METADATA_KEY,
+)
 
 _RANK = re.compile(r"\.rank_0*([1-9][0-9]*)$")
 _GENERATION = re.compile(r"g([0-9]{2})(?:_|p)")
 _PARENT_SLOT = re.compile(r"p0*([1-9][0-9]*)\.rank_")
+_EXACT_SHAPLEY_MAX_CANDIDATES = 12
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -47,6 +58,14 @@ def _jsonl(path: Path) -> list[dict[str, Any]]:
     if any(type(value) is not dict for value in rows):
         raise TypeError(f"{path} contains a non-object row")
     return rows
+
+
+def _audit_text(plaintext: dict[str, Any], name: str) -> str:
+    """Recover an authenticated selector text field in either storage form."""
+
+    if type(plaintext) is not dict:
+        raise TypeError("selector plaintext audit must be an exact object")
+    return decode_selector_audit_text(plaintext, name)
 
 
 def _unwrap(value: dict[str, Any]) -> dict[str, Any]:
@@ -202,6 +221,139 @@ def _hypervolume(points: list[tuple[float, ...]], dimension: int) -> float:
     if dimension == 3:
         return hypervolume_3d(points, (1.0, 1.0, 1.0))  # type: ignore[arg-type]
     raise ValueError("systematic analysis supports affine 2-D or 3-D endpoints")
+
+
+def _stage_set_credit(
+    before_points: list[tuple[float, ...]],
+    candidate_points: list[tuple[str, tuple[float, ...] | None]],
+    *,
+    dimension: int,
+    exact_shapley_max_candidates: int = _EXACT_SHAPLEY_MAX_CANDIDATES,
+) -> dict[str, Any]:
+    """Decompose one simultaneous slate without inventing scalar causality.
+
+    Hypervolume is a set function.  An isolated candidate marginal answers a
+    different question from the candidate's exclusive leave-one-out value in
+    the realized slate, and neither conserves the stage gain.  Exact Shapley
+    credit does conserve that gain by averaging the candidate's marginal over
+    every predecessor subset.  The exact enumeration is deliberately bounded;
+    leave-one-out remains available for larger stages, while an approximation
+    must be introduced as an explicit future policy rather than silently.
+
+    ``None`` points are typed candidate-infeasibility occurrences.  They remain
+    players in the authenticated slate and correctly receive zero dummy-player
+    credit.
+    """
+
+    if (
+        type(exact_shapley_max_candidates) is not int
+        or isinstance(exact_shapley_max_candidates, bool)
+        or exact_shapley_max_candidates <= 0
+    ):
+        raise ValueError("exact_shapley_max_candidates must be positive")
+    candidate_ids = [value[0] for value in candidate_points]
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise ValueError("stage set-credit input repeats a candidate ID")
+    if any(type(candidate_id) is not str or not candidate_id for candidate_id in candidate_ids):
+        raise ValueError("stage set-credit candidate IDs must be non-empty strings")
+    if any(
+        point is not None and len(point) != dimension
+        for _, point in candidate_points
+    ):
+        raise ValueError("stage set-credit point dimension differs from the endpoint")
+
+    ordered = sorted(candidate_points, key=lambda value: value[0])
+    candidate_count = len(ordered)
+    base_hypervolume = _hypervolume(before_points, dimension)
+    cache: dict[int, float] = {0: base_hypervolume}
+
+    def hypervolume_for(mask: int) -> float:
+        cached = cache.get(mask)
+        if cached is not None:
+            return cached
+        selected = [
+            point
+            for index, (_, point) in enumerate(ordered)
+            if mask & (1 << index) and point is not None
+        ]
+        result = _hypervolume([*before_points, *selected], dimension)
+        cache[mask] = result
+        return result
+
+    full_mask = (1 << candidate_count) - 1
+    full_hypervolume = hypervolume_for(full_mask)
+    stage_gain = full_hypervolume - base_hypervolume
+    tolerance = 64 * math.ulp(max(1.0, abs(full_hypervolume), abs(base_hypervolume)))
+    rows: list[dict[str, Any]] = []
+    for index, (candidate_id, point) in enumerate(ordered):
+        leave_one_out = full_hypervolume - hypervolume_for(
+            full_mask & ~(1 << index)
+        )
+        rows.append(
+            {
+                "candidate_id": candidate_id,
+                "scored": point is not None,
+                "slate_leave_one_out_hypervolume": leave_one_out,
+                "positive_slate_leave_one_out": leave_one_out > tolerance,
+                "exact_stage_shapley_hypervolume": None,
+                "positive_exact_stage_shapley": None,
+            }
+        )
+
+    exact = candidate_count <= exact_shapley_max_candidates
+    if exact and candidate_count:
+        for index, row in enumerate(rows):
+            bit = 1 << index
+            credit = 0.0
+            for mask in range(1 << candidate_count):
+                if mask & bit:
+                    continue
+                predecessor_count = mask.bit_count()
+                weight = 1.0 / (
+                    candidate_count
+                    * math.comb(candidate_count - 1, predecessor_count)
+                )
+                credit += weight * (
+                    hypervolume_for(mask | bit) - hypervolume_for(mask)
+                )
+            row["exact_stage_shapley_hypervolume"] = credit
+            row["positive_exact_stage_shapley"] = credit > tolerance
+    elif exact:
+        # A sealed stage should normally contain candidates, but the empty
+        # definition is useful for direct policy tests and remains conserved.
+        exact = True
+
+    leave_one_out_sum = sum(
+        float(value["slate_leave_one_out_hypervolume"]) for value in rows
+    )
+    shapley_values = [
+        float(value["exact_stage_shapley_hypervolume"])
+        for value in rows
+        if value["exact_stage_shapley_hypervolume"] is not None
+    ]
+    shapley_sum = sum(shapley_values) if exact else None
+    return {
+        "schema_version": 1,
+        "credit_scope": "simultaneous_stage_slate_against_frozen_prior_archive",
+        "candidate_count": candidate_count,
+        "scored_candidate_count": sum(point is not None for _, point in ordered),
+        "base_hypervolume": base_hypervolume,
+        "full_union_hypervolume": full_hypervolume,
+        "stage_hypervolume_gain": stage_gain,
+        "leave_one_out_sum": leave_one_out_sum,
+        "stage_gain_minus_leave_one_out_sum": stage_gain - leave_one_out_sum,
+        "shapley_mode": (
+            "exact_subset_enumeration"
+            if exact
+            else "not_computed_above_exact_candidate_cap"
+        ),
+        "exact_shapley_max_candidates": exact_shapley_max_candidates,
+        "exact_shapley_sum": shapley_sum,
+        "exact_shapley_conservation_error": (
+            None if shapley_sum is None else shapley_sum - stage_gain
+        ),
+        "candidate_rows": rows,
+    }
 
 
 def _physical_evaluation_trajectory(
@@ -649,11 +801,9 @@ def _action_forecast_information(rows: list[dict[str, Any]]) -> dict[str, Any]:
         uncertainty_counts.update(call_lower)
         uncertainty_counts.update(call_upper)
         effect_sign_counts.update(
-            (
-                "zero"
-                if item == "z"
-                else ("negative" if item.startswith("n") else "positive")
-            )
+            "zero"
+            if item == "z"
+            else ("negative" if item.startswith("n") else "positive")
             for item in call_effects
         )
         asymmetric_uncertainty_count += sum(
@@ -1333,129 +1483,132 @@ def _observed_direction(parent: float, child: float) -> str:
     return "unchanged"
 
 
-def _forecast_confidence_label(value: float) -> str:
-    if type(value) is not float or not math.isfinite(value):
-        raise TypeError("forecast confidence must be a finite canonical float")
-    if not 0.0 <= value <= 1.0:
-        raise ValueError("forecast confidence must lie in [0, 1]")
-    if value >= 0.75:
-        return "high"
-    if value >= 0.4:
-        return "medium"
-    if value > 0.0:
-        return "low"
-    return "unknown"
+def _finite_mean(values: list[float]) -> float | None:
+    return None if not values else sum(values) / len(values)
 
 
-def _selector_forecast_response_members(
-    response: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """Normalize legacy model slates and trusted all-action decisions.
+def _improvement_forecast_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    scorable = [
+        value
+        for value in rows
+        if value["predicted_improvement"] is not None
+        and value["observed_improvement"] is not None
+    ]
+    true_positive = sum(
+        value["predicted_improvement"] is True and value["observed_improvement"] is True
+        for value in scorable
+    )
+    false_positive = sum(
+        value["predicted_improvement"] is True
+        and value["observed_improvement"] is False
+        for value in scorable
+    )
+    true_negative = sum(
+        value["predicted_improvement"] is False
+        and value["observed_improvement"] is False
+        for value in scorable
+    )
+    false_negative = sum(
+        value["predicted_improvement"] is False
+        and value["observed_improvement"] is True
+        for value in scorable
+    )
+    positive_count = true_positive + false_negative
+    negative_count = true_negative + false_positive
+    predicted_positive_count = true_positive + false_positive
+    recall = None if positive_count == 0 else true_positive / positive_count
+    specificity = None if negative_count == 0 else true_negative / negative_count
+    return {
+        "improvement_prediction_count": len(scorable),
+        "improvement_true_positive_count": true_positive,
+        "improvement_false_positive_count": false_positive,
+        "improvement_true_negative_count": true_negative,
+        "improvement_false_negative_count": false_negative,
+        "improvement_precision": (
+            None
+            if predicted_positive_count == 0
+            else true_positive / predicted_positive_count
+        ),
+        "improvement_recall": recall,
+        "improvement_specificity": specificity,
+        "improvement_balanced_accuracy": (
+            None
+            if recall is None or specificity is None
+            else (recall + specificity) / 2.0
+        ),
+    }
 
-    Outcome-conditioned selection has no second free-form selector response:
-    the model emits numeric forecasts for every action and trusted code emits
-    the evaluated K-set.  Its durable response therefore stores members under
-    ``ranked_decision`` and continuous confidence in ``selected_forecasts``.
-    This decoder preserves that distinction while presenting the common
-    selected effect rows needed for realized forecast calibration.
-    """
 
-    if type(response) is not dict:
-        raise TypeError("selector response projection must be an object")
-    supplemental = response.get("supplemental_selector_audit")
-    payload = supplemental.get("payload") if type(supplemental) is dict else None
-    audit_kind = supplemental.get("audit_kind") if type(supplemental) is dict else None
-    if audit_kind != "outcome_conditioned_expert_portfolio":
-        original = (
-            payload.get("original_k8_response") if type(payload) is dict else None
-        )
-        raw_members = (
-            original.get("members")
-            if type(original) is dict
-            else response.get("members")
-        )
-        if type(raw_members) is not list or any(
-            type(value) is not dict for value in raw_members
-        ):
-            raise ValueError("selector forecast response lacks object members")
-        return raw_members
-
-    ranked = response.get("ranked_decision")
-    raw_members = ranked.get("members") if type(ranked) is dict else None
-    if (
-        type(payload) is not dict
-        or type(raw_members) is not list
-        or any(type(value) is not dict for value in raw_members)
-    ):
-        raise ValueError("outcome-conditioned response lacks ranked members")
-    aliases = payload.get("metric_aliases")
-    selected_forecasts = payload.get("selected_forecasts")
-    if type(aliases) is not list or type(selected_forecasts) is not list:
-        raise ValueError("outcome-conditioned response lacks forecast decoding")
-    target_by_forecast: dict[str, str] = {}
-    for alias in aliases:
-        if (
-            type(alias) is not dict
-            or type(alias.get("forecast_metric_id")) is not str
-            or type(alias.get("target_metric_id")) is not str
-        ):
-            raise ValueError("outcome-conditioned metric alias is malformed")
-        target_by_forecast[str(alias["forecast_metric_id"])] = str(
-            alias["target_metric_id"]
-        )
-    confidence_by_cell: dict[tuple[str, str], str] = {}
-    for forecast in selected_forecasts:
-        metrics = forecast.get("metric_forecasts") if type(forecast) is dict else None
-        option_id = forecast.get("option_id") if type(forecast) is dict else None
-        if type(option_id) is not str or type(metrics) is not list:
-            raise ValueError("outcome-conditioned selected forecast is malformed")
-        for metric in metrics:
-            if (
-                type(metric) is not dict
-                or type(metric.get("metric_id")) is not str
-                or type(metric.get("confidence_hex")) is not str
-            ):
-                raise ValueError("outcome-conditioned forecast metric is malformed")
-            forecast_metric_id = str(metric["metric_id"])
-            target_metric_id = target_by_forecast.get(forecast_metric_id)
-            if target_metric_id is None:
-                raise ValueError("selected forecast uses an unknown metric alias")
-            confidence_by_cell[(option_id, target_metric_id)] = (
-                _forecast_confidence_label(float.fromhex(metric["confidence_hex"]))
-            )
-
-    normalized: list[dict[str, Any]] = []
-    for member in raw_members:
-        option_id = member.get("option_id")
-        effects = member.get("effect_predictions")
-        if (
-            type(option_id) is not str
-            or type(effects) is not list
-            or any(type(value) is not dict for value in effects)
-        ):
-            raise ValueError("outcome-conditioned ranked member is malformed")
-        normalized_effects: list[dict[str, Any]] = []
-        for effect in effects:
-            metric_id = effect.get("metric_id")
-            if type(metric_id) is not str:
-                raise ValueError("ranked effect prediction lacks a metric ID")
-            confidence = confidence_by_cell.get((option_id, metric_id))
-            if confidence is None:
-                raise ValueError("ranked effect lacks its selected confidence")
-            normalized_effects.append({**effect, "confidence": confidence})
-        normalized.append({**member, "effect_predictions": normalized_effects})
-    if {str(value["option_id"]) for value in normalized} != {
-        option_id for option_id, _ in confidence_by_cell
-    }:
-        raise ValueError("ranked decision and selected forecasts disagree")
-    return normalized
+def _numeric_forecast_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    numeric = [value for value in rows if value["numeric_forecast_available"]]
+    normalized = [
+        value for value in numeric if value["normalized_absolute_p50_error"] is not None
+    ]
+    absolute_errors = [value["absolute_p50_error"] for value in numeric]
+    normalized_errors = [value["normalized_absolute_p50_error"] for value in normalized]
+    normalized_widths = [value["normalized_p10_p90_width"] for value in normalized]
+    return {
+        "numeric_prediction_count": len(numeric),
+        "p10_p90_coverage": (
+            None
+            if not numeric
+            else sum(value["p10_p90_covered"] for value in numeric) / len(numeric)
+        ),
+        "mean_p50_signed_error": _finite_mean(
+            [value["p50_signed_error"] for value in numeric]
+        ),
+        "mean_absolute_p50_error": _finite_mean(absolute_errors),
+        "median_absolute_p50_error": (
+            None if not absolute_errors else median(absolute_errors)
+        ),
+        "normalized_numeric_prediction_count": len(normalized),
+        "mean_normalized_absolute_p50_error": _finite_mean(normalized_errors),
+        "median_normalized_absolute_p50_error": (
+            None if not normalized_errors else median(normalized_errors)
+        ),
+        "mean_normalized_p10_p90_width": _finite_mean(normalized_widths),
+    }
 
 
 def _forecast_calibration(
     stages: list[dict[str, Any]],
     engine: list[dict[str, Any]],
+    *,
+    axes: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Score model-authored effect directions against realized parent contrasts."""
+    """Score decision forecasts without laundering exact projections into LLM skill.
+
+    Modern selector traces can overlay benchmark-owned exact/cheap metric
+    projections onto the probabilistic model forecast.  The combined decision
+    forecast is useful, but its accuracy is not a model-accuracy estimate.
+    Preserve the legacy aggregate while identifying every scorable cell as
+    model-authoritative, exact-projected, unresolved, or legacy-unspecified.
+    When authenticated numerical quantiles are present, score their calibration
+    in raw metric units and, when affine objective axes are supplied, in units
+    of each objective's frozen ideal-to-reference span.
+    """
+
+    metric_span: dict[str, float] = {}
+    metric_goal: dict[str, str] = {}
+    if axes is not None:
+        if type(axes) is not list or any(type(value) is not dict for value in axes):
+            raise TypeError("forecast calibration axes must contain objects")
+        for axis in axes:
+            metric_id = axis.get("metric_id")
+            if type(metric_id) is not str or not metric_id:
+                raise ValueError("forecast calibration axis lacks its metric ID")
+            ideal = _hex_or_number(axis.get("ideal_hex", axis.get("ideal")))
+            reference = _hex_or_number(axis.get("reference_hex", axis.get("reference")))
+            span = abs(reference - ideal)
+            if span <= 0.0:
+                raise ValueError("forecast calibration axis has a zero affine span")
+            if metric_id in metric_span:
+                raise ValueError("forecast calibration axes repeat a metric ID")
+            goal = axis.get("goal")
+            if goal not in ("min", "max"):
+                raise ValueError("forecast calibration axis has an unknown goal")
+            metric_span[metric_id] = span
+            metric_goal[metric_id] = goal
 
     # A seed can remain on the Pareto frontier and be selected as a parent in
     # any later portfolio generation.  Seed registrations carry the same
@@ -1469,6 +1622,7 @@ def _forecast_calibration(
         and type(value.get("candidate_id")) is str
     }
     rows: list[dict[str, Any]] = []
+    validity_rows: list[dict[str, Any]] = []
     member_count = 0
     unscorable_member_count = 0
     unscorable_missing_event_member_count = 0
@@ -1478,14 +1632,33 @@ def _forecast_calibration(
         receipt = event["payload"]["stage_receipt"]
         generation = int(receipt["generation"])
         response_members_by_request: dict[str, dict[str, dict[str, Any]]] = {}
+        response_authority_by_request: dict[str, dict[str, str]] = {}
+        response_numeric_by_request: dict[str, dict[str, dict[str, Any]]] = {}
         for audit in receipt.get("selector_audits") or []:
             plaintext = audit.get("plaintext_audit")
             if type(plaintext) is not dict:
                 raise ValueError("forecast calibration lacks selector plaintext")
-            response = json.loads(plaintext["response_text"])
+            response = json.loads(_audit_text(plaintext, "response_text"))
             if type(response) is not dict:
                 raise TypeError("selector response projection must be an object")
-            raw_members = _selector_forecast_response_members(response)
+            supplemental = response.get("supplemental_selector_audit")
+            payload = (
+                supplemental.get("payload") if type(supplemental) is dict else None
+            )
+            original = (
+                payload.get("original_k8_response") if type(payload) is dict else None
+            )
+            ranked = response.get("ranked_decision")
+            if type(original) is dict:
+                raw_members = original.get("members")
+            elif type(ranked) is dict:
+                raw_members = ranked.get("members")
+            else:
+                raw_members = response.get("members")
+            if type(raw_members) is not list or any(
+                type(value) is not dict for value in raw_members
+            ):
+                raise ValueError("selector forecast response lacks object members")
             members = {
                 str(value["option_id"]): value
                 for value in raw_members
@@ -1493,7 +1666,120 @@ def _forecast_calibration(
             }
             if len(members) != len(raw_members):
                 raise ValueError("selector forecast members lack unique option IDs")
-            response_members_by_request[str(audit["request_sha256"])] = members
+            request_sha256 = str(audit["request_sha256"])
+            response_members_by_request[request_sha256] = members
+
+            authority_by_metric: dict[str, str] = {}
+            alias_by_forecast: dict[str, str] = {}
+            raw_aliases = (
+                payload.get("metric_aliases", []) if type(payload) is dict else []
+            )
+            if type(raw_aliases) is not list or any(
+                type(value) is not dict for value in raw_aliases
+            ):
+                raise TypeError("forecast metric aliases must contain objects")
+            for value in raw_aliases:
+                forecast_metric_id = value.get("forecast_metric_id")
+                target_metric_id = value.get("target_metric_id")
+                if (
+                    type(forecast_metric_id) is not str
+                    or not forecast_metric_id
+                    or type(target_metric_id) is not str
+                    or not target_metric_id
+                ):
+                    raise ValueError("forecast metric alias is malformed")
+                if forecast_metric_id in alias_by_forecast:
+                    raise ValueError("forecast metric aliases are not unique")
+                alias_by_forecast[forecast_metric_id] = target_metric_id
+
+            authority = (
+                payload.get("forecast_health_authority_resolution")
+                if type(payload) is dict
+                else None
+            )
+            if type(authority) is dict:
+                authority_fields = (
+                    ("fully_projected_metric_ids", "exact_projection"),
+                    ("model_authoritative_metric_ids", "model_authoritative"),
+                    ("unresolved_failed_metric_ids", "unresolved"),
+                )
+                for field, authority_kind in authority_fields:
+                    raw_metric_ids = authority.get(field, [])
+                    if type(raw_metric_ids) is not list or any(
+                        type(value) is not str or not value for value in raw_metric_ids
+                    ):
+                        raise TypeError(
+                            f"forecast authority {field} must contain strings"
+                        )
+                    for raw_metric_id in raw_metric_ids:
+                        metric_id = alias_by_forecast.get(raw_metric_id, raw_metric_id)
+                        prior = authority_by_metric.get(metric_id)
+                        if prior is not None and prior != authority_kind:
+                            raise ValueError(
+                                "one forecast metric has conflicting authorities"
+                            )
+                        authority_by_metric[metric_id] = authority_kind
+            response_authority_by_request[request_sha256] = authority_by_metric
+
+            numeric_by_option: dict[str, dict[str, Any]] = {}
+            raw_selected = (
+                payload.get("selected_forecasts", []) if type(payload) is dict else []
+            )
+            if type(raw_selected) is not list or any(
+                type(value) is not dict for value in raw_selected
+            ):
+                raise TypeError("selected numerical forecasts must contain objects")
+            for selected_forecast in raw_selected:
+                option_id = selected_forecast.get("option_id")
+                raw_metrics = selected_forecast.get("metric_forecasts")
+                if type(option_id) is not str or not option_id:
+                    raise ValueError("selected numerical forecast lacks an option ID")
+                if type(raw_metrics) is not list or any(
+                    type(value) is not dict for value in raw_metrics
+                ):
+                    raise TypeError(
+                        "selected numerical metric forecasts must contain objects"
+                    )
+                if option_id in numeric_by_option:
+                    raise ValueError("selected numerical forecasts repeat an option ID")
+                metrics_by_target: dict[str, dict[str, float]] = {}
+                for metric in raw_metrics:
+                    raw_metric_id = metric.get("metric_id")
+                    if type(raw_metric_id) is not str or not raw_metric_id:
+                        raise ValueError("numerical forecast lacks its metric ID")
+                    metric_id = alias_by_forecast.get(raw_metric_id, raw_metric_id)
+                    if metric_id in metrics_by_target:
+                        raise ValueError(
+                            "selected numerical forecasts repeat a target metric"
+                        )
+                    p10 = _hex_or_number(metric.get("p10_delta_hex"))
+                    p50 = _hex_or_number(metric.get("p50_delta_hex"))
+                    p90 = _hex_or_number(metric.get("p90_delta_hex"))
+                    confidence = _hex_or_number(metric.get("confidence_hex"))
+                    if not p10 <= p50 <= p90:
+                        raise ValueError(
+                            "selected numerical forecast quantiles are unordered"
+                        )
+                    if not 0.0 <= confidence <= 1.0:
+                        raise ValueError(
+                            "selected numerical forecast confidence is outside [0,1]"
+                        )
+                    metrics_by_target[metric_id] = {
+                        "p10_delta": p10,
+                        "p50_delta": p50,
+                        "p90_delta": p90,
+                        "numeric_confidence": confidence,
+                    }
+                probability_valid = _hex_or_number(
+                    selected_forecast.get("probability_valid_hex")
+                )
+                if not 0.0 <= probability_valid <= 1.0:
+                    raise ValueError("selected validity probability is outside [0,1]")
+                numeric_by_option[option_id] = {
+                    "probability_valid": probability_valid,
+                    "metrics": metrics_by_target,
+                }
+            response_numeric_by_request[request_sha256] = numeric_by_option
 
         raw_waves = receipt["result"].get("portfolio_wave_receipts", [])
         waves = raw_waves if type(raw_waves) is list else []
@@ -1504,6 +1790,8 @@ def _forecast_calibration(
             forecasts = response_members_by_request.get(request_sha256)
             if forecasts is None:
                 raise ValueError("evaluated wave lacks its selector forecast response")
+            authority_by_metric = response_authority_by_request[request_sha256]
+            numeric_forecasts = response_numeric_by_request[request_sha256]
             parent_id = str(wave["parent_candidate_id"])
             parent_event = evaluated.get(parent_id)
             raw_attributions = wave.get("action_attributions", [])
@@ -1522,6 +1810,29 @@ def _forecast_calibration(
                 candidate_id = str(attribution["candidate_id"])
                 child_event = evaluated.get(candidate_id)
                 member_count += 1
+                numerical = numeric_forecasts.get(option_id)
+                if (
+                    child_event is not None
+                    and type(child_event.get("valid")) is bool
+                    and numerical is not None
+                ):
+                    actual_valid = child_event["valid"] is True
+                    predicted_valid = float(numerical["probability_valid"])
+                    validity_rows.append(
+                        {
+                            "generation": generation,
+                            "request_sha256": request_sha256,
+                            "parent_candidate_id": parent_id,
+                            "candidate_id": candidate_id,
+                            "option_id": option_id,
+                            "predicted_probability_valid": predicted_valid,
+                            "observed_valid": actual_valid,
+                            "brier_score": (
+                                predicted_valid - (1.0 if actual_valid else 0.0)
+                            )
+                            ** 2,
+                        }
+                    )
                 if parent_event is None or child_event is None:
                     unscorable_member_count += 1
                     unscorable_missing_event_member_count += 1
@@ -1558,6 +1869,42 @@ def _forecast_calibration(
                     )
                     confidence = str(prediction.get("confidence", "unspecified"))
                     known = predicted != "unknown"
+                    numeric = (
+                        None
+                        if numerical is None
+                        else numerical["metrics"].get(metric_id)
+                    )
+                    parent_value = parent_objectives[metric_id]
+                    child_value = child_objectives[metric_id]
+                    observed_delta = child_value - parent_value
+                    span = metric_span.get(metric_id)
+                    goal = metric_goal.get(metric_id)
+                    predicted_improvement = (
+                        None
+                        if not known or goal is None
+                        else (
+                            predicted == "decrease"
+                            if goal == "min"
+                            else predicted == "increase"
+                        )
+                    )
+                    observed_improvement = (
+                        None
+                        if goal is None
+                        else (
+                            actual == "decrease"
+                            if goal == "min"
+                            else actual == "increase"
+                        )
+                    )
+                    forecast_authority = authority_by_metric.get(
+                        metric_id,
+                        (
+                            "legacy_unspecified"
+                            if not authority_by_metric
+                            else "unresolved"
+                        ),
+                    )
                     rows.append(
                         {
                             "generation": generation,
@@ -1566,11 +1913,66 @@ def _forecast_calibration(
                             "candidate_id": candidate_id,
                             "option_id": option_id,
                             "metric_id": metric_id,
+                            "forecast_authority": forecast_authority,
                             "confidence": confidence,
                             "predicted_direction": predicted,
                             "observed_direction": actual,
                             "known_direction_forecast": known,
                             "direction_correct": known and predicted == actual,
+                            "predicted_improvement": predicted_improvement,
+                            "observed_improvement": observed_improvement,
+                            "improvement_prediction_correct": (
+                                None
+                                if predicted_improvement is None
+                                or observed_improvement is None
+                                else predicted_improvement == observed_improvement
+                            ),
+                            "observed_delta": observed_delta,
+                            "numeric_forecast_available": numeric is not None,
+                            "numeric_confidence": (
+                                None
+                                if numeric is None
+                                else numeric["numeric_confidence"]
+                            ),
+                            "p10_delta": (
+                                None if numeric is None else numeric["p10_delta"]
+                            ),
+                            "p50_delta": (
+                                None if numeric is None else numeric["p50_delta"]
+                            ),
+                            "p90_delta": (
+                                None if numeric is None else numeric["p90_delta"]
+                            ),
+                            "p10_p90_covered": (
+                                None
+                                if numeric is None
+                                else (
+                                    numeric["p10_delta"]
+                                    <= observed_delta
+                                    <= numeric["p90_delta"]
+                                )
+                            ),
+                            "p50_signed_error": (
+                                None
+                                if numeric is None
+                                else numeric["p50_delta"] - observed_delta
+                            ),
+                            "absolute_p50_error": (
+                                None
+                                if numeric is None
+                                else abs(numeric["p50_delta"] - observed_delta)
+                            ),
+                            "normalized_absolute_p50_error": (
+                                None
+                                if numeric is None or span is None
+                                else abs(numeric["p50_delta"] - observed_delta) / span
+                            ),
+                            "normalized_p10_p90_width": (
+                                None
+                                if numeric is None or span is None
+                                else (numeric["p90_delta"] - numeric["p10_delta"])
+                                / span
+                            ),
                             "adjudication_policy": "binary64_exact_sign_v1",
                         }
                     )
@@ -1592,6 +1994,8 @@ def _forecast_calibration(
                     if not known
                     else sum(value["direction_correct"] for value in known) / len(known)
                 ),
+                **_improvement_forecast_summary(members),
+                **_numeric_forecast_summary(members),
             }
         )
     by_generation: list[dict[str, Any]] = []
@@ -1608,9 +2012,49 @@ def _forecast_calibration(
                     if not known
                     else sum(value["direction_correct"] for value in known) / len(known)
                 ),
+                **_improvement_forecast_summary(members),
             }
         )
+    by_authority: list[dict[str, Any]] = []
+    for authority in sorted({str(value["forecast_authority"]) for value in rows}):
+        members = [value for value in rows if value["forecast_authority"] == authority]
+        known = [value for value in members if value["known_direction_forecast"]]
+        high = [value for value in known if value["confidence"] == "high"]
+        by_authority.append(
+            {
+                "forecast_authority": authority,
+                "prediction_count": len(members),
+                "known_direction_count": len(known),
+                "unknown_direction_count": len(members) - len(known),
+                "direction_accuracy": (
+                    None
+                    if not known
+                    else sum(value["direction_correct"] for value in known) / len(known)
+                ),
+                "high_confidence_known_direction_count": len(high),
+                "high_confidence_direction_accuracy": (
+                    None
+                    if not high
+                    else sum(value["direction_correct"] for value in high) / len(high)
+                ),
+                **_improvement_forecast_summary(members),
+                **_numeric_forecast_summary(members),
+            }
+        )
+    authority_summary = {
+        str(value["forecast_authority"]): value for value in by_authority
+    }
+
+    def authority_value(authority: str, field: str) -> object:
+        value = authority_summary.get(authority)
+        if value is None:
+            return 0 if field.endswith("_count") else None
+        return value[field]
+
+    validity_brier_scores = [value["brier_score"] for value in validity_rows]
+    aggregate_numeric = _numeric_forecast_summary(rows)
     return {
+        "aggregate_scope": "post_authority_resolution_combined_not_model_only",
         "evaluated_forecast_member_count": member_count,
         "unscorable_forecast_member_count": unscorable_member_count,
         "unscorable_missing_event_member_count": (
@@ -1643,8 +2087,86 @@ def _forecast_calibration(
             if not high_rows
             else sum(value["direction_correct"] for value in high_rows) / len(high_rows)
         ),
+        **_improvement_forecast_summary(rows),
+        **aggregate_numeric,
+        "validity_prediction_count": len(validity_rows),
+        "validity_observed_valid_count": sum(
+            value["observed_valid"] for value in validity_rows
+        ),
+        "validity_mean_predicted_probability": _finite_mean(
+            [value["predicted_probability_valid"] for value in validity_rows]
+        ),
+        "validity_empirical_rate": (
+            None
+            if not validity_rows
+            else sum(value["observed_valid"] for value in validity_rows)
+            / len(validity_rows)
+        ),
+        "validity_brier_score": _finite_mean(validity_brier_scores),
+        "model_authoritative_prediction_count": authority_value(
+            "model_authoritative", "prediction_count"
+        ),
+        "model_authoritative_known_direction_count": authority_value(
+            "model_authoritative", "known_direction_count"
+        ),
+        "model_authoritative_direction_accuracy": authority_value(
+            "model_authoritative", "direction_accuracy"
+        ),
+        "model_authoritative_high_confidence_direction_accuracy": authority_value(
+            "model_authoritative", "high_confidence_direction_accuracy"
+        ),
+        "model_authoritative_improvement_precision": authority_value(
+            "model_authoritative", "improvement_precision"
+        ),
+        "model_authoritative_improvement_recall": authority_value(
+            "model_authoritative", "improvement_recall"
+        ),
+        "model_authoritative_improvement_balanced_accuracy": authority_value(
+            "model_authoritative", "improvement_balanced_accuracy"
+        ),
+        "model_authoritative_numeric_prediction_count": authority_value(
+            "model_authoritative", "numeric_prediction_count"
+        ),
+        "model_authoritative_p10_p90_coverage": authority_value(
+            "model_authoritative", "p10_p90_coverage"
+        ),
+        "model_authoritative_mean_normalized_absolute_p50_error": authority_value(
+            "model_authoritative", "mean_normalized_absolute_p50_error"
+        ),
+        "model_authoritative_median_normalized_absolute_p50_error": authority_value(
+            "model_authoritative", "median_normalized_absolute_p50_error"
+        ),
+        "exact_projection_prediction_count": authority_value(
+            "exact_projection", "prediction_count"
+        ),
+        "exact_projection_known_direction_count": authority_value(
+            "exact_projection", "known_direction_count"
+        ),
+        "exact_projection_direction_accuracy": authority_value(
+            "exact_projection", "direction_accuracy"
+        ),
+        "exact_projection_improvement_balanced_accuracy": authority_value(
+            "exact_projection", "improvement_balanced_accuracy"
+        ),
+        "exact_projection_numeric_prediction_count": authority_value(
+            "exact_projection", "numeric_prediction_count"
+        ),
+        "exact_projection_p10_p90_coverage": authority_value(
+            "exact_projection", "p10_p90_coverage"
+        ),
+        "exact_projection_mean_normalized_absolute_p50_error": authority_value(
+            "exact_projection", "mean_normalized_absolute_p50_error"
+        ),
+        "legacy_unspecified_prediction_count": authority_value(
+            "legacy_unspecified", "prediction_count"
+        ),
+        "legacy_unspecified_direction_accuracy": authority_value(
+            "legacy_unspecified", "direction_accuracy"
+        ),
         "by_confidence": by_confidence,
         "by_generation": by_generation,
+        "by_authority": by_authority,
+        "validity_rows": validity_rows,
         "rows": rows,
     }
 
@@ -2526,155 +3048,621 @@ def _semantic_reconciliation_projection(
     }
 
 
-def _outcome_conditioned_selector_projection(
-    *,
-    response: dict[str, Any],
-    selector_audit: dict[str, Any],
-    generation: int,
+def _outcome_conditioned_selector_behavior(
+    stages: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Normalize one trusted all-action K-set without inventing a model slate."""
+    """Normalize the current trusted expert-portfolio selector.
 
-    supplemental = response.get("supplemental_selector_audit")
-    if (
-        type(supplemental) is not dict
-        or supplemental.get("audit_kind") != "outcome_conditioned_expert_portfolio"
-    ):
-        raise ValueError("response is not an outcome-conditioned selector audit")
-    payload = supplemental.get("payload")
-    ranked = response.get("ranked_decision")
-    if type(payload) is not dict or type(ranked) is not dict:
-        raise ValueError("outcome-conditioned selector lacks payload or decision")
-    members = _selector_forecast_response_members(response)
-    option_ids = tuple(str(value["option_id"]) for value in members)
-    if len(set(option_ids)) != len(option_ids):
-        raise ValueError("outcome-conditioned decision repeats an option")
-    allocation = payload.get("allocation")
-    allocation_members = allocation.get("members") if type(allocation) is dict else None
-    if type(allocation_members) is not list:
-        raise ValueError("outcome-conditioned selector lacks trusted allocation")
-    allocation_ids = tuple(str(value["option_id"]) for value in allocation_members)
-    if allocation_ids != option_ids:
-        raise ValueError("trusted allocation and ranked decision disagree")
+    The outcome-conditioned architecture does not ask one model to author a
+    K8 slate.  It forecasts the complete finite action union in independent
+    blocks and lets authenticated trusted code choose the evaluated K4.  The
+    legacy analyzer used a prompt-owned ``proposal_constraints`` object and
+    therefore could neither read these traces nor distinguish eligible support
+    from evaluated support.  This projection keeps those sets explicit and
+    joins evaluated ranks and roles through the same workload-neutral call key
+    used by the downstream candidate analysis.
+    """
 
-    health = payload.get("forecast_health")
-    assessments = health.get("metric_assessments") if type(health) is dict else None
-    if type(assessments) is not list or not assessments:
-        raise ValueError("outcome-conditioned selector lacks forecast health")
-    row_counts = {
-        int(value["row_count"])
-        for value in assessments
-        if type(value) is dict and type(value.get("row_count")) is int
-    }
-    if len(row_counts) != 1 or len(assessments) != len(
-        [value for value in assessments if type(value) is dict]
-    ):
-        raise ValueError("forecast health has inconsistent universe sizes")
-    forecast_universe_size = next(iter(row_counts))
-    if forecast_universe_size < len(option_ids):
-        raise ValueError("forecast universe is smaller than the evaluated slate")
-    candidate_evaluations = allocation.get("candidate_evaluations")
-    physical_call_count = payload.get("physical_call_count")
-    if type(candidate_evaluations) is not int or candidate_evaluations <= 0:
-        raise ValueError("trusted allocation lacks candidate-evaluation accounting")
-    if type(physical_call_count) is not int or physical_call_count <= 0:
-        raise ValueError("outcome-conditioned selector lacks physical call accounting")
+    calls: list[dict[str, Any]] = []
+    option_counts: Counter[str] = Counter()
+    eligible_counts: Counter[str] = Counter()
+    phenotype_counts: Counter[str] = Counter()
+    role_counts: Counter[str] = Counter()
+    direction_counts: Counter[str] = Counter()
+    confidence_counts: Counter[str] = Counter()
+    family_counts: Counter[str] = Counter()
+    action_kind_counts: Counter[str] = Counter()
+    prompt_definition_counts: Counter[str] = Counter()
+    by_generation: dict[int, list[dict[str, Any]]] = {}
 
-    action_records = [
-        {
-            "model_rank": None,
-            "allocation_rank": rank,
-            "option_id": option_id,
-            "action_kind": "sealed_action_without_hierarchy_projection",
-            "component_option_ids": [],
-            "evaluated": True,
-        }
-        for rank, option_id in enumerate(option_ids, start=1)
-    ]
-    phenotypes = tuple(str(value["child_configuration_sha256"]) for value in members)
-    if len(set(phenotypes)) != len(phenotypes):
-        collision_count = len(phenotypes) - len(set(phenotypes))
-    else:
-        collision_count = 0
-    rationales = [str(value.get("design_rationale", "")) for value in members]
-    rationale_jaccards = _pairwise_token_jaccards(rationales)
-    member_card_attributions = []
-    for member in members:
-        cited = tuple(str(value) for value in member.get("supporting_card_keys", []))
-        member_card_attributions.append(
+    def pairs(value: object, *, name: str) -> dict[str, int]:
+        if type(value) is not list:
+            raise TypeError(f"{name} must be a list of [name, count] pairs")
+        result: dict[str, int] = {}
+        for item in value:
+            if (
+                type(item) is not list
+                or len(item) != 2
+                or type(item[0]) is not str
+                or type(item[1]) is not int
+                or isinstance(item[1], bool)
+                or item[1] < 0
+            ):
+                raise ValueError(f"{name} contains a malformed count pair")
+            if item[0] in result:
+                raise ValueError(f"{name} repeats a count key")
+            result[item[0]] = item[1]
+        return result
+
+    for event in stages:
+        receipt = event["payload"]["stage_receipt"]
+        generation = int(receipt["generation"])
+        for audit in receipt.get("selector_audits") or []:
+            plaintext = audit.get("plaintext_audit")
+            if type(plaintext) is not dict:
+                raise ValueError("selector audit lacks its plaintext projection")
+            response = json.loads(_audit_text(plaintext, "response_text"))
+            if type(response) is not dict:
+                raise TypeError("selector response projection must be an object")
+            ranked = response.get("ranked_decision")
+            supplemental = response.get("supplemental_selector_audit")
+            if type(ranked) is not dict or type(supplemental) is not dict:
+                raise ValueError("outcome-conditioned response lacks ranked evidence")
+            if supplemental.get("audit_kind") != "outcome_conditioned_expert_portfolio":
+                raise ValueError("selector audit kind is not outcome-conditioned")
+            payload = supplemental.get("payload")
+            if type(payload) is not dict:
+                raise ValueError("outcome-conditioned audit lacks its payload")
+            raw_members = ranked.get("members")
+            if type(raw_members) is not list or any(
+                type(value) is not dict for value in raw_members
+            ):
+                raise ValueError("ranked decision lacks object members")
+            members = list(raw_members)
+            option_ids = tuple(str(value["option_id"]) for value in members)
+            if len(option_ids) != len(set(option_ids)):
+                raise ValueError("ranked decision repeats an option")
+
+            contextual = payload.get("contextual_allocation")
+            realization = payload.get("contextual_allocation_realization")
+            global_wave = payload.get("global_wave_allocation")
+            health = payload.get("forecast_health")
+            if any(
+                type(value) is not dict
+                for value in (contextual, realization, global_wave, health)
+            ):
+                raise ValueError("outcome-conditioned audit lacks trusted receipts")
+            assert type(contextual) is dict
+            assert type(realization) is dict
+            assert type(global_wave) is dict
+            assert type(health) is dict
+            lane_id = str(contextual["slice_id"])
+            raw_eligible_by_lane = global_wave.get("eligible_option_ids")
+            raw_selected_by_lane = global_wave.get("selected_option_ids")
+            if (
+                type(raw_eligible_by_lane) is not dict
+                or type(raw_selected_by_lane) is not dict
+            ):
+                raise ValueError("global allocation lacks lane-indexed action sets")
+            raw_eligible = raw_eligible_by_lane.get(lane_id)
+            raw_selected = raw_selected_by_lane.get(lane_id)
+            if (
+                raw_eligible is not None
+                and (
+                    type(raw_eligible) is not list
+                    or any(type(value) is not str for value in raw_eligible)
+                )
+            ) or (
+                type(raw_selected) is not list
+                or any(type(value) is not str for value in raw_selected)
+            ):
+                raise ValueError("global allocation lacks this lane's action sets")
+            eligible_option_ids = () if raw_eligible is None else tuple(raw_eligible)
+            selected_option_ids = tuple(raw_selected)
+            if len(eligible_option_ids) != len(set(eligible_option_ids)):
+                raise ValueError("eligible action set contains duplicates")
+            if eligible_option_ids and not set(selected_option_ids).issubset(
+                eligible_option_ids
+            ):
+                raise ValueError("selected action is absent from eligible support")
+            if set(selected_option_ids) != set(option_ids):
+                raise ValueError("ranked decision and global allocation disagree")
+
+            raw_role_audits = payload.get("role_assignment_audits")
+            if type(raw_role_audits) is not list:
+                raise ValueError("outcome-conditioned role assignments are malformed")
+            role_maps: list[dict[str, str]] = []
+            for role_audit in raw_role_audits:
+                assignments = (
+                    role_audit.get("assignments") if type(role_audit) is dict else None
+                )
+                if type(assignments) is not list or any(
+                    type(value) is not dict for value in assignments
+                ):
+                    raise ValueError("role-assignment audit is malformed")
+                role_maps.append(
+                    {
+                        str(value["option_id"]): str(value["role"])
+                        for value in assignments
+                    }
+                )
+            roles_list: list[str] = []
+            for member, option_id in zip(members, option_ids, strict=True):
+                rationale = str(member.get("design_rationale", ""))
+                match = re.search(r"(?:^|[ ;])role=([a-z0-9_]+)(?:;|$)", rationale)
+                if match is None:
+                    if not role_maps or option_id not in role_maps[0]:
+                        raise ValueError("ranked member lacks a role assignment")
+                    role = role_maps[0][option_id]
+                else:
+                    role = match.group(1)
+                assigned_roles = {
+                    value[option_id] for value in role_maps if option_id in value
+                }
+                if assigned_roles and role not in assigned_roles:
+                    raise ValueError("ranked rationale role lacks quantile support")
+                roles_list.append(role)
+            roles = tuple(roles_list)
+
+            forecasts = payload.get("selected_forecasts")
+            if type(forecasts) is not list or any(
+                type(value) is not dict for value in forecasts
+            ):
+                raise ValueError("selected forecasts must contain objects")
+            forecast_by_option = {str(value["option_id"]): value for value in forecasts}
+            if set(forecast_by_option) != set(option_ids):
+                raise ValueError("selected forecast set and ranked decision disagree")
+            global_row_start = int(health["global_row_start"])
+            global_row_stop = int(health["global_row_stop"])
+            forecast_action_count = global_row_stop - global_row_start
+            if forecast_action_count < len(option_ids):
+                raise ValueError("forecast frame is smaller than the selected slate")
+            if len(eligible_option_ids) > forecast_action_count:
+                raise ValueError("eligible identities exceed the forecast frame")
+            # Older V17 traces compacted most eligible identity lists to null.
+            # In those calls the complete forecast-frame cardinality is the
+            # only authenticated support upper bound. V19's durable envelope
+            # receipt removes this censoring for future experiments.
+            eligible_action_count = (
+                len(eligible_option_ids)
+                if eligible_option_ids
+                else forecast_action_count
+            )
+
+            action_records: list[dict[str, Any]] = []
+            for rank, (member, role) in enumerate(
+                zip(members, roles, strict=True), start=1
+            ):
+                option_id = str(member["option_id"])
+                family = str(member.get("family", "unknown"))
+                if option_id.startswith("compose."):
+                    action_kind = "compose_r2"
+                elif option_id.startswith(("acquisition.", "generic_restart.")):
+                    action_kind = "global"
+                else:
+                    action_kind = "atomic_or_catalogue"
+                action_kind_counts[action_kind] += 1
+                family_counts[family] += 1
+                role_counts[role] += 1
+                for prediction in member.get("effect_predictions", []):
+                    if type(prediction) is not dict:
+                        raise TypeError("effect prediction must be an object")
+                    direction_counts[str(prediction["direction"])] += 1
+                selected_forecast = forecast_by_option[option_id]
+                for metric in selected_forecast.get("metric_forecasts", []):
+                    if type(metric) is not dict:
+                        raise TypeError("selected metric forecast must be an object")
+                    confidence_counts[str(metric.get("confidence_hex"))] += 1
+                action_records.append(
+                    {
+                        "model_rank": rank,
+                        "option_id": option_id,
+                        "action_kind": action_kind,
+                        "component_option_ids": [],
+                        "evaluated": True,
+                        "family": family,
+                        "role": role,
+                    }
+                )
+
+            contextual_requested_sources = pairs(
+                contextual.get("source_target_counts"),
+                name="source_target_counts",
+            )
+            contextual_requested_operators = pairs(
+                contextual.get("operator_target_counts"),
+                name="operator_target_counts",
+            )
+            contextual_realized_sources = pairs(
+                realization.get("realized_source_target_counts"),
+                name="realized_source_target_counts",
+            )
+            contextual_realized_operators = pairs(
+                realization.get("realized_operator_target_counts"),
+                name="realized_operator_target_counts",
+            )
+            ranks = tuple(
+                int(value.get("rank", index)) for index, value in enumerate(members, 1)
+            )
+            common_pool = {
+                "candidate_universe_size": eligible_action_count,
+                "model_selection_size": len(option_ids),
+                "evaluation_size": len(option_ids),
+                "evaluated_option_ids": list(option_ids),
+                # Compatibility name for the downstream generic rank join.
+                # These are trusted broker ranks, not raw model proposal ranks.
+                "evaluated_model_ranks": list(ranks),
+                "allocator_roles": list(roles),
+                "allocator_replacement_count": 0,
+                "selection_fraction_of_universe": len(option_ids)
+                / eligible_action_count,
+                "evaluation_fraction_of_universe": len(option_ids)
+                / eligible_action_count,
+            }
+            rationales = [str(value.get("design_rationale", "")) for value in members]
+            rationale_jaccards = _pairwise_token_jaccards(rationales)
+            call = {
+                "selection_architecture": "outcome_conditioned_expert_portfolio",
+                "generation": generation,
+                "parent_slot": int(audit["parent_slot"]),
+                "lane_id": lane_id,
+                "request_sha256": str(audit["request_sha256"]),
+                "prompt_definition_sha256": str(payload["policy_definition_sha256"]),
+                "option_ids": list(option_ids),
+                "eligible_option_ids": list(eligible_option_ids),
+                "eligible_action_count": eligible_action_count,
+                "eligible_option_identities_recorded": bool(eligible_option_ids),
+                "forecast_action_count": forecast_action_count,
+                "variation_actions": action_records,
+                "hierarchical_composition": None,
+                "witness_option_ids": [],
+                "hidden_feasibility_certificate": None,
+                "common_candidate_pool": common_pool,
+                "proposal_support": None,
+                "semantic_reconciliation": None,
+                "frontier_context": None,
+                "frontier_target": None,
+                "contextual_allocation_projection": {
+                    "exact": realization.get("exact") is True,
+                    "source_l1_deviation": int(realization["source_l1_deviation"]),
+                    "operator_l1_deviation": int(realization["operator_l1_deviation"]),
+                    "requested_source_target_counts": contextual_requested_sources,
+                    "realized_source_target_counts": contextual_realized_sources,
+                    "requested_operator_target_counts": contextual_requested_operators,
+                    "realized_operator_target_counts": contextual_realized_operators,
+                    "objective_values_consulted": realization.get(
+                        "objective_values_consulted"
+                    ),
+                    "workload_identifiers_consulted": realization.get(
+                        "workload_identifiers_consulted"
+                    ),
+                },
+                "forecast_health_passes": health.get("passes") is True,
+                "forecast_distinct_row_signature_count": int(
+                    health["distinct_row_signature_count"]
+                ),
+                "forecast_physical_call_count": int(payload["physical_call_count"]),
+                "candidate_evaluations": int(
+                    payload["allocation"]["candidate_evaluations"]
+                ),
+                "selected_forecasts": forecasts,
+                "unique_design_rationale_count": len(set(rationales)),
+                "exact_duplicate_design_rationale_occurrence_count": (
+                    len(rationales) - len(set(rationales))
+                ),
+                "mean_pairwise_rationale_token_jaccard": (
+                    None
+                    if not rationale_jaccards
+                    else sum(rationale_jaccards) / len(rationale_jaccards)
+                ),
+            }
+            calls.append(call)
+            by_generation.setdefault(generation, []).append(call)
+            option_counts.update(option_ids)
+            eligible_counts.update(eligible_option_ids)
+            phenotype_counts.update(
+                str(value["child_configuration_sha256"]) for value in members
+            )
+            prompt_definition_counts[str(payload["policy_definition_sha256"])] += 1
+
+    lane_rows: list[dict[str, Any]] = []
+    lane_jaccards: list[float] = []
+    for generation, generation_calls in sorted(by_generation.items()):
+        values: list[float] = []
+        for left_index, left in enumerate(generation_calls):
+            for right in generation_calls[left_index + 1 :]:
+                value = _jaccard(set(left["option_ids"]), set(right["option_ids"]))
+                values.append(value)
+                lane_jaccards.append(value)
+        lane_rows.append(
             {
-                "option_id": str(member["option_id"]),
-                "evaluated": True,
-                "cited_card_keys": list(cited),
-                # The compact outcome-conditioned audit authenticates selected
-                # card keys but deliberately does not reproduce the full prompt
-                # card/action evidence.  Keep exact-target joins unidentified.
-                "card_exact_finite_target": None,
-                "card_citation_without_exact_finite_target": None,
-                "cited_empirical_card_keys": [],
-                "empirical_card_exact_target": None,
-                "empirical_card_cross_target_generalization": None,
+                "generation": generation,
+                "lane_count": len(generation_calls),
+                "lane_pair_count": len(values),
+                "mean_lane_option_jaccard": (
+                    None if not values else sum(values) / len(values)
+                ),
+                "minimum_lane_option_jaccard": None if not values else min(values),
+                "maximum_lane_option_jaccard": None if not values else max(values),
+                "lane_union_option_count": len(
+                    set().union(
+                        *(set(value["option_ids"]) for value in generation_calls)
+                    )
+                ),
             }
         )
-    cited_member_count = sum(
-        bool(value["cited_card_keys"]) for value in member_card_attributions
-    )
-    empirical_card_attribution = {
-        "available_card_count": None,
-        "selected_card_citation_member_count": cited_member_count,
-        "evaluated_card_citation_member_count": cited_member_count,
-        "selected_card_citation_without_exact_finite_target_count": 0,
-        "evaluated_card_citation_without_exact_finite_target_count": 0,
-        "selected_citation_member_count": 0,
-        "evaluated_citation_member_count": 0,
-        "selected_exact_target_member_count": 0,
-        "evaluated_exact_target_member_count": 0,
-        "selected_cross_target_generalization_member_count": 0,
-        "evaluated_cross_target_generalization_member_count": 0,
-        "exact_card_target_projection_identified": False,
-        "members": member_card_attributions,
-    }
-    role = f"trusted_all_action:{payload.get('target_kind', 'unknown')}"
-    return {
-        "generation": generation,
-        "parent_slot": int(selector_audit["parent_slot"]),
-        "request_sha256": str(selector_audit["request_sha256"]),
-        "prompt_definition_sha256": str(payload["policy_definition_sha256"]),
-        "selection_mode": "outcome_conditioned_trusted_all_action",
-        "forecast_universe_size": forecast_universe_size,
-        "allocator_candidate_evaluations": candidate_evaluations,
-        "physical_forecast_call_count": physical_call_count,
-        "role_label": role,
-        "option_ids": list(option_ids),
-        "variation_actions": action_records,
-        "hierarchical_composition": None,
-        "witness_mode": "trusted_outcome_conditioned_no_model_slate",
-        "witness_option_ids": [],
-        "hidden_feasibility_certificate": None,
-        "witness_overlap_count": 0,
-        "witness_overlap_fraction": None,
-        "exact_ordered_witness_copy": False,
-        "exact_set_witness_copy": False,
-        "unique_option_count": len(option_ids),
-        "unique_phenotype_count": len(set(phenotypes)),
-        "within_call_phenotype_collision_count": collision_count,
-        "unique_design_rationale_count": len(set(rationales)),
-        "exact_duplicate_design_rationale_occurrence_count": (
-            len(rationales) - len(set(rationales))
-        ),
-        "mean_pairwise_rationale_token_jaccard": (
+
+    option_entropy = _entropy(option_counts)
+    effective_option_count = math.exp(option_entropy) if option_counts else 0.0
+    role_entropy = _entropy(role_counts)
+    contextual_rows = [value["contextual_allocation_projection"] for value in calls]
+
+    def aggregate_counts(field: str) -> dict[str, int]:
+        return dict(
+            sorted(
+                sum(
+                    (Counter(value[field]) for value in contextual_rows), Counter()
+                ).items()
+            )
+        )
+
+    contextual_projection = {
+        "call_count": len(contextual_rows),
+        "call_coverage_rate": None if not calls else len(contextual_rows) / len(calls),
+        "exact_call_count": sum(value["exact"] for value in contextual_rows),
+        "exact_call_rate": (
             None
-            if not rationale_jaccards
-            else sum(rationale_jaccards) / len(rationale_jaccards)
+            if not contextual_rows
+            else sum(value["exact"] for value in contextual_rows) / len(contextual_rows)
         ),
-        "card_attributed_member_count": cited_member_count,
-        "empirical_card_attribution": empirical_card_attribution,
-        "frontier_context": None,
-        "frontier_target": None,
-        "common_candidate_pool": None,
-        "proposal_support": None,
-        "semantic_reconciliation": None,
-        "members": members,
-        "phenotypes": list(phenotypes),
+        "source_l1_deviation": sum(
+            int(value["source_l1_deviation"]) for value in contextual_rows
+        ),
+        "operator_l1_deviation": sum(
+            int(value["operator_l1_deviation"]) for value in contextual_rows
+        ),
+        "requested_source_target_counts": aggregate_counts(
+            "requested_source_target_counts"
+        ),
+        "realized_source_target_counts": aggregate_counts(
+            "realized_source_target_counts"
+        ),
+        "requested_operator_target_counts": aggregate_counts(
+            "requested_operator_target_counts"
+        ),
+        "realized_operator_target_counts": aggregate_counts(
+            "realized_operator_target_counts"
+        ),
+        "objective_blind_call_rate": (
+            None
+            if not contextual_rows
+            else sum(
+                value["objective_values_consulted"] is False
+                for value in contextual_rows
+            )
+            / len(contextual_rows)
+        ),
+        "workload_identifier_blind_call_rate": (
+            None
+            if not contextual_rows
+            else sum(
+                value["workload_identifiers_consulted"] is False
+                for value in contextual_rows
+            )
+            / len(contextual_rows)
+        ),
+    }
+    rationale_values = [
+        float(value["mean_pairwise_rationale_token_jaccard"])
+        for value in calls
+        if value["mean_pairwise_rationale_token_jaccard"] is not None
+    ]
+    total_selected = sum(len(value["option_ids"]) for value in calls)
+    total_eligible = sum(int(value["eligible_action_count"]) for value in calls)
+    selection_fractions = [
+        len(value["option_ids"]) / int(value["eligible_action_count"])
+        for value in calls
+    ]
+    semantic_reconciliation = {
+        "call_count": 0,
+        "call_coverage_rate": 0.0 if calls else None,
+        "original_member_count": 0,
+        "original_unique_member_count": 0,
+        "duplicate_model_member_count": 0,
+        "reconciled_member_count": 0,
+        "retained_model_member_count": 0,
+        "engine_inserted_member_count": 0,
+        "engine_insertion_rate": None,
+        "evaluated_member_count": 0,
+        "evaluated_model_member_count": 0,
+        "evaluated_engine_member_count": 0,
+        "evaluated_engine_member_rate": None,
+        "model_card_attribution_rewrite_count": 0,
+        "origin_counts": {},
+        "reason_counts": {},
+        "objective_blind_call_rate": None,
+        "workload_identifier_blind_call_rate": None,
+        # The controller receipt is direct in this architecture rather than a
+        # post-hoc semantic reconciliation projection.
+        "contextual_allocation_projection": contextual_projection,
+        "composition_capacity_projection": {
+            "call_count": 0,
+            "call_coverage_rate": 0.0 if calls else None,
+            "capacity_projected_call_count": 0,
+            "capacity_projected_call_rate": None,
+            "preferred_composite_count_total": 0,
+            "effective_composite_count_total": 0,
+            "absolute_projection_distance_total": 0,
+            "projections": [],
+        },
+        "calls": [],
+    }
+    return {
+        "selection_architecture": "outcome_conditioned_expert_portfolio",
+        "selector_call_count": len(calls),
+        "proposal_member_count": total_selected,
+        "variation_action_kind_counts": dict(sorted(action_kind_counts.items())),
+        "evaluated_variation_action_kind_counts": dict(
+            sorted(action_kind_counts.items())
+        ),
+        "hierarchical_call_count": 0,
+        "hierarchical_exact_required_count_rate": None,
+        "composite_proposal_count": action_kind_counts.get("compose_r2", 0),
+        "composite_proposal_share": (
+            None
+            if total_selected == 0
+            else action_kind_counts.get("compose_r2", 0) / total_selected
+        ),
+        "composite_evaluated_count": action_kind_counts.get("compose_r2", 0),
+        "composite_proposal_evaluation_rate": (
+            None if action_kind_counts.get("compose_r2", 0) == 0 else 1.0
+        ),
+        "composite_model_rank_counts": {},
+        "unique_option_count": len(option_counts),
+        "catalogue_union_option_count": len(eligible_counts),
+        "catalogue_coverage_fraction": (
+            None if not eligible_counts else len(option_counts) / len(eligible_counts)
+        ),
+        "option_entropy_nats": option_entropy,
+        "effective_option_count": effective_option_count,
+        "effective_option_fraction_of_slots": (
+            None if total_selected == 0 else effective_option_count / total_selected
+        ),
+        "normalized_option_entropy_to_catalogue": (
+            None
+            if len(eligible_counts) <= 1
+            else option_entropy / math.log(len(eligible_counts))
+        ),
+        "role_entropy_nats": role_entropy,
+        "normalized_role_entropy_to_observed_roles": (
+            None if len(role_counts) <= 1 else role_entropy / math.log(len(role_counts))
+        ),
+        "exact_duplicate_design_rationale_occurrence_count": sum(
+            int(value["exact_duplicate_design_rationale_occurrence_count"])
+            for value in calls
+        ),
+        "mean_within_call_rationale_token_jaccard": (
+            None
+            if not rationale_values
+            else sum(rationale_values) / len(rationale_values)
+        ),
+        "unique_phenotype_count": len(phenotype_counts),
+        "phenotype_collision_occurrence_count": (
+            sum(phenotype_counts.values()) - len(phenotype_counts)
+        ),
+        "exact_ordered_witness_copy_count": 0,
+        "exact_ordered_witness_copy_rate": None,
+        "exact_set_witness_copy_count": 0,
+        "exact_set_witness_copy_rate": None,
+        "mean_witness_overlap_fraction": None,
+        "mean_cross_lane_option_jaccard": (
+            None if not lane_jaccards else sum(lane_jaccards) / len(lane_jaccards)
+        ),
+        "role_counts": dict(sorted(role_counts.items())),
+        "confidence_counts": dict(sorted(confidence_counts.items())),
+        "direction_counts": dict(sorted(direction_counts.items())),
+        "prompt_definition_counts": dict(sorted(prompt_definition_counts.items())),
+        "witness_mode_counts": {"trusted_complete_action_union": len(calls)},
+        "hidden_feasibility_certificate_call_count": 0,
+        "common_pool_call_count": len(calls),
+        "common_universe_union_option_count": len(eligible_counts),
+        "common_pool_candidate_universe_size_counts": dict(
+            sorted(
+                Counter(str(value["eligible_action_count"]) for value in calls).items()
+            )
+        ),
+        "common_pool_model_selection_size_counts": dict(
+            sorted(Counter(str(len(value["option_ids"])) for value in calls).items())
+        ),
+        "common_pool_evaluation_size_counts": dict(
+            sorted(Counter(str(len(value["option_ids"])) for value in calls).items())
+        ),
+        "mean_common_universe_selection_fraction": (
+            None
+            if not selection_fractions
+            else sum(selection_fractions) / len(selection_fractions)
+        ),
+        "mean_common_universe_evaluation_fraction": (
+            None
+            if not selection_fractions
+            else sum(selection_fractions) / len(selection_fractions)
+        ),
+        "common_pool_allocator_replacement_count": 0,
+        "common_pool_allocator_replacement_rate": None,
+        "common_pool_literal_model_top_evaluation_size_preserved_rate": None,
+        "common_pool_prompt_projection_match_rate": None,
+        "common_pool_model_provider_blind_rate": None,
+        "common_pool_outcome_blind_rate": None,
+        "common_pool_hidden_witness_rate": None,
+        "proposal_support_call_count": 0,
+        "proposal_support_reservation_count": 0,
+        "proposal_support_selected_inclusion_rate": None,
+        "proposal_support_authenticated_deferral_count": 0,
+        "proposal_support_reconciled_membership_exact_call_rate": None,
+        "proposal_support_evaluated_reservation_count": 0,
+        "proposal_support_reservation_evaluation_rate": None,
+        "proposal_support_evaluator_slot_share": None,
+        "proposal_support_all_reservations_evaluated_call_rate": None,
+        "proposal_support_original_model_rank_counts": {},
+        "proposal_support_allocator_role_counts": {},
+        "proposal_support_prompt_projection_match_rate": None,
+        "semantic_reconciliation": semantic_reconciliation,
+        "card_attributed_member_count": 0,
+        "evaluated_card_citation_member_count": 0,
+        "evaluated_card_citation_without_exact_finite_target_count": 0,
+        "empirical_card_available_call_count": 0,
+        "empirical_card_selected_citation_member_count": 0,
+        "empirical_card_evaluated_citation_member_count": 0,
+        "empirical_card_selected_exact_target_member_count": 0,
+        "empirical_card_evaluated_exact_target_member_count": 0,
+        "empirical_card_selected_cross_target_generalization_member_count": 0,
+        "empirical_card_evaluated_cross_target_generalization_member_count": 0,
+        "frontier_context_call_count": 0,
+        "frontier_context_enabled_rate": 0.0 if calls else None,
+        "frontier_context_distinct_projection_count": 0,
+        "frontier_context_dimension_counts": {},
+        "frontier_context_projector_counts": {},
+        "frontier_context_parent_dominated_count": 0,
+        "frontier_context_future_outcome_leak_count": 0,
+        "frontier_target_call_count": 0,
+        "frontier_target_enabled_rate": 0.0 if calls else None,
+        "frontier_target_distinct_target_count": 0,
+        "frontier_target_allocator_counts": {},
+        "frontier_target_direction_counts": {},
+        "frontier_target_opportunity_rank_counts": {},
+        "frontier_target_lane_counts": {},
+        "frontier_target_weight_counts": {},
+        "frontier_target_mean_opportunity_from_ideal": None,
+        "frontier_target_mean_parent_regret_above_archive_best": None,
+        "frontier_target_future_outcome_leak_count": 0,
+        "frontier_target_workload_identifier_consulted_count": 0,
+        "frontier_target_model_or_provider_consulted_count": 0,
+        "generation_lane_diversity": lane_rows,
+        "outcome_conditioned": {
+            "eligible_action_occurrences": total_eligible,
+            "evaluated_action_occurrences": total_selected,
+            "eligible_identity_receipt_call_count": sum(
+                value["eligible_option_identities_recorded"] for value in calls
+            ),
+            "evaluated_fraction_of_eligible_support": (
+                None if total_eligible == 0 else total_selected / total_eligible
+            ),
+            "selected_family_counts": dict(sorted(family_counts.items())),
+            "forecast_health_pass_rate": (
+                None
+                if not calls
+                else sum(value["forecast_health_passes"] for value in calls)
+                / len(calls)
+            ),
+            "forecast_physical_call_count": sum(
+                int(value["forecast_physical_call_count"]) for value in calls
+            ),
+            "trusted_candidate_evaluations": sum(
+                int(value["candidate_evaluations"]) for value in calls
+            ),
+            "contextual_allocation": contextual_projection,
+        },
+        "calls": calls,
     }
 
 
@@ -2684,6 +3672,23 @@ def _selector_behavior(
     provider_backed: bool,
 ) -> dict[str, Any]:
     """Recover workload-neutral proposal diversity and witness-copy endpoints."""
+
+    for event in stages:
+        receipt = event["payload"]["stage_receipt"]
+        audits = receipt.get("selector_audits") or []
+        if not audits:
+            continue
+        plaintext = audits[0].get("plaintext_audit")
+        if type(plaintext) is not dict:
+            raise ValueError("selector audit lacks its plaintext projection")
+        response = json.loads(_audit_text(plaintext, "response_text"))
+        supplemental = response.get("supplemental_selector_audit")
+        if (
+            type(supplemental) is dict
+            and supplemental.get("audit_kind") == "outcome_conditioned_expert_portfolio"
+        ):
+            return _outcome_conditioned_selector_behavior(stages)
+        break
 
     calls: list[dict[str, Any]] = []
     option_counts: Counter[str] = Counter()
@@ -2707,44 +3712,16 @@ def _selector_behavior(
             plaintext = selector_audit.get("plaintext_audit")
             if type(plaintext) is not dict:
                 raise ValueError("selector audit lacks its plaintext projection")
-            response = json.loads(plaintext["response_text"])
+            response = json.loads(_audit_text(plaintext, "response_text"))
             if type(response) is not dict:
                 raise TypeError("selector response projection must be an object")
-            supplemental_projection = response.get("supplemental_selector_audit")
-            if (
-                provider_backed
-                and type(supplemental_projection) is dict
-                and supplemental_projection.get("audit_kind")
-                == "outcome_conditioned_expert_portfolio"
-            ):
-                call = _outcome_conditioned_selector_projection(
-                    response=response,
-                    selector_audit=selector_audit,
-                    generation=generation,
-                )
-                members = call["members"]
-                option_ids = tuple(str(value) for value in call["option_ids"])
-                option_counts.update(option_ids)
-                prompt_definition_counts[call["prompt_definition_sha256"]] += 1
-                witness_mode_counts[call["witness_mode"]] += 1
-                role_counts[call["role_label"]] += len(members)
-                for action in call["variation_actions"]:
-                    action_kind_counts[str(action["action_kind"])] += 1
-                    if action["evaluated"]:
-                        evaluated_action_kind_counts[str(action["action_kind"])] += 1
-                for member in members:
-                    for prediction in member.get("effect_predictions", []):
-                        confidence_counts[str(prediction["confidence"])] += 1
-                        direction_counts[str(prediction["direction"])] += 1
-                phenotype_counts.update(str(value) for value in call["phenotypes"])
-                calls.append(call)
-                by_generation.setdefault(generation, []).append(call)
-                continue
             evaluated_option_ids: tuple[str, ...] = ()
             hidden_feasibility_certificate: dict[str, Any] | None = None
             payload: dict[str, Any] | None = None
             if provider_backed:
-                machine = _prompt_machine_contract(plaintext["request_text"])
+                machine = _prompt_machine_contract(
+                    _audit_text(plaintext, "request_text")
+                )
                 supplemental = response.get("supplemental_selector_audit")
                 if type(supplemental) is not dict:
                     raise ValueError("selector response lacks its supplemental audit")
@@ -2968,7 +3945,9 @@ def _selector_behavior(
                     and type(value.get("phenotype_identity_sha256")) is str
                 )
             else:
-                machine = _prompt_finite_contract(plaintext["request_text"])
+                machine = _prompt_finite_contract(
+                    _audit_text(plaintext, "request_text")
+                )
                 members = response.get("members")
                 if type(members) is not list:
                     raise ValueError(
@@ -3147,14 +4126,6 @@ def _selector_behavior(
                 "parent_slot": int(selector_audit["parent_slot"]),
                 "request_sha256": str(selector_audit["request_sha256"]),
                 "prompt_definition_sha256": prompt_definition,
-                "selection_mode": (
-                    "legacy_provider_backed_free_form"
-                    if provider_backed
-                    else "provider_free_direct"
-                ),
-                "forecast_universe_size": None,
-                "allocator_candidate_evaluations": None,
-                "physical_forecast_call_count": None,
                 "witness_mode": witness_mode,
                 "option_ids": list(option_ids),
                 "variation_actions": action_records,
@@ -3367,44 +4338,8 @@ def _selector_behavior(
         int(value["evaluated_engine_member_count"])
         for value in semantic_reconciliation_records
     )
-    selection_mode_counts = Counter(str(value["selection_mode"]) for value in calls)
-    outcome_conditioned_calls = [
-        value
-        for value in calls
-        if value["selection_mode"] == "outcome_conditioned_trusted_all_action"
-    ]
     return {
         "selector_call_count": len(calls),
-        "selection_mode_counts": dict(sorted(selection_mode_counts.items())),
-        "outcome_conditioned_call_count": len(outcome_conditioned_calls),
-        "outcome_conditioned_forecast_universe_row_count_total": sum(
-            int(value["forecast_universe_size"]) for value in outcome_conditioned_calls
-        ),
-        "outcome_conditioned_forecast_universe_size_counts": dict(
-            sorted(
-                Counter(
-                    str(value["forecast_universe_size"])
-                    for value in outcome_conditioned_calls
-                ).items()
-            )
-        ),
-        "outcome_conditioned_allocator_candidate_evaluations_total": sum(
-            int(value["allocator_candidate_evaluations"])
-            for value in outcome_conditioned_calls
-        ),
-        "outcome_conditioned_physical_forecast_call_count": sum(
-            int(value["physical_forecast_call_count"])
-            for value in outcome_conditioned_calls
-        ),
-        "proposal_member_count_semantics": (
-            "mixed_see_selection_mode_counts"
-            if len(selection_mode_counts) > 1
-            else (
-                "trusted_evaluated_k_set"
-                if outcome_conditioned_calls
-                else "model_or_control_proposal_members"
-            )
-        ),
         "proposal_member_count": proposal_count,
         "variation_action_kind_counts": dict(sorted(action_kind_counts.items())),
         "evaluated_variation_action_kind_counts": dict(
@@ -3899,9 +4834,7 @@ def _selector_behavior(
             for value in empirical_card_records
         ),
         "empirical_card_available_call_count": sum(
-            type(value["available_card_count"]) is int
-            and int(value["available_card_count"]) > 0
-            for value in empirical_card_records
+            int(value["available_card_count"]) > 0 for value in empirical_card_records
         ),
         "empirical_card_selected_citation_member_count": sum(
             int(value["selected_citation_member_count"])
@@ -4053,6 +4986,12 @@ def _original_model_rank_and_allocator_calibration(
         common = call.get("common_candidate_pool")
         if type(common) is not dict:
             continue
+        raw_actions = call.get("variation_actions", [])
+        if type(raw_actions) is not list or any(
+            type(value) is not dict for value in raw_actions
+        ):
+            raise ValueError("selector variation-action join is malformed")
+        action_by_option = {str(value["option_id"]): value for value in raw_actions}
         option_ids = common.get("evaluated_option_ids")
         model_ranks = common.get("evaluated_model_ranks")
         roles = common.get("allocator_roles")
@@ -4089,6 +5028,10 @@ def _original_model_rank_and_allocator_calibration(
                 "option_id": str(option_id),
                 "original_model_rank": int(model_rank),
                 "allocator_role": str(role),
+                "action_kind": action_by_option.get(str(option_id), {}).get(
+                    "action_kind"
+                ),
+                "family": action_by_option.get(str(option_id), {}).get("family"),
             }
 
     joined_rows: list[dict[str, Any]] = []
@@ -4291,6 +5234,8 @@ def _original_model_rank_and_allocator_calibration(
         "unjoined_candidate_label_count": eligible_label_count - len(joined_rows),
         "original_model_rank_rows": aggregate("original_model_rank"),
         "allocator_role_rows": aggregate("allocator_role"),
+        "action_kind_rows": aggregate("action_kind"),
+        "family_rows": aggregate("family"),
         "proposal_support_calibration": {
             "semantics": (
                 "authenticated_proposal_membership_joined_to_observed_"
@@ -4844,12 +5789,16 @@ def _contextual_search_behavior(summary: dict[str, Any]) -> dict[str, Any]:
         plan = plan_by_wave.get(wave)
         rows = observations_by_wave.get(wave, [])
 
-        def planned_counts(kind: str) -> dict[str, int]:
-            if plan is None:
+        def planned_counts(
+            kind: str,
+            *,
+            active_plan: dict[str, Any] | None = plan,
+        ) -> dict[str, int]:
+            if active_plan is None:
                 return {}
             return {
                 str(value["arm_id"]): int(value["target_slots"])
-                for value in plan[f"{kind}_allocations"]
+                for value in active_plan[f"{kind}_allocations"]
             }
 
         observed_source = dict(
@@ -4920,6 +5869,278 @@ def _contextual_search_behavior(summary: dict[str, Any]) -> dict[str, Any]:
                 value.get("final_front_persisted") is True for value in delayed_credits
             ),
         },
+    }
+
+
+def _expert_union_support(
+    stages: list[dict[str, Any]],
+    candidate_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Join the complete eligible expert union to materialized outcomes.
+
+    V19 records every engine-owned finite option before trusted allocation,
+    including options that never enter an LLM prompt and are never evaluated.
+    This projection authenticates those receipts and performs an occurrence-
+    level join using ``(parent_candidate_id, option_identity_sha256)``. It is
+    intentionally workload- and model-blind: source/operator labels come only
+    from the generic finite-variation metadata contract.
+    """
+
+    candidate_by_id = {str(value["candidate_id"]): value for value in candidate_rows}
+    option_rows: list[dict[str, Any]] = []
+    generation_rows: list[dict[str, Any]] = []
+    portfolio_stage_count = 0
+
+    for event in stages:
+        receipt = event["payload"]["stage_receipt"]
+        result = receipt["result"]
+        raw_waves = result.get("portfolio_wave_receipts")
+        if type(raw_waves) is list and raw_waves:
+            portfolio_stage_count += 1
+        trace = result.get("variation_envelope_trace_receipt")
+        if trace is None:
+            continue
+        if type(trace) is not dict:
+            raise TypeError("variation-envelope trace receipt must be an object")
+        payload = decode_campaign_variation_envelope_trace_record(trace)
+        generation = int(receipt["generation"])
+        if trace.get("generation") != generation:
+            raise ValueError("variation-envelope trace names a foreign generation")
+        lanes = payload.get("lanes")
+        if type(lanes) is not list:
+            raise TypeError("variation-envelope trace payload lacks lanes")
+
+        eligible: dict[tuple[str, str], dict[str, Any]] = {}
+        stage_rows: list[dict[str, Any]] = []
+        for lane in lanes:
+            if type(lane) is not dict:
+                raise TypeError("variation-envelope trace lane must be an object")
+            parent_candidate_id = lane.get("parent_candidate_id")
+            options = lane.get("eligible_options")
+            if type(parent_candidate_id) is not str or type(options) is not list:
+                raise TypeError("variation-envelope trace lane is malformed")
+            for value in options:
+                if type(value) is not dict:
+                    raise TypeError("variation-envelope eligible option is malformed")
+                option = value.get("option")
+                if type(option) is not dict:
+                    raise TypeError("variation-envelope option evidence is malformed")
+                metadata = option.get("metadata")
+                if type(metadata) is not dict or any(
+                    type(key) is not str or type(item) is not str
+                    for key, item in metadata.items()
+                ):
+                    raise TypeError("variation-envelope option metadata is malformed")
+                option_identity = option.get("option_identity_sha256")
+                family = option.get("family")
+                support_origin = value.get("support_origin")
+                if (
+                    type(option_identity) is not str
+                    or type(family) is not str
+                    or support_origin not in ("base", "envelope_addition")
+                ):
+                    raise ValueError("variation-envelope option identity is malformed")
+                source = metadata.get(
+                    VARIATION_SOURCE_METADATA_KEY,
+                    PRIMARY_VARIATION_SOURCE_ID,
+                )
+                operator = metadata.get(VARIATION_OPERATOR_METADATA_KEY)
+                if operator is None:
+                    operator = (
+                        "composite" if "composition_radius" in metadata else "atomic"
+                    )
+                diversity_signature = metadata.get(
+                    VARIATION_DIVERSITY_SIGNATURE_METADATA_KEY,
+                    family,
+                )
+                raw_native_rank = metadata.get(VARIATION_SOURCE_RANK_METADATA_KEY)
+                if raw_native_rank is None:
+                    native_rank = None
+                elif raw_native_rank.isascii() and raw_native_rank.isdigit():
+                    native_rank = int(raw_native_rank)
+                else:
+                    raise ValueError("variation source rank is not a decimal integer")
+                key = (parent_candidate_id, option_identity)
+                if key in eligible:
+                    raise ValueError(
+                        "variation-envelope trace repeats a parent-local option"
+                    )
+                row = {
+                    "generation": generation,
+                    "lane_id": str(lane["lane_id"]),
+                    "parent_candidate_id": parent_candidate_id,
+                    "option_id": str(option["option_id"]),
+                    "option_identity_sha256": option_identity,
+                    "child_configuration_sha256": str(
+                        option["child_configuration_sha256"]
+                    ),
+                    "phenotype_identity_sha256": str(
+                        value["phenotype_identity_sha256"]
+                    ),
+                    "family": family,
+                    "source": source,
+                    "operator": operator,
+                    "native_rank": native_rank,
+                    "diversity_signature": diversity_signature,
+                    "support_origin": support_origin,
+                    "evaluated": False,
+                    "candidate_id": None,
+                    "positive_individual_marginal": False,
+                    "individual_marginal_hypervolume": None,
+                    "admitted_to_stage_front": False,
+                    "admitted_to_final_front": False,
+                }
+                eligible[key] = row
+                stage_rows.append(row)
+
+        waves = raw_waves if type(raw_waves) is list else []
+        evaluated_keys: set[tuple[str, str]] = set()
+        for wave in waves:
+            if type(wave) is not dict:
+                raise TypeError("portfolio wave receipt must be an object")
+            parent_candidate_id = wave.get("parent_candidate_id")
+            attributions = wave.get("action_attributions")
+            if type(parent_candidate_id) is not str or type(attributions) is not list:
+                raise TypeError("portfolio wave attribution join is malformed")
+            for attribution in attributions:
+                if type(attribution) is not dict:
+                    raise TypeError("portfolio action attribution must be an object")
+                selected = attribution.get("selected_member")
+                candidate_id = attribution.get("candidate_id")
+                if type(selected) is not dict or type(candidate_id) is not str:
+                    raise TypeError("portfolio action attribution lacks its join keys")
+                option_identity = selected.get("option_identity_sha256")
+                if type(option_identity) is not str:
+                    raise TypeError("selected option identity must be a string")
+                key = (parent_candidate_id, option_identity)
+                row = eligible.get(key)
+                if row is None:
+                    raise ValueError("evaluated action is absent from the expert union")
+                if key in evaluated_keys:
+                    raise ValueError("expert-union action is evaluated more than once")
+                outcome = candidate_by_id.get(candidate_id)
+                if outcome is None:
+                    raise ValueError("expert-union action lacks its candidate outcome")
+                row.update(
+                    {
+                        "evaluated": True,
+                        "candidate_id": candidate_id,
+                        "positive_individual_marginal": bool(
+                            outcome["positive_individual_marginal"]
+                        ),
+                        "individual_marginal_hypervolume": outcome[
+                            "individual_marginal_hypervolume"
+                        ],
+                        "admitted_to_stage_front": bool(
+                            outcome["admitted_to_stage_front"]
+                        ),
+                        "admitted_to_final_front": bool(
+                            outcome["admitted_to_final_front"]
+                        ),
+                    }
+                )
+                evaluated_keys.add(key)
+
+        option_rows.extend(stage_rows)
+        generation_rows.append(
+            {
+                "generation": generation,
+                "lane_count": len(lanes),
+                "eligible_option_occurrence_count": len(stage_rows),
+                "evaluated_option_occurrence_count": len(evaluated_keys),
+                "eligible_envelope_addition_occurrence_count": sum(
+                    value["support_origin"] == "envelope_addition"
+                    for value in stage_rows
+                ),
+                "evaluated_envelope_addition_occurrence_count": sum(
+                    value["evaluated"]
+                    and value["support_origin"] == "envelope_addition"
+                    for value in stage_rows
+                ),
+            }
+        )
+
+    def grouped(field: str) -> list[dict[str, Any]]:
+        values = sorted(
+            {value[field] for value in option_rows},
+            key=lambda value: (value is None, str(value)),
+        )
+        rows: list[dict[str, Any]] = []
+        for key in values:
+            members = [value for value in option_rows if value[field] == key]
+            evaluated = [value for value in members if value["evaluated"]]
+            marginals = [
+                float(value["individual_marginal_hypervolume"])
+                for value in evaluated
+                if value["individual_marginal_hypervolume"] is not None
+            ]
+            rows.append(
+                {
+                    field: key,
+                    "eligible_option_occurrence_count": len(members),
+                    "unique_eligible_option_identity_count": len(
+                        {value["option_identity_sha256"] for value in members}
+                    ),
+                    "evaluated_option_occurrence_count": len(evaluated),
+                    "evaluation_fraction": (
+                        len(evaluated) / len(members) if members else None
+                    ),
+                    "positive_individual_marginal_count": sum(
+                        value["positive_individual_marginal"] for value in evaluated
+                    ),
+                    "stage_front_admission_count": sum(
+                        value["admitted_to_stage_front"] for value in evaluated
+                    ),
+                    "final_front_admission_count": sum(
+                        value["admitted_to_final_front"] for value in evaluated
+                    ),
+                    "median_individual_marginal_hypervolume": (
+                        None if not marginals else median(marginals)
+                    ),
+                }
+            )
+        return rows
+
+    eligible_count = len(option_rows)
+    evaluated_rows = [value for value in option_rows if value["evaluated"]]
+    trace_count = len(generation_rows)
+    return {
+        "schema_version": 1,
+        "portfolio_stage_count": portfolio_stage_count,
+        "authenticated_full_union_trace_stage_count": trace_count,
+        "authenticated_full_union_trace_stage_rate": (
+            None if portfolio_stage_count == 0 else trace_count / portfolio_stage_count
+        ),
+        "full_union_trace_available": trace_count > 0,
+        "eligible_option_occurrence_count": eligible_count,
+        "unique_eligible_option_identity_count": len(
+            {value["option_identity_sha256"] for value in option_rows}
+        ),
+        "evaluated_option_occurrence_count": len(evaluated_rows),
+        "eligible_to_evaluated_fraction": (
+            None if eligible_count == 0 else len(evaluated_rows) / eligible_count
+        ),
+        "positive_individual_marginal_count": sum(
+            value["positive_individual_marginal"] for value in evaluated_rows
+        ),
+        "stage_front_admission_count": sum(
+            value["admitted_to_stage_front"] for value in evaluated_rows
+        ),
+        "final_front_admission_count": sum(
+            value["admitted_to_final_front"] for value in evaluated_rows
+        ),
+        "generation_rows": generation_rows,
+        "support_origin_rows": grouped("support_origin"),
+        "source_rows": grouped("source"),
+        "operator_rows": grouped("operator"),
+        "family_rows": grouped("family"),
+        "native_rank_rows": grouped("native_rank"),
+        "diversity_signature_rows": grouped("diversity_signature"),
+        "full_child_configurations_authenticated_but_omitted_from_analysis": (
+            trace_count > 0
+        ),
+        "workload_identifiers_consulted": False,
+        "model_identifiers_consulted": False,
     }
 
 
@@ -5099,6 +6320,137 @@ def analyze_run(
             }
         )
 
+    stage_set_credit_rows: list[dict[str, Any]] = []
+    stage_after_by_generation = {
+        int(value["generation"]): float(value["hypervolume_after"])
+        for value in stage_rows
+    }
+    candidate_by_id = {
+        str(value["candidate_id"]): value for value in candidate_rows
+    }
+    for generation in sorted(stage_kind):
+        members = sorted(
+            (
+                value
+                for value in candidate_rows
+                if value["generation"] == generation and value["stage_sealed"]
+            ),
+            key=lambda value: str(value["candidate_id"]),
+        )
+        credit = _stage_set_credit(
+            before_points[generation],
+            [
+                (
+                    str(value["candidate_id"]),
+                    (
+                        None
+                        if value["normalized_point"] is None
+                        else tuple(float(item) for item in value["normalized_point"])
+                    ),
+                )
+                for value in members
+            ],
+            dimension=dimension,
+        )
+        expected_after = stage_after_by_generation[generation]
+        union_error = float(credit["full_union_hypervolume"]) - expected_after
+        tolerance = 256 * math.ulp(
+            max(
+                1.0,
+                abs(float(credit["full_union_hypervolume"])),
+                abs(expected_after),
+            )
+        )
+        if abs(union_error) > tolerance:
+            raise ValueError(
+                "stage candidate union does not reproduce the sealed archive utility"
+            )
+        credit["generation"] = generation
+        credit["operator_stage"] = stage_kind[generation]
+        credit["sealed_archive_hypervolume_after"] = expected_after
+        credit["candidate_union_vs_sealed_archive_error"] = union_error
+        for credit_row in credit["candidate_rows"]:
+            candidate = candidate_by_id[str(credit_row["candidate_id"])]
+            candidate["slate_leave_one_out_hypervolume"] = credit_row[
+                "slate_leave_one_out_hypervolume"
+            ]
+            candidate["positive_slate_leave_one_out"] = credit_row[
+                "positive_slate_leave_one_out"
+            ]
+            candidate["exact_stage_shapley_hypervolume"] = credit_row[
+                "exact_stage_shapley_hypervolume"
+            ]
+            candidate["positive_exact_stage_shapley"] = credit_row[
+                "positive_exact_stage_shapley"
+            ]
+            credit_row.update(
+                {
+                    "generation": generation,
+                    "operator_stage": stage_kind[generation],
+                    "operator_kind": candidate["operator_kind"],
+                    "allocation_rank": candidate["allocation_rank"],
+                    "parent_slot": candidate["parent_slot"],
+                    "individual_marginal_hypervolume": candidate[
+                        "individual_marginal_hypervolume"
+                    ],
+                    "admitted_to_stage_front": candidate[
+                        "admitted_to_stage_front"
+                    ],
+                    "admitted_to_final_front": candidate[
+                        "admitted_to_final_front"
+                    ],
+                    "dominates_any_parent": candidate["dominates_any_parent"],
+                    "better_relation_any_parent": candidate[
+                        "better_relation_any_parent"
+                    ],
+                }
+            )
+        stage_set_credit_rows.append(credit)
+
+    exact_stage_credits = [
+        value
+        for value in stage_set_credit_rows
+        if value["shapley_mode"] == "exact_subset_enumeration"
+    ]
+    all_stages_exact = len(exact_stage_credits) == len(stage_set_credit_rows)
+    set_credit = {
+        "schema_version": 1,
+        "credit_scope": "simultaneous_stage_slate_against_frozen_prior_archive",
+        "exact_shapley_max_candidates": _EXACT_SHAPLEY_MAX_CANDIDATES,
+        "stage_count": len(stage_set_credit_rows),
+        "exact_shapley_stage_count": len(exact_stage_credits),
+        "all_stages_exact_shapley": all_stages_exact,
+        "total_stage_hypervolume_gain": sum(
+            float(value["stage_hypervolume_gain"])
+            for value in stage_set_credit_rows
+        ),
+        "total_leave_one_out_sum": sum(
+            float(value["leave_one_out_sum"]) for value in stage_set_credit_rows
+        ),
+        "total_exact_shapley_sum": (
+            sum(float(value["exact_shapley_sum"]) for value in exact_stage_credits)
+            if all_stages_exact
+            else None
+        ),
+        "maximum_absolute_exact_shapley_conservation_error": (
+            None
+            if not exact_stage_credits
+            else max(
+                abs(float(value["exact_shapley_conservation_error"]))
+                for value in exact_stage_credits
+            )
+        ),
+        "maximum_absolute_candidate_union_vs_sealed_archive_error": (
+            None
+            if not stage_set_credit_rows
+            else max(
+                abs(float(value["candidate_union_vs_sealed_archive_error"]))
+                for value in stage_set_credit_rows
+            )
+        ),
+        "stage_rows": stage_set_credit_rows,
+    }
+
     rank_rows: list[dict[str, Any]] = []
     for rank in sorted(
         {
@@ -5195,6 +6547,7 @@ def analyze_run(
         stages,
         provider_backed=provider["logical_calls"] > 0,
     )
+    expert_union_support = _expert_union_support(stages, candidate_rows)
     original_rank_and_role_calibration = _original_model_rank_and_allocator_calibration(
         candidate_rows,
         selector_behavior,
@@ -5331,6 +6684,7 @@ def analyze_run(
             "trajectory": stage_rows,
         },
         "operators": operator_totals,
+        "set_credit": set_credit,
         "model_rank_calibration_semantics": (
             "legacy_resolved_k4_candidate_label_rank_not_original_k8_model_rank"
         ),
@@ -5350,7 +6704,8 @@ def analyze_run(
         ],
         "contextual_search_controller": _contextual_search_behavior(summary),
         "selector_behavior": selector_behavior,
-        "forecast_calibration": _forecast_calibration(stages, engine),
+        "expert_union_support": expert_union_support,
+        "forecast_calibration": _forecast_calibration(stages, engine, axes=axes),
         "memory_and_reflection": {
             "candidate_outputs_claiming_insights": sum(
                 value["claimed_insight_count"] > 0 for value in candidate_rows
@@ -5431,23 +6786,53 @@ def _flat_row(value: dict[str, Any]) -> dict[str, Any]:
             sort_keys=True,
             separators=(",", ":"),
         ),
-        "selector_unique_option_count": value["selector_behavior"][
-            "unique_option_count"
+        "expert_union_trace_stage_count": value["expert_union_support"][
+            "authenticated_full_union_trace_stage_count"
         ],
-        "selector_selection_mode_counts_json": json.dumps(
-            value["selector_behavior"]["selection_mode_counts"],
+        "expert_union_trace_stage_rate": value["expert_union_support"][
+            "authenticated_full_union_trace_stage_rate"
+        ],
+        "expert_union_eligible_option_occurrence_count": value["expert_union_support"][
+            "eligible_option_occurrence_count"
+        ],
+        "expert_union_evaluated_option_occurrence_count": value["expert_union_support"][
+            "evaluated_option_occurrence_count"
+        ],
+        "expert_union_eligible_to_evaluated_fraction": value["expert_union_support"][
+            "eligible_to_evaluated_fraction"
+        ],
+        "expert_union_support_json": json.dumps(
+            value["expert_union_support"],
             sort_keys=True,
             separators=(",", ":"),
         ),
-        "selector_outcome_conditioned_call_count": value["selector_behavior"][
-            "outcome_conditioned_call_count"
+        "set_credit_stage_count": value["set_credit"]["stage_count"],
+        "set_credit_exact_shapley_stage_count": value["set_credit"][
+            "exact_shapley_stage_count"
         ],
-        "selector_outcome_conditioned_forecast_universe_row_count_total": value[
-            "selector_behavior"
-        ]["outcome_conditioned_forecast_universe_row_count_total"],
-        "selector_outcome_conditioned_allocator_candidate_evaluations_total": value[
-            "selector_behavior"
-        ]["outcome_conditioned_allocator_candidate_evaluations_total"],
+        "set_credit_all_stages_exact_shapley": value["set_credit"][
+            "all_stages_exact_shapley"
+        ],
+        "set_credit_total_stage_hypervolume_gain": value["set_credit"][
+            "total_stage_hypervolume_gain"
+        ],
+        "set_credit_total_leave_one_out_sum": value["set_credit"][
+            "total_leave_one_out_sum"
+        ],
+        "set_credit_total_exact_shapley_sum": value["set_credit"][
+            "total_exact_shapley_sum"
+        ],
+        "set_credit_maximum_absolute_shapley_conservation_error": value[
+            "set_credit"
+        ]["maximum_absolute_exact_shapley_conservation_error"],
+        "set_credit_json": json.dumps(
+            value["set_credit"],
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        "selector_unique_option_count": value["selector_behavior"][
+            "unique_option_count"
+        ],
         "selector_effective_option_count": value["selector_behavior"][
             "effective_option_count"
         ],
@@ -5638,11 +7023,86 @@ def _flat_row(value: dict[str, Any]) -> dict[str, Any]:
         "forecast_direction_accuracy": value["forecast_calibration"][
             "direction_accuracy"
         ],
+        "forecast_accuracy_aggregate_scope": value["forecast_calibration"][
+            "aggregate_scope"
+        ],
+        "forecast_model_authoritative_prediction_count": value["forecast_calibration"][
+            "model_authoritative_prediction_count"
+        ],
+        "forecast_model_authoritative_known_direction_count": value[
+            "forecast_calibration"
+        ]["model_authoritative_known_direction_count"],
+        "forecast_model_authoritative_direction_accuracy": value[
+            "forecast_calibration"
+        ]["model_authoritative_direction_accuracy"],
+        "forecast_model_authoritative_improvement_precision": value[
+            "forecast_calibration"
+        ]["model_authoritative_improvement_precision"],
+        "forecast_model_authoritative_improvement_recall": value[
+            "forecast_calibration"
+        ]["model_authoritative_improvement_recall"],
+        "forecast_model_authoritative_improvement_balanced_accuracy": value[
+            "forecast_calibration"
+        ]["model_authoritative_improvement_balanced_accuracy"],
+        "forecast_model_authoritative_numeric_prediction_count": value[
+            "forecast_calibration"
+        ]["model_authoritative_numeric_prediction_count"],
+        "forecast_model_authoritative_p10_p90_coverage": value["forecast_calibration"][
+            "model_authoritative_p10_p90_coverage"
+        ],
+        "forecast_model_authoritative_mean_normalized_absolute_p50_error": value[
+            "forecast_calibration"
+        ]["model_authoritative_mean_normalized_absolute_p50_error"],
+        "forecast_model_authoritative_median_normalized_absolute_p50_error": value[
+            "forecast_calibration"
+        ]["model_authoritative_median_normalized_absolute_p50_error"],
+        "forecast_exact_projection_prediction_count": value["forecast_calibration"][
+            "exact_projection_prediction_count"
+        ],
+        "forecast_exact_projection_direction_accuracy": value["forecast_calibration"][
+            "exact_projection_direction_accuracy"
+        ],
+        "forecast_exact_projection_improvement_balanced_accuracy": value[
+            "forecast_calibration"
+        ]["exact_projection_improvement_balanced_accuracy"],
+        "forecast_exact_projection_numeric_prediction_count": value[
+            "forecast_calibration"
+        ]["exact_projection_numeric_prediction_count"],
+        "forecast_exact_projection_p10_p90_coverage": value["forecast_calibration"][
+            "exact_projection_p10_p90_coverage"
+        ],
+        "forecast_exact_projection_mean_normalized_absolute_p50_error": value[
+            "forecast_calibration"
+        ]["exact_projection_mean_normalized_absolute_p50_error"],
+        "forecast_validity_prediction_count": value["forecast_calibration"][
+            "validity_prediction_count"
+        ],
+        "forecast_validity_empirical_rate": value["forecast_calibration"][
+            "validity_empirical_rate"
+        ],
+        "forecast_validity_mean_predicted_probability": value["forecast_calibration"][
+            "validity_mean_predicted_probability"
+        ],
+        "forecast_validity_brier_score": value["forecast_calibration"][
+            "validity_brier_score"
+        ],
         "forecast_high_confidence_direction_accuracy": value["forecast_calibration"][
             "high_confidence_direction_accuracy"
         ],
         "forecast_high_confidence_direction_error_count": value["forecast_calibration"][
             "high_confidence_direction_error_count"
+        ],
+        "forecast_improvement_precision": value["forecast_calibration"][
+            "improvement_precision"
+        ],
+        "forecast_improvement_recall": value["forecast_calibration"][
+            "improvement_recall"
+        ],
+        "forecast_improvement_specificity": value["forecast_calibration"][
+            "improvement_specificity"
+        ],
+        "forecast_improvement_balanced_accuracy": value["forecast_calibration"][
+            "improvement_balanced_accuracy"
         ],
         "forecast_unknown_direction_rate": value["forecast_calibration"][
             "unknown_direction_forecast_rate"

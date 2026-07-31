@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import hashlib
 
+import pytest
+
+from agent_evolve.application import contextual_campaign_planning as planning_module
 from agent_evolve.application.contextual_search_controller import (
     ContextualSearchDelayedCredit,
     ContextualSearchLedger,
@@ -33,6 +36,12 @@ from agent_evolve.ports.contextual_search_allocation import (
     ContextualJointCountVector,
     ContextualLaneJointCountCapability,
     ContextualPortfolioAllocationRealization,
+)
+from agent_evolve.ports.portfolio_selection import (
+    pairwise_disjoint_parent_patch_pairs,
+)
+from agent_evolve.policies.variation.source_union_finite_catalog import (
+    required_source_evaluation_option_ids,
 )
 
 
@@ -228,12 +237,130 @@ def test_prospective_joint_capability_projects_before_exact_lane_slicing() -> No
         {"atomic": 2, "composite": 0},
         {"atomic": 1, "composite": 1},
     ]
+    assert [
+        value.feasibility_witness_option_identity_sha256s
+        for value in stage.slices
+    ] == [
+        capabilities[0].feasible_vectors[0].feasibility_witness_option_identity_sha256s,
+        capabilities[1].feasible_vectors[0].feasibility_witness_option_identity_sha256s,
+    ]
+    assert [
+        value.to_contract(
+            campaign_generation=5
+        ).feasibility_witness_option_identity_sha256s
+        for value in stage.slices
+    ] == [
+        capabilities[0].feasible_vectors[0].feasibility_witness_option_identity_sha256s,
+        capabilities[1].feasible_vectors[0].feasibility_witness_option_identity_sha256s,
+    ]
+
+
+def test_joint_capability_reassigns_an_unrealizable_exploration_arm() -> None:
+    source_ids = ("engine_global", "model")
+    operator_ids = ("atomic", "composite", "global")
+    source_preserving = ContextualJointCountVector(
+        source_target_counts=(("engine_global", 1), ("model", 3)),
+        operator_target_counts=(("atomic", 3), ("composite", 0), ("global", 1)),
+        feasibility_witness_option_identity_sha256s=tuple(
+            sorted(_sha(f"reassigned-a-{index}") for index in range(4))
+        ),
+    )
+    operator_preserving = ContextualJointCountVector(
+        source_target_counts=(("engine_global", 0), ("model", 4)),
+        operator_target_counts=(("atomic", 3), ("composite", 1), ("global", 0)),
+        feasibility_witness_option_identity_sha256s=tuple(
+            sorted(_sha(f"reassigned-b-{index}") for index in range(4))
+        ),
+    )
+    capability = ContextualLaneJointCountCapability(
+        slice_id="only_lane",
+        finite_contract_identity_sha256=_sha("reassigned-contract"),
+        structural_constraint_sha256=_sha("reassigned-constraint"),
+        evaluation_slots=4,
+        source_arm_ids=source_ids,
+        operator_arm_ids=operator_ids,
+        feasible_vectors=tuple(
+            sorted(
+                (source_preserving, operator_preserving),
+                key=lambda value: value.vector_sha256,
+            )
+        ),
+    )
+    query = ContextualSearchQuery(
+        campaign_scope_sha256=_sha("reassigned-campaign"),
+        wave_index=1,
+        total_portfolio_waves=3,
+        real_evaluation_slots=4,
+        available_source_ids=source_ids,
+        available_operator_ids=operator_ids,
+        incumbent_source_id="model",
+        incumbent_operator_id="atomic",
+        archive_front_size=2,
+        joint_count_capabilities=(capability,),
+    )
+    ledger = ContextualSearchLedger()
+    snapshot = ledger.snapshot(
+        campaign_scope_sha256=query.campaign_scope_sha256,
+        cutoff_wave_index_exclusive=query.wave_index,
+        available_source_ids=query.available_source_ids,
+        available_operator_ids=query.available_operator_ids,
+    )
+
+    decision = PhaseAwareContextualSearchController().decide(query, snapshot)
+
+    assert _allocation(decision, "source") == {"engine_global": 1, "model": 3}
+    assert _allocation(decision, "operator") == {
+        "atomic": 3,
+        "composite": 0,
+        "global": 1,
+    }
+    assert next(
+        value.arm_id for value in decision.source_allocations if value.exploration_slot
+    ) == "engine_global"
+    assert next(
+        value.arm_id
+        for value in decision.operator_allocations
+        if value.exploration_slot
+    ) == "global"
+    projected = {
+        value.arm_id
+        for value in decision.operator_allocations
+        if value.prospective_joint_exploration_projected
+    }
+    assert projected == {"composite", "global"}
+    decision.__post_init__()
 
 
 class _JointProjectionContext:
-    def __init__(self, contract: FiniteVariationContract) -> None:
-        self.prepared = object()
-        self.stage_request = object()
+    def __init__(
+        self,
+        contract: FiniteVariationContract,
+        *,
+        future_recombination_width: int | None = None,
+    ) -> None:
+        if future_recombination_width is None:
+            self.prepared = object()
+            self.stage_request = object()
+        else:
+            future = type(
+                "FutureStep",
+                (),
+                {
+                    "source_portfolio_generation": 1,
+                    "offspring_per_parent": future_recombination_width,
+                },
+            )()
+            self.prepared = type(
+                "Prepared",
+                (),
+                {"schedule": type("Schedule", (), {"steps": (future,)})()},
+            )()
+            current = type("CurrentStep", (), {"generation": 1})()
+            self.stage_request = type(
+                "StageRequest",
+                (),
+                {"step": current},
+            )()
         self.parent_lane = type("Lane", (), {"lane_id": "elite"})()
         self.variation = type("Variation", (), {"contract": contract})()
 
@@ -288,6 +415,7 @@ def test_finite_contract_joint_capability_rejects_impossible_source_mix() -> Non
     )
     capability = FiniteContractContextualJointCapabilityProjector(
         min_distinct_families=3,
+        operator_exposure_bounds=(("atomic", 1, 4),),
     ).project(
         _JointProjectionContext(contract),
         evaluation_slots=4,
@@ -301,10 +429,333 @@ def test_finite_contract_joint_capability_rejects_impossible_source_mix() -> Non
     assert {"engine_global": 2, "primary": 2} in source_rows
     assert {"engine_global": 3, "primary": 1} not in source_rows
     assert all(
+        dict(value.operator_target_counts)["atomic"] >= 1
+        for value in capability.feasible_vectors
+    )
+    assert all(
         record["objective_values_consulted"] is False
         and record["workload_identifiers_consulted"] is False
         for record in (value.to_record() for value in capability.feasible_vectors)
     )
+
+
+def test_joint_capability_uses_semantic_source_floor_not_fixed_representative() -> None:
+    parent = freeze_json({"a": 0, "b": 0, "d": 0})
+    parent_sha256 = typed_json_sha256(parent)
+    options = (
+        FiniteVariationOption(
+            option_id="global.clashing",
+            parent_configuration_sha256=parent_sha256,
+            child_configuration=freeze_json({"a": 1, "b": 0, "d": 0}),
+            family="global",
+            description="Global source action that clashes with primary A.",
+            metadata=(
+                ("evaluation_source", "global_restart"),
+                ("evaluation_source_minimum", "1"),
+            ),
+        ),
+        FiniteVariationOption(
+            option_id="global.compatible",
+            parent_configuration_sha256=parent_sha256,
+            child_configuration=freeze_json({"a": 0, "b": 0, "d": 1}),
+            family="global",
+            description="Compatible action from the same semantic source.",
+            metadata=(
+                ("evaluation_source", "global_restart"),
+                ("evaluation_source_minimum", "1"),
+            ),
+        ),
+        FiniteVariationOption(
+            option_id="primary.a",
+            parent_configuration_sha256=parent_sha256,
+            child_configuration=freeze_json({"a": 2, "b": 0, "d": 0}),
+            family="primary_a",
+            description="Primary A action.",
+        ),
+        FiniteVariationOption(
+            option_id="primary.b",
+            parent_configuration_sha256=parent_sha256,
+            child_configuration=freeze_json({"a": 0, "b": 2, "d": 0}),
+            family="primary_b",
+            description="Primary B action.",
+        ),
+    )
+    contract = None
+    for salt in range(256):
+        candidate = FiniteVariationContract(
+            catalog_id="semantic_source_floor_fixture",
+            catalog_version=1,
+            catalog_definition_sha256=_sha(f"semantic-floor-{salt}"),
+            parent_configuration=parent,
+            options=options,
+        )
+        if required_source_evaluation_option_ids(candidate) == ("global.clashing",):
+            contract = candidate
+            break
+    assert contract is not None
+
+    capability = FiniteContractContextualJointCapabilityProjector(
+        min_distinct_families=3,
+        require_pairwise_disjoint_parent_patches=True,
+    ).project(
+        _JointProjectionContext(contract),
+        evaluation_slots=3,
+        source_arm_ids=("global_restart", "primary"),
+        operator_arm_ids=("atomic", "composite"),
+    )
+    vector = next(
+        value
+        for value in capability.feasible_vectors
+        if dict(value.source_target_counts) == {"global_restart": 1, "primary": 2}
+        and dict(value.operator_target_counts) == {"atomic": 3, "composite": 0}
+    )
+    compatible_identity = contract.resolve("global.compatible").identity_sha256
+    clashing_identity = contract.resolve("global.clashing").identity_sha256
+    assert compatible_identity in vector.feasibility_witness_option_identity_sha256s
+    assert clashing_identity not in vector.feasibility_witness_option_identity_sha256s
+
+
+def test_pairwise_joint_capability_collapses_exact_feasibility_equivalence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Value multiplicity at one locus must not inflate exact witness search."""
+
+    path_count = 12
+    values_per_path = 8
+    parent_payload = {f"p{index:02d}": 0 for index in range(path_count)}
+    parent = freeze_json(parent_payload)
+    parent_sha256 = typed_json_sha256(parent)
+    options = []
+    for path_index in range(path_count):
+        for value in range(1, values_per_path + 1):
+            child = dict(parent_payload)
+            child[f"p{path_index:02d}"] = value
+            options.append(
+                FiniteVariationOption(
+                    option_id=f"dense.p{path_index:02d}.v{value:02d}",
+                    parent_configuration_sha256=parent_sha256,
+                    child_configuration=freeze_json(child),
+                    family="dense_atomic",
+                    description="Dense scalar-grid alternative at one locus.",
+                )
+            )
+    contract = FiniteVariationContract(
+        catalog_id="dense_pairwise_fixture",
+        catalog_version=1,
+        catalog_definition_sha256=_sha("dense-pairwise-fixture"),
+        parent_configuration=parent,
+        options=tuple(options),
+    )
+    original = planning_module.pairwise_disjoint_parent_patch_pairs
+    projected_domain_sizes: list[int] = []
+
+    def observed_pairs(active_contract, option_ids):
+        projected_domain_sizes.append(len(option_ids))
+        return original(active_contract, option_ids)
+
+    monkeypatch.setattr(
+        planning_module,
+        "pairwise_disjoint_parent_patch_pairs",
+        observed_pairs,
+    )
+    capability = FiniteContractContextualJointCapabilityProjector(
+        require_pairwise_disjoint_parent_patches=True,
+        minimum_single_path_interventions=4,
+    ).project(
+        _JointProjectionContext(contract),
+        evaluation_slots=4,
+        source_arm_ids=("primary",),
+        operator_arm_ids=("atomic",),
+    )
+
+    assert projected_domain_sizes == [path_count]
+    assert len(capability.feasible_vectors) == 1
+    witness_identities = set(
+        capability.feasible_vectors[0].feasibility_witness_option_identity_sha256s
+    )
+    witness_ids = {
+        option.option_id
+        for option in contract.options
+        if option.identity_sha256 in witness_identities
+    }
+    assert len(witness_ids) == 4
+    assert len(pairwise_disjoint_parent_patch_pairs(contract, tuple(witness_ids))) == 6
+
+
+def test_joint_capability_reserves_true_single_path_assay_independent_of_operator() -> None:
+    parent = freeze_json({"x": 0, "y": 0, "z": 0})
+    parent_sha256 = typed_json_sha256(parent)
+    contract = FiniteVariationContract(
+        catalog_id="intervention_axis_fixture",
+        catalog_version=1,
+        catalog_definition_sha256=_sha("intervention-axis-fixture"),
+        parent_configuration=parent,
+        options=(
+            FiniteVariationOption(
+                option_id="atomic.joint_a",
+                parent_configuration_sha256=parent_sha256,
+                child_configuration=freeze_json({"x": 1, "y": 1, "z": 0}),
+                family="same_declared_operator",
+                description="Declared atomic proposal with two changed paths.",
+            ),
+            FiniteVariationOption(
+                option_id="atomic.joint_b",
+                parent_configuration_sha256=parent_sha256,
+                child_configuration=freeze_json({"x": 2, "y": 2, "z": 0}),
+                family="same_declared_operator",
+                description="Second declared atomic proposal with two paths.",
+            ),
+            FiniteVariationOption(
+                option_id="atomic.single",
+                parent_configuration_sha256=parent_sha256,
+                child_configuration=freeze_json({"x": 0, "y": 0, "z": 1}),
+                family="same_declared_operator",
+                description="Declared atomic proposal with one changed path.",
+            ),
+        ),
+    )
+    capability = FiniteContractContextualJointCapabilityProjector(
+        minimum_single_path_interventions=1,
+    ).project(
+        _JointProjectionContext(contract),
+        evaluation_slots=2,
+        source_arm_ids=("primary",),
+        operator_arm_ids=("atomic",),
+    )
+
+    assert capability.minimum_single_path_interventions == 1
+    assert len(capability.feasible_vectors) == 1
+    assert contract.resolve("atomic.single").identity_sha256 in (
+        capability.feasible_vectors[0].feasibility_witness_option_identity_sha256s
+    )
+    assert capability.to_record()["intervention_axis"] == (
+        "exact_parent_relative_changed_json_path_count"
+    )
+
+
+def test_joint_capability_reserves_registered_future_recombination_opportunities() -> None:
+    parent = freeze_json({"a": 0, "b": 0, "c": 0})
+    parent_sha256 = typed_json_sha256(parent)
+    contract = FiniteVariationContract(
+        catalog_id="offspring_opportunity_fixture",
+        catalog_version=1,
+        catalog_definition_sha256=_sha("offspring-opportunity-fixture"),
+        parent_configuration=parent,
+        options=(
+            FiniteVariationOption(
+                option_id="action.a1",
+                parent_configuration_sha256=parent_sha256,
+                child_configuration=freeze_json({"a": 1, "b": 0, "c": 0}),
+                family="same_family",
+                description="First action on A.",
+            ),
+            FiniteVariationOption(
+                option_id="action.a2",
+                parent_configuration_sha256=parent_sha256,
+                child_configuration=freeze_json({"a": 2, "b": 0, "c": 0}),
+                family="same_family",
+                description="Second action on A.",
+            ),
+            FiniteVariationOption(
+                option_id="action.b",
+                parent_configuration_sha256=parent_sha256,
+                child_configuration=freeze_json({"a": 0, "b": 1, "c": 0}),
+                family="same_family",
+                description="Action on B.",
+            ),
+            FiniteVariationOption(
+                option_id="action.c",
+                parent_configuration_sha256=parent_sha256,
+                child_configuration=freeze_json({"a": 0, "b": 0, "c": 1}),
+                family="same_family",
+                description="Action on C.",
+            ),
+        ),
+    )
+    capability = FiniteContractContextualJointCapabilityProjector(
+        protect_future_recombination_opportunities=True,
+    ).project(
+        _JointProjectionContext(contract, future_recombination_width=2),
+        evaluation_slots=3,
+        source_arm_ids=("primary",),
+        operator_arm_ids=("atomic",),
+    )
+
+    assert capability.minimum_disjoint_parent_patch_pairs == 2
+    identity_to_option = {
+        option.identity_sha256: option.option_id for option in contract.options
+    }
+    for vector in capability.feasible_vectors:
+        witness = tuple(
+            identity_to_option[value]
+            for value in vector.feasibility_witness_option_identity_sha256s
+        )
+        assert len(pairwise_disjoint_parent_patch_pairs(contract, witness)) >= 2
+    assert capability.to_record()["offspring_opportunity_axis"] == (
+        "pairwise_disjoint_parent_relative_patch_pairs"
+    )
+
+
+def test_joint_capability_continues_after_unrepairable_base_signature_set() -> None:
+    parent = freeze_json({"x": 0, "y": 0, "z": 0})
+    parent_sha256 = typed_json_sha256(parent)
+    contract = FiniteVariationContract(
+        catalog_id="offspring_opportunity_signature_recourse_fixture",
+        catalog_version=1,
+        catalog_definition_sha256=_sha("offspring-signature-recourse"),
+        parent_configuration=parent,
+        options=(
+            FiniteVariationOption(
+                option_id="family_a.x",
+                parent_configuration_sha256=parent_sha256,
+                child_configuration=freeze_json({"x": 1, "y": 0, "z": 0}),
+                family="family_a",
+                description="First action on X.",
+            ),
+            FiniteVariationOption(
+                option_id="family_b.x",
+                parent_configuration_sha256=parent_sha256,
+                child_configuration=freeze_json({"x": 2, "y": 0, "z": 0}),
+                family="family_b",
+                description="Second family action on X.",
+            ),
+            FiniteVariationOption(
+                option_id="family_c.xy",
+                parent_configuration_sha256=parent_sha256,
+                child_configuration=freeze_json({"x": 3, "y": 1, "z": 0}),
+                family="family_c",
+                description="Joint action overlapping both early signatures.",
+            ),
+            FiniteVariationOption(
+                option_id="family_d.z",
+                parent_configuration_sha256=parent_sha256,
+                child_configuration=freeze_json({"x": 0, "y": 0, "z": 1}),
+                family="family_d",
+                description="Later signature that restores two pair opportunities.",
+            ),
+        ),
+    )
+    capability = FiniteContractContextualJointCapabilityProjector(
+        min_distinct_families=3,
+        minimum_single_path_interventions=1,
+        protect_future_recombination_opportunities=True,
+    ).project(
+        _JointProjectionContext(contract, future_recombination_width=2),
+        evaluation_slots=3,
+        source_arm_ids=("primary",),
+        operator_arm_ids=("atomic",),
+    )
+
+    assert len(capability.feasible_vectors) == 1
+    identity_to_option = {
+        option.identity_sha256: option.option_id for option in contract.options
+    }
+    witness = tuple(
+        identity_to_option[value]
+        for value in capability.feasible_vectors[0].feasibility_witness_option_identity_sha256s
+    )
+    assert "family_d.z" in witness
+    assert len(pairwise_disjoint_parent_patch_pairs(contract, witness)) >= 2
 
 
 def test_sealed_outcomes_reallocate_and_terminal_removes_information_slot() -> None:
@@ -359,7 +810,10 @@ def test_sealed_outcomes_reallocate_and_terminal_removes_information_slot() -> N
         expansion_snapshot,
     )
     assert expansion.phase is SearchPhase.BASIN_EXPANSION
-    assert _allocation(expansion, "source") == {"engine_global": 2, "model": 2}
+    # Exploitation follows observed archive return; the zero-return source and
+    # operator retain exactly one nonterminal uncertainty slot, not a second
+    # pseudo-prior allocation.
+    assert _allocation(expansion, "source") == {"engine_global": 1, "model": 3}
     assert _allocation(expansion, "operator") == {"atomic": 3, "composite": 1}
 
     terminal_query = _query(3)
@@ -374,8 +828,8 @@ def test_sealed_outcomes_reallocate_and_terminal_removes_information_slot() -> N
         terminal_snapshot,
     )
     assert terminal.phase is SearchPhase.TERMINAL_CONVERSION
-    assert _allocation(terminal, "source") == {"engine_global": 1, "model": 3}
-    assert _allocation(terminal, "operator") == {"atomic": 3, "composite": 1}
+    assert _allocation(terminal, "source") == {"engine_global": 0, "model": 4}
+    assert _allocation(terminal, "operator") == {"atomic": 4, "composite": 0}
     assert not any(value.exploration_slot for value in terminal.source_allocations)
     assert terminal.to_record()["terminal_information_bonus"] == 0.0
 

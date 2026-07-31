@@ -42,6 +42,30 @@ def _sha(value: str) -> str:
     return hashlib.sha256(value.encode("ascii")).hexdigest()
 
 
+def test_policy_frame_preserves_experiment_stratum_and_separates_identity() -> None:
+    engine_scope = ForecastCalibrationScope(
+        model_profile_sha256=_sha("model"),
+        prompt_definition_sha256=_sha("engine-prompt"),
+        selector_policy_definition_sha256=_sha("engine-selector"),
+        benchmark_sha256=_sha("benchmark"),
+        session_sha256=_sha("session"),
+    )
+
+    runtime_scope = engine_scope.for_policy_frame(
+        prompt_definition_sha256=_sha("runtime-prompt"),
+        selector_policy_definition_sha256=_sha("runtime-selector"),
+    )
+
+    assert runtime_scope.model_profile_sha256 == engine_scope.model_profile_sha256
+    assert runtime_scope.benchmark_sha256 == engine_scope.benchmark_sha256
+    assert runtime_scope.session_sha256 == engine_scope.session_sha256
+    assert runtime_scope.prompt_definition_sha256 == _sha("runtime-prompt")
+    assert runtime_scope.selector_policy_definition_sha256 == _sha(
+        "runtime-selector"
+    )
+    assert runtime_scope.scope_sha256 != engine_scope.scope_sha256
+
+
 def _action(*, wave_index: int, option_id: str) -> PortfolioActionOutcomeFeedback:
     scope = ForecastCalibrationScope(
         model_profile_sha256=_sha("model"),

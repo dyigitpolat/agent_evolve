@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: pip install -e '.[llm,dev]'
+      # The research corpus is not in this repository. Naming a path that does
+      # not exist is deliberate: it asserts the guard works, so a corpus-only
+      # test is skipped rather than failing CI on a file it was never given.
+      - name: Test
+        env:
+          AGENTEVOLVE_RESEARCH_CORPUS: /nonexistent
+        run: python -m pytest tests/ -q
+
+  stranger:
+    name: a stranger can install it and get a result
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Everything below runs from the built wheel in a clean environment, with
+      # no source tree on the path and no credentials. This is the claim the
+      # package is making, so it is the one CI checks.
+      - name: Build wheel
+        run: |
+          pip install build
+          python -m build --wheel --outdir dist/
+      - name: Install the wheel somewhere else entirely
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+      - name: Import costs nothing and exposes a small surface
+        run: |
+          cd /tmp
+          /tmp/clean/bin/python -c "
+          import agent_evolve, sys
+          assert len(agent_evolve.__all__) <= 12, agent_evolve.__all__
+          loaded = [m for m in sys.modules if m.startswith('agent_evolve')]
+          assert len(loaded) < 60, len(loaded)
+          print('exports', len(agent_evolve.__all__), '| modules', len(loaded))
+          "
+      - name: The credential-free example produces a real front
+        run: |
+          mkdir -p /tmp/stranger
+          cp examples/build_flags/problem_def.py /tmp/stranger/myproblem.py
+          cd /tmp/stranger
+          env -i PATH=/usr/bin:/bin HOME=/tmp \
+            /tmp/clean/bin/agent_evolve check myproblem:problem \
+            --budget 24 --repeats 2 --baseline-only
+      - name: Asking for a model without the extra says how to fix it
+        run: |
+          cd /tmp/stranger
+          env -i PATH=/usr/bin:/bin HOME=/tmp \
+            /tmp/clean/bin/agent_evolve run myproblem:problem --budget 8 --proposer llm 2>&1 \
+            | grep -q "agent_evolve\[llm\]" \
+            && echo "actionable" \
+            || (echo "the failure did not name the fix"; exit 1)
+
+  packaging:
+    name: packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - name: Metadata is well formed
+        run: twine check dist/*
+      - name: A licence file is actually shipped
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          assert any(n.endswith("licenses/LICENSE") for n in names), names[:20]
+          assert any(n.endswith("py.typed") for n in names), "py.typed missing"
+          print("licence and py.typed present in", wheel)
+          PY

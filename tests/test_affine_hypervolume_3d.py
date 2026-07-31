@@ -4,7 +4,17 @@ from dataclasses import dataclass
 
 import pytest
 
-from agent_evolve.domain.typed_json import freeze_json, thaw_json
+from agent_evolve.application.agentic_evolution import EvolutionCandidate
+from agent_evolve.domain.ids import CandidateId
+from agent_evolve.domain.lineage import CandidateOccurrence
+from agent_evolve.domain.typed_json import (
+    freeze_json,
+    thaw_json,
+    typed_json_sha256,
+)
+from agent_evolve.policies.reward.affine_candidate_consequence_3d import (
+    AffineCandidateArchiveConsequenceUtility3D,
+)
 from agent_evolve.policies.reward.affine_hypervolume import AffineObjectiveAxis
 from agent_evolve.policies.reward.affine_hypervolume_3d import (
     AffineFrozenArchiveJointWaveReward3D,
@@ -32,6 +42,35 @@ def _spec(scale: float = 1.0) -> AffineHypervolume3DSpec:
             AffineObjectiveAxis("area", "min", 0.0, 1.2e-7),
         ),
         reference_provenance="prospectively fixed engineering envelope",
+    )
+
+
+def _evolution_candidate(
+    name: str,
+    objectives: dict[str, float],
+    *,
+    valid: bool = True,
+    operator_compliant: bool = True,
+) -> EvolutionCandidate:
+    configuration = freeze_json({"name": name})
+    return EvolutionCandidate(
+        occurrence=CandidateOccurrence(
+            candidate_id=CandidateId(f"candidate_{name}"),
+            configuration_hash=typed_json_sha256(configuration),
+            configuration_artifact_hash=typed_json_sha256(configuration),
+            proposal_sequence=1,
+        ),
+        configuration=configuration,
+        objectives=(
+            tuple((metric_id, float(value)) for metric_id, value in objectives.items())
+            if valid
+            else ()
+        ),
+        valid=valid,
+        generation=1,
+        label=name,
+        operator_compliant=operator_compliant,
+        operator_failure=None if operator_compliant else "rejected",
     )
 
 
@@ -161,3 +200,38 @@ def test_reference_envelope_audit_binds_headroom_and_fails_closed() -> None:
             ],
         }
     ]
+
+
+def test_candidate_consequence_utility_3d_admits_only_compliant_candidates() -> None:
+    utility = AffineCandidateArchiveConsequenceUtility3D(_spec())
+    admitted = _evolution_candidate(
+        "admitted",
+        {"energy": 0.10, "latency": 0.30, "area": 8.0e-8},
+    )
+    rejected = _evolution_candidate(
+        "rejected",
+        {"energy": 0.01, "latency": 0.02, "area": 1.0e-9},
+        operator_compliant=False,
+    )
+    candidates = (admitted, rejected)
+    expected = AffineHypervolumeSnapshot3D.create(
+        spec=_spec(),
+        archive_points=(admitted.objective_map,),
+    )
+
+    assert utility.utility(candidates) == expected.base_hypervolume
+    assert utility.marginal_utility(
+        candidates,
+        {"energy": 0.06, "latency": 0.40, "area": 7.0e-8},
+    ) == expected.marginal_gain(
+        {"energy": 0.06, "latency": 0.40, "area": 7.0e-8}
+    )
+    joint_points = (
+        {"energy": 0.06, "latency": 0.40, "area": 7.0e-8},
+        {"energy": 0.12, "latency": 0.20, "area": 9.0e-8},
+    )
+    assert utility.portfolio_marginal_utility(
+        candidates,
+        joint_points,
+    ) == expected.joint_gain(joint_points)
+    assert len(utility.definition_sha256) == 64

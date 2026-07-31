@@ -73,6 +73,7 @@ from .evaluator import (
     canonical_evaluation_bundle_bytes,
 )
 from .finite_variation_catalog import TimeloopV2FiniteVariationCatalog
+from .hard_feasibility import TimeloopV2HardFeasibility
 from .network_panel import NetworkLayerPanel, panel_sha256
 from .problem_def import TimeloopV2CoDesignProblem
 from .runtime_manifest import (
@@ -896,6 +897,7 @@ def compose_timeloop_v2_detailed_benchmark(
         outcome_relation=relation,
         optimization_semantics=timeloop_v2_optimization_semantics(problem),
         finite_variation_catalogs=(TimeloopV2FiniteVariationCatalog(panel),),
+        hard_feasibility=TimeloopV2HardFeasibility(panel),
     )
 
 

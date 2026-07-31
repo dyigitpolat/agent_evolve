@@ -27,6 +27,42 @@ def test_accounting_preserves_occurrences_and_exposes_cache_reuse() -> None:
     assert accounting.to_record()["cache_reuse_occurrences"] == 2
 
 
+def test_accounting_exposes_typed_operator_abstention_without_hiding_work() -> None:
+    accounting = CampaignEvaluationAccounting(
+        planned_candidate_occurrences=38,
+        minimum_candidate_occurrences=26,
+        seed_occurrences=2,
+        seed_unique_evaluations=2,
+        stage_occurrences=(8, 1, 8, 0, 8, 1),
+        stage_unique_evaluations=(8, 1, 8, 0, 8, 1),
+        candidate_occurrences=28,
+        unique_evaluations=28,
+    )
+
+    assert accounting.planned_underfill_occurrences == 10
+    assert accounting.candidate_capacity_utilization == 28 / 38
+    assert accounting.to_record()["candidate_plan_mode"] == (
+        "typed_operator_abstention_capacity_envelope"
+    )
+
+
+@pytest.mark.parametrize("candidate_occurrences", [25, 39])
+def test_accounting_rejects_occurrences_outside_capacity_envelope(
+    candidate_occurrences: int,
+) -> None:
+    with pytest.raises(ValueError, match="capacity envelope"):
+        CampaignEvaluationAccounting(
+            planned_candidate_occurrences=38,
+            minimum_candidate_occurrences=26,
+            seed_occurrences=2,
+            seed_unique_evaluations=2,
+            stage_occurrences=(candidate_occurrences - 2,),
+            stage_unique_evaluations=(candidate_occurrences - 2,),
+            candidate_occurrences=candidate_occurrences,
+            unique_evaluations=candidate_occurrences,
+        )
+
+
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
