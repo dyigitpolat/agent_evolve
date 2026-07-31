@@ -256,6 +256,7 @@ def run_evolution_loop(
     # -- Generation 0: the caller's own starting points -------------------
     # Evaluated before anything is proposed, so the run can say plainly
     # whether what it proposed beat what the caller already had.
+    seed_pareto: List[Candidate] = []
     if config.seeds:
         seed_configs = [dict(c) for c in config.seeds]
         for c in seed_configs:
@@ -270,19 +271,45 @@ def run_evolution_loop(
                     r, generation=0, authored_by=AUTHORED_BY_CALLER_SEED
                 )))
         log(f"  [seeds] {len(seed_valid)} valid, {len(seed_failed)} rejected")
+        seed_pareto = compute_pareto_front(
+            [result_to_candidate(r) for r in seed_valid], objectives
+        )
 
-    # -- Generation 1: initial sampling with regeneration ----------------
-    gen1_valid, gen1_failed, constraint_instruction = _run_initial_generation(
-        state=state,
-        constraint_instruction=constraint_instruction,
-        performance_insights=performance_insights,
-    )
+    # -- Generation 1 -----------------------------------------------------
+    # With starting points that measured, the first proposal *breeds from
+    # them*. Sampling blind here instead -- which is what this did -- threw
+    # away the one thing the caller supplied and paid to evaluate, and made
+    # the run's first batch independent of the state it was told to start
+    # from. Without seeds the behaviour is unchanged: sample, then regenerate.
+    if seed_pareto:
+        if config.use_performance_insights:
+            stats_str, pareto_str, _, _ = _performance_stats_str(
+                all_valid, objectives, state.render
+            )
+            performance_insights = call(
+                harness.performance_insights, stats_str, pareto_str, None
+            )
+        gen1_valid, gen1_failed, constraint_instruction = _run_evolution_generation(
+            state=state,
+            gen=1,
+            prev_pareto=seed_pareto,
+            constraint_instruction=constraint_instruction,
+            performance_insights=performance_insights,
+        )
+        gen1_authored_by = AUTHORED_BY_OFFSPRING_PROPOSAL
+    else:
+        gen1_valid, gen1_failed, constraint_instruction = _run_initial_generation(
+            state=state,
+            constraint_instruction=constraint_instruction,
+            performance_insights=performance_insights,
+        )
+        gen1_authored_by = AUTHORED_BY_INITIAL_PROPOSAL
 
     all_valid.extend(gen1_valid)
     all_failed.extend(gen1_failed)
     for r in gen1_valid + gen1_failed:
         all_candidates_meta.append((r, _candidate_metadata(
-            r, generation=1, authored_by=AUTHORED_BY_INITIAL_PROPOSAL
+            r, generation=1, authored_by=gen1_authored_by
         )))
 
     pareto = compute_pareto_front([result_to_candidate(r) for r in all_valid], objectives)
@@ -290,7 +317,13 @@ def run_evolution_loop(
 
     if config.use_performance_insights and gen1_valid:
         stats_str, pareto_str, _, _ = _performance_stats_str(all_valid, objectives, state.render)
-        performance_insights = call(harness.performance_insights, stats_str, pareto_str, None)
+        # Carry the seed-derived insight forward rather than restarting from
+        # nothing: the chain from a measurement to the next proposal is the
+        # mechanism under test, and dropping a link in it is not an ablation,
+        # it is a bug.
+        performance_insights = call(
+            harness.performance_insights, stats_str, pareto_str, performance_insights or None
+        )
 
     history.append(
         {

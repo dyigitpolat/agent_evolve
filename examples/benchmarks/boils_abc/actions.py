@@ -77,8 +77,14 @@ class CandidateConfig(BaseModel):
         validate_default=True,
     )
 
+    # A literal default rather than a factory. The two behave identically --
+    # pydantic copies a mutable default per instance -- but a lambda is opaque
+    # behavioural state that cannot be bound by a schema digest, so a candidate
+    # model carrying one cannot be sealed for provider-free replay. The
+    # generative path seals the schema it emitted against; this makes that
+    # possible without changing a single candidate.
     sequence: list[ActionId] = Field(
-        default_factory=lambda: list(DEFAULT_ACTION_SEQUENCE),
+        default=list(DEFAULT_ACTION_SEQUENCE),
         min_length=SEQUENCE_LENGTH,
         max_length=SEQUENCE_LENGTH,
         description=(
