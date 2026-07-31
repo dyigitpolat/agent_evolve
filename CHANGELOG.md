@@ -67,6 +67,21 @@ existence and positional arity at class-definition time.
   `--baseline-only` needs no credentials.
 - **A `random` proposer** that needs no provider, no network and no cost. It is
   both the credential-free path and the control arm.
+- **`optimize(..., seal="journal.jsonl")`** — writes one chained,
+  self-authenticating line per model call, holding the configuration that was
+  emitted, the digest of the prompt that produced it, the digest of the schema
+  it was drawn from, and the verdict `validate` returned. The run then replays
+  from that file with no provider and no credential; a drifted prompt, an
+  edited line, a broken chain, or a feasibility rule that moved since the
+  recording all fail loudly rather than falling back to a live call.
+- **`agent_evolve.proposal_mode`** — names the two ways a model can act on a
+  problem and what each seals with. `generative`: the model emits candidates
+  against `candidate_model`. `catalogue`: the engine enumerates parent-relative
+  edits and the model selects one, which certifies feasibility by construction
+  but leaves the model no way to author anything.
+  `require_matched_support` refuses to compare two arms that draw from
+  different spaces — the mistake is easy to make, because the wrong null still
+  runs and still returns an ordinary-looking number.
 - **A CLI**: `check`, `run`, `version`.
 - **CI**, and `scripts/ci-local.sh` to run the same workflow file locally.
 - **`docs/scope.md`** — where this helps and where it does not, from measured
@@ -91,6 +106,13 @@ existence and positional arity at class-definition time.
 - Environment inputs on the public path: three that affect behaviour
   (`AGENTEVOLVE_MODEL`, `AGENTEVOLVE_HARNESS`, `AGENTEVOLVE_TEMPERATURE`) plus
   two credential-safety controls.
+
+- **Seeds now seed.** `optimize()` evaluated the caller's starting points and
+  then sampled its first batch blind, so the one thing the caller supplied and
+  paid to measure had no effect on what was proposed next. With valid seeds the
+  first proposal is now bred from them, and the insight derived from them
+  carries forward instead of restarting from nothing. Runs with no seeds are
+  unchanged.
 
 ### Fixed
 

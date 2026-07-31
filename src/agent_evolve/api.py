@@ -115,6 +115,7 @@ def optimize(
     model: Optional[str] = None,
     proposer: str = "auto",
     seed: Optional[int] = None,
+    seal: Optional[str] = None,
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> SearchResult:
     """Optimize *problem* within *budget* evaluations.
@@ -123,6 +124,13 @@ def optimize(
     only sizing number the caller supplies. The problem's seeds are evaluated
     before anything is proposed, so the result always answers "did this beat
     what I already had".
+
+    *seal* names a file to write the run's proposal journal to: one chained,
+    self-authenticating line per model call, holding the exact configuration
+    that was emitted, the digest of the prompt that produced it, the digest of
+    the schema it was drawn from, and the verdict ``validate`` returned. The run
+    then replays from that file with no provider and no credential. Pass it when
+    the result has to be checkable by someone who was not there.
     """
     if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
         raise ValueError(f"budget must be a positive integer, got {budget!r}")
@@ -145,6 +153,27 @@ def optimize(
         LLMConfig(model=model or settings.model, temperature=settings.temperature),
     )
 
+    seal_handle = None
+    if seal is not None:
+        from pathlib import Path
+
+        from agent_evolve.application.generative_proposal_journal import journal_line
+        from agent_evolve.proposal_mode import build_generative_proposer
+
+        path = Path(seal)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        seal_handle = path.open("w", encoding="ascii")
+
+        def _write(record: dict) -> None:
+            seal_handle.write(journal_line(record) + "\n")
+            seal_handle.flush()
+
+        harness = build_generative_proposer(bound, delegate=harness, on_seal=_write)
+        harness.bind(
+            ctx,
+            LLMConfig(model=model or settings.model, temperature=settings.temperature),
+        )
+
     seeds = tuple(dict(c) for c in bound.seeds())
     cache = EvaluationCache()
     cache.budget = budget
@@ -157,9 +186,15 @@ def optimize(
         evaluation_budget=budget,
         evaluation_cache=cache,
     )
-    return run_evolution_loop(
-        problem=bound,
-        harness=harness,
-        config=config,
-        log=announce,
-    )
+    try:
+        return run_evolution_loop(
+            problem=bound,
+            harness=harness,
+            config=config,
+            log=announce,
+        )
+    finally:
+        # Closed even when the run raises: a journal truncated by a crash still
+        # records every call that did happen, and that is the honest artifact.
+        if seal_handle is not None:
+            seal_handle.close()

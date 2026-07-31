@@ -423,3 +423,20 @@ def test_the_sealed_harness_drives_a_whole_optimization_and_replays_it(tmp_path)
     assert replayed.best.objectives == live.best.objectives
     assert replayed.evaluations == live.evaluations
     assert replayer.terminal_sha256 == recorder.terminal_sha256
+
+
+def test_optimize_seals_the_run_when_asked(tmp_path):
+    """The public entry point can produce a checkable journal in one argument."""
+
+    from agent_evolve.api import optimize
+
+    journal = tmp_path / "journal.jsonl"
+    result = optimize(
+        Problem(), budget=6, proposer="random", seed=11, seal=str(journal)
+    )
+    assert result.evaluations > 0
+
+    summary = verify_generative_journal(journal)
+    assert summary["proposal_calls"] >= 1
+    assert summary["emitted_configurations"] >= summary["accepted_configurations"]
+    assert summary["candidate_schema_sha256s"] == [candidate_schema_sha256(Candidate)]
