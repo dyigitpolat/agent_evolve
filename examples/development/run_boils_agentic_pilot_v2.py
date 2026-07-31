@@ -218,8 +218,14 @@ def _materialize_child(index: int, replacement: str) -> dict[str, Any]:
     return child
 
 
+from examples.development.corpus_paths import resolve_corpus_path  # noqa: E402
+
+
 def _load_and_validate_legal_universe() -> tuple[bytes, dict[str, object]]:
-    payload = LEGAL_CHILD_PATH.read_bytes()
+    # Resolves the pre-split path or its archived twin. The hash check below is
+    # what makes that safe: identical bytes or a loud failure, never different
+    # evidence read quietly.
+    payload = resolve_corpus_path(LEGAL_CHILD_PATH).read_bytes()
     if _sha256_bytes(payload) != EXPECTED_LEGAL_FILE_SHA256:
         raise RuntimeError("frozen BOiLS v2 legal-child file hash changed")
     parsed = json.loads(payload)

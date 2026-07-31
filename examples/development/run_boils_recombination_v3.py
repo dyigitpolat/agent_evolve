@@ -75,6 +75,7 @@ from examples.development import run_agentic_probe as support  # noqa: E402
 from examples.development import run_boils_agentic_pilot as v1  # noqa: E402
 from examples.development import run_boils_agentic_pilot_v2 as v2  # noqa: E402
 from examples.development import run_boils_local_oracle as oracle  # noqa: E402
+from examples.development.corpus_paths import resolve_corpus_path  # noqa: E402
 
 
 MODEL = "deepseek/deepseek-v4-pro"
@@ -472,7 +473,7 @@ def verify_evidence_bundle(
         path, expected_hash = sources[name]
         if not path.is_file():
             raise RuntimeError(f"sealed evidence source is missing: {name}")
-        payload = path.read_bytes()
+        payload = resolve_corpus_path(path).read_bytes()
         observed_hash = _sha256_bytes(payload)
         if observed_hash != expected_hash:
             raise RuntimeError(f"sealed evidence source hash changed: {name}")
@@ -1811,7 +1812,7 @@ def _finalize(run_dir: Path, status: str) -> None:
         path = run_dir / name
         if not path.exists():
             continue
-        payload = path.read_bytes()
+        payload = resolve_corpus_path(path).read_bytes()
         record: dict[str, object] = {
             "bytes": len(payload),
             "sha256": _sha256_bytes(payload),

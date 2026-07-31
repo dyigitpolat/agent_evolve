@@ -15,7 +15,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.13"]
+        # The declared floor and the newest release. The floor leg is the
+        # point: it caught shipped code using BaseExceptionGroup, a 3.11
+        # builtin, while the metadata claimed 3.10.
+        python: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

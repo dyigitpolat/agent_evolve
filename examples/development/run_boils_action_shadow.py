@@ -61,6 +61,7 @@ from examples.development.boils_action_shadow_contracts import (  # noqa: E402
 from examples.development import run_agentic_probe as support  # noqa: E402
 from examples.development import run_boils_agentic_pilot as v1  # noqa: E402
 from examples.development import run_boils_agentic_pilot_v2 as v2  # noqa: E402
+from examples.development.corpus_paths import resolve_corpus_path  # noqa: E402
 
 
 MODEL = "deepseek/deepseek-v4-pro"
@@ -184,7 +185,7 @@ def hash_bind_inputs(
     records: dict[str, dict[str, object]] = {}
     for name in EXPECTED_INPUT_SHA256:
         path, expected = sources[name]
-        payload = path.read_bytes()
+        payload = resolve_corpus_path(path).read_bytes()
         observed = _sha256_bytes(payload)
         if observed != expected:
             raise RuntimeError(f"shadow sealed-input hash changed: {name}")
@@ -193,7 +194,7 @@ def hash_bind_inputs(
 
 
 def _load_nonoracle_json(path: Path, expected_sha256: str) -> dict[str, object]:
-    payload = path.read_bytes()
+    payload = resolve_corpus_path(path).read_bytes()
     if _sha256_bytes(payload) != expected_sha256:
         raise RuntimeError(f"frozen non-oracle JSON changed: {path.name}")
     parsed = json.loads(payload)
@@ -1100,7 +1101,7 @@ def _finalize(run_dir: Path, status: str) -> None:
         path = run_dir / name
         if not path.exists():
             continue
-        payload = path.read_bytes()
+        payload = resolve_corpus_path(path).read_bytes()
         record: dict[str, object] = {"bytes": len(payload), "sha256": _sha256_bytes(payload)}
         if name.endswith(".jsonl"):
             record["lines"] = len(payload.splitlines())

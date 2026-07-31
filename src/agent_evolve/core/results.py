@@ -12,6 +12,28 @@ from agent_evolve.core.problem import ObjectiveSpec, ProblemContractError
 ConfigT = TypeVar("ConfigT")
 
 
+
+@dataclass(frozen=True)
+class ProviderUsageSummary:
+    """What the run spent, so a caller can answer "what did this cost me".
+
+    Counted from the calls actually made, never declared. ``calls`` is zero for
+    an uninformed proposer, and that zero is measured: a run that made no model
+    call still reports the block rather than omitting it, because an absent
+    field cannot be told apart from an unrecorded one.
+    """
+
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: Optional[str] = None
+    model: Optional[str] = None
+
+    @property
+    def provider_free(self) -> bool:
+        return self.calls == 0
+
+
 @dataclass(frozen=True)
 class Candidate(Generic[ConfigT]):
     """A single evaluated configuration."""
@@ -48,6 +70,31 @@ class SearchResult(Generic[ConfigT]):
     history: List[Dict[str, Any]] = field(default_factory=list)
     best_per_generation: List[Candidate[ConfigT]] = field(default_factory=list)
     evaluations: int = 0
+    provider_usage: "ProviderUsageSummary | None" = None
+
+    def candidates_by_author(self) -> Dict[str, int]:
+        """How many candidates each authoring call produced.
+
+        Publish this beside any comparison that treats "the model proposed it"
+        as an arm. A count is checkable; a label is only asserted, and an arm
+        named for the component that produced it rather than the authority that
+        decided it is a mistake that survives review because the numbers still
+        look plausible.
+        """
+        counts: Dict[str, int] = {}
+        for candidate in self.all_candidates:
+            author = candidate.metadata.get("authored_by", "unrecorded")
+            counts[author] = counts.get(author, 0) + 1
+        return counts
+
+    def proposed_candidates(self) -> List[Candidate[ConfigT]]:
+        """Only what the proposer authored: the caller's own seeds excluded."""
+
+        return [
+            candidate
+            for candidate in self.all_candidates
+            if candidate.metadata.get("authored_by", "").startswith("proposer_")
+        ]
 
 
 # ------------------------------------------------------------------

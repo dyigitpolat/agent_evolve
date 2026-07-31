@@ -38,6 +38,7 @@ from examples.benchmarks.boils_abc.evaluator import (  # noqa: E402
 from examples.development import run_agentic_probe as support  # noqa: E402
 from examples.development import run_boils_agentic_pilot as v1  # noqa: E402
 from examples.development import run_boils_recombination_v3 as v3  # noqa: E402
+from examples.development.corpus_paths import resolve_corpus_path  # noqa: E402
 
 
 RUN_ID = "boils_recombination_engine_v4_20260714"
@@ -160,7 +161,7 @@ def _read_json_lines(path: Path) -> list[dict[str, object]]:
 def verify_preregistration(path: Path = PREREGISTRATION_PATH) -> dict[str, object]:
     if not path.is_file():
         raise RuntimeError("engine-v4 preregistration is missing")
-    payload = path.read_bytes()
+    payload = resolve_corpus_path(path).read_bytes()
     if (
         len(payload) != EXPECTED_PREREGISTRATION_BYTES
         or _sha256_bytes(payload) != EXPECTED_PREREGISTRATION_SHA256
@@ -254,7 +255,7 @@ def scan_unseen_children(
         paths = tuple(sorted(root.rglob("evaluations.jsonl")))
         scan_scope = "caller_supplied_recursive_root"
     for path in paths:
-        payload = path.read_bytes()
+        payload = resolve_corpus_path(path).read_bytes()
         relative = str(path.relative_to(root))
         scanned.append(
             {
@@ -297,7 +298,7 @@ def verify_failed_v3_bundle(
         path = run_dir / name
         if not path.is_file():
             raise RuntimeError(f"failed-v3 source is missing: {name}")
-        payload = path.read_bytes()
+        payload = resolve_corpus_path(path).read_bytes()
         observed_hash = _sha256_bytes(payload)
         if observed_hash != expected_hash:
             raise RuntimeError(f"failed-v3 source hash changed: {name}")
@@ -1489,7 +1490,7 @@ def _finalize(run_dir: Path, status: str) -> None:
         path = run_dir / name
         if not path.exists():
             continue
-        payload = path.read_bytes()
+        payload = resolve_corpus_path(path).read_bytes()
         files[name] = {
             "bytes": len(payload),
             "sha256": _sha256_bytes(payload),

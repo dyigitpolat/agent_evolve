@@ -52,15 +52,6 @@ RESEARCH_CORPUS = pathlib.Path(
     )
 )
 
-#: Modules that cannot even be imported without the corpus.
-_CORPUS_ONLY_MODULES = (
-    "test_run_boils_action_shadow_offline.py",
-    "test_run_boils_agentic_pilot_v2_offline.py",
-    "test_run_boils_local_oracle_offline.py",
-    "test_run_boils_recombination_engine_v4_offline.py",
-    "test_run_boils_recombination_v3_offline.py",
-)
-
 #: Text that means a test module drives the research stack rather than the
 #: shipped package. Detection is textual on purpose: several of these load a
 #: campaign script through ``spec_from_file_location`` with a computed path, so
@@ -92,16 +83,23 @@ _REQUIRED_CORPUS_FILES = ("data/boils_v2_patch_native_legal_children.json",)
 def research_corpus_available() -> bool:
     """True only when the corpus holds what the code under test actually reads.
 
-    Deliberately checks the *live* paths, not the archive. The scripts compute
-    pre-split paths, so a file that exists only under ``archive/`` is one they
-    cannot open: reporting it as available would restore exactly the failure
-    this guard exists to convert into a skip. When this returns False and the
-    directory is present, the corpus has drifted rather than gone missing --
-    see ``corpus_drift_reason()``.
+    Resolves exactly the way the loaders resolve -- live path first, then the
+    2026-07-28 archive location -- by calling the same helper they call. That
+    shared call is the point. This guard's original defect was checking
+    something *near* what the code reads (that the directory existed) instead
+    of what it reads, and a guard that resolves paths its own way would be the
+    same mistake wearing a different hat: it would drift from the loaders
+    silently, and the only symptom would be tests skipped or failed for the
+    wrong reason.
     """
     if not RESEARCH_CORPUS.is_dir():
         return False
-    return all((RESEARCH_CORPUS / rel).is_file() for rel in _REQUIRED_CORPUS_FILES)
+    from examples.development.corpus_paths import corpus_path_or_none
+
+    return all(
+        corpus_path_or_none(RESEARCH_CORPUS / rel) is not None
+        for rel in _REQUIRED_CORPUS_FILES
+    )
 
 
 def corpus_drift_reason():
@@ -124,13 +122,41 @@ def corpus_drift_reason():
     return "the research corpus is present but missing files the scripts read"
 
 
-collect_ignore = [] if research_corpus_available() else list(_CORPUS_ONLY_MODULES)
+def pytest_ignore_collect(collection_path, config):
+    """Without the corpus, do not even import a module that drives it.
+
+    This used to be a hand-written list of five module names -- the five that
+    failed in the environment it was written in, where the corpus was partly
+    present. In a genuinely corpus-free environment eleven fail, so CI was
+    always going to break on the six nobody had seen. Worse, some raise
+    RuntimeError rather than FileNotFoundError, and all of them fail during
+    *collection*, where the skip hook below cannot reach.
+
+    Deriving the set from the same research signal used to mark the tests
+    removes both problems: nothing to keep in sync, and a module added
+    tomorrow is covered the day it appears.
+    """
+    if research_corpus_available():
+        return None
+    path = pathlib.Path(str(collection_path))
+    if path.suffix == ".py" and path.name.startswith("test_") and _is_research_module(path):
+        return True
+    return None
+
+
+#: A module that talks *about* the research corpus without needing one says so
+#: with this line. Textual detection is deliberately broad, so it needs an
+#: explicit escape rather than a cleverer rule -- a test for the corpus
+#: resolver mentions every signal there is and requires none of them.
+_CORPUS_FREE_PRAGMA = "corpus-free-by-construction"
 
 
 def _is_research_module(path: pathlib.Path) -> bool:
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
+        return False
+    if _CORPUS_FREE_PRAGMA in text:
         return False
     return any(signal in text for signal in _RESEARCH_SIGNALS)
 

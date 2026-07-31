@@ -73,7 +73,11 @@ def test_role_indexed_source_closure_and_manifest_are_content_addressed(
     boolean_version = {**record, "manifest_version": True}
     with pytest.raises(LiveRuntimeManifestError, match="identity changed"):
         live_runtime_manifest_from_record(boolean_version)
-    with pytest.raises(ValueError, match="init=False"):
+    # The claim is that the sealed digest cannot be forged through replace(),
+    # not which exception the interpreter picks to say so: CPython raises
+    # ValueError up to 3.12 and TypeError from 3.13. Pinning the type made this
+    # a test of the interpreter version rather than of the manifest.
+    with pytest.raises((ValueError, TypeError), match="init=False"):
         replace(manifest, manifest_sha256="0" * 64)
 
     verify_runtime_source_closure(source)

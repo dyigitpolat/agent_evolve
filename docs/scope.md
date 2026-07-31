@@ -79,6 +79,47 @@ your problem may be one of these, and half a minute will tell you.
 About **$2.10-2.30** per 38-evaluation campaign on a mid-tier model. The
 `random` proposer costs nothing, needs no credential, and touches no network.
 
+## The check that cannot fail
+
+Most of the corrections above came from one mistake, made five times. It
+deserves a name, because naming it is the only defence that has worked.
+
+**The pattern: a check that looks like a guarantee and cannot come out any
+other way.** Not a wrong check -- a check on something *adjacent* to the claim,
+which therefore passes whether or not the claim holds.
+
+Four of the five are in the research record: a `"provider_calls": 0` written as
+a literal in a receipt, which evidences nothing because it cannot be anything
+else; a comparison against a constant that the constant guaranteed; a pooled
+statistic whose denominator dropped the declines, so abstention scored as
+success; and an aggregate check whose components cancelled, reproducing a known
+total while both halves were wrong.
+
+The fifth is the clearest, and it is in this repository. A guard was written to
+skip tests when the research corpus is absent. It checked that the corpus
+*directory* existed. Then the corpus was reorganised -- the files moved intact
+into `archive/` -- and the directory still existed, so the guard reported the
+corpus present while every file it protected was unreadable. Tests failed at
+collection again, which is precisely what the guard had been written to
+prevent. It was written by someone who had just spent a week removing the other
+four.
+
+That is the useful part. This is not carelessness, and knowing about it does
+not prevent it. It is the shape a check naturally takes when you write it
+quickly: you verify the thing that is easy to reach -- the directory, the
+constant, the total -- instead of the thing you actually depend on. The
+question that catches it is cheap and worth making a habit:
+
+> If the thing I am checking for were broken right now, would this check fail?
+
+For the corpus guard the answer was no, and one line of thought would have
+found it. The guard now resolves paths by calling the same helper the loaders
+call, so it cannot answer differently from the code it is protecting.
+
+This is also why `agent_evolve check` exists and why the `random` proposer
+ships as a first-class arm: an optimizer compared only against itself is the
+same pathology at experiment scale.
+
 ## What we cannot claim
 
 Three limits on the numbers above, stated because they bound what you should

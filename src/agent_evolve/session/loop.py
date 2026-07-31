@@ -22,6 +22,7 @@ from agent_evolve.core.formatting import (
 from agent_evolve.core.problem import ObjectiveSpec, Problem, validate_objective_specs
 from agent_evolve.core.results import (
     Candidate,
+    ProviderUsageSummary,
     SearchResult,
     compute_pareto_front,
     objective_value,
@@ -212,7 +213,12 @@ def run_evolution_loop(
     rng = random.Random(config.seed)
     retries = config.llm_retries
 
+    # Counted, never declared. A run that made no proposer call reports zero
+    # because zero was observed here, not because the field was left out.
+    proposer_calls = [0]
+
     def call(fn: Callable, *args: Any) -> Any:
+        proposer_calls[0] += 1
         return _retry(fn, args, retries, log, rate_limit_retries=config.rate_limit_retries)
 
     key_fn = getattr(problem, "candidate_key", None) or _default_candidate_key
@@ -260,7 +266,9 @@ def run_evolution_loop(
         all_valid.extend(seed_valid)
         all_failed.extend(seed_failed)
         for r in seed_valid + seed_failed:
-            all_candidates_meta.append((r, _candidate_metadata(r, generation=0)))
+            all_candidates_meta.append((r, _candidate_metadata(
+                    r, generation=0, authored_by=AUTHORED_BY_CALLER_SEED
+                )))
         log(f"  [seeds] {len(seed_valid)} valid, {len(seed_failed)} rejected")
 
     # -- Generation 1: initial sampling with regeneration ----------------
@@ -273,7 +281,9 @@ def run_evolution_loop(
     all_valid.extend(gen1_valid)
     all_failed.extend(gen1_failed)
     for r in gen1_valid + gen1_failed:
-        all_candidates_meta.append((r, _candidate_metadata(r, generation=1)))
+        all_candidates_meta.append((r, _candidate_metadata(
+            r, generation=1, authored_by=AUTHORED_BY_INITIAL_PROPOSAL
+        )))
 
     pareto = compute_pareto_front([result_to_candidate(r) for r in all_valid], objectives)
     best_per_generation.append(_snapshot_best(pareto, objectives))
@@ -322,7 +332,9 @@ def run_evolution_loop(
         all_valid.extend(gen_valid)
         all_failed.extend(gen_failed)
         for r in gen_valid + gen_failed:
-            all_candidates_meta.append((r, _candidate_metadata(r, generation=gen)))
+            all_candidates_meta.append((r, _candidate_metadata(
+                r, generation=gen, authored_by=AUTHORED_BY_OFFSPRING_PROPOSAL
+            )))
 
         pareto = compute_pareto_front([result_to_candidate(r) for r in all_valid], objectives)
         best_per_generation.append(_snapshot_best(pareto, objectives))
@@ -358,6 +370,7 @@ def run_evolution_loop(
             else sum(r.evaluation_attempted for r in (*all_valid, *all_failed))
         ),
         candidate_key=state.key_fn,
+        provider_usage=_provider_usage(harness, proposer_calls[0]),
     )
     log("")
     log(
@@ -572,10 +585,61 @@ def _pareto_as_results(pareto: Sequence[Candidate]) -> List[CandidateResult]:
     ]
 
 
-def _candidate_metadata(result: CandidateResult, *, generation: int) -> Dict[str, Any]:
-    """Preserve trace diagnostics in the public candidate ledger."""
+# Who authored a candidate's configuration. Recorded per candidate so a caller
+# can tell what the model actually produced from what it was given, without
+# inferring it from position in the loop. Inferring authorship from position is
+# how an arm gets labelled by the component that produced it rather than by the
+# authority that decided it, which is a mistake this project has made twice.
+AUTHORED_BY_CALLER_SEED = "caller_seed"
+AUTHORED_BY_INITIAL_PROPOSAL = "proposer_initial"
+AUTHORED_BY_OFFSPRING_PROPOSAL = "proposer_offspring"
+AUTHORING_CALLS = (
+    AUTHORED_BY_CALLER_SEED,
+    AUTHORED_BY_INITIAL_PROPOSAL,
+    AUTHORED_BY_OFFSPRING_PROPOSAL,
+)
+
+
+def _provider_usage(harness: Any, proposer_calls: int) -> ProviderUsageSummary:
+    """Summarise what the run spent on the proposer.
+
+    ``calls`` is always counted here. Token and cost figures come from the
+    harness when it reports them and stay ``None`` when it does not -- ``None``
+    means "this proposer does not report it", which is deliberately not the
+    same value as zero. Conflating the two is how a run that never looked comes
+    to read like a run that measured nothing spent.
+    """
+
+    reported = getattr(harness, "usage", None)
+    figures: Dict[str, Any] = {}
+    if callable(reported):
+        try:
+            value = reported()
+        except Exception:  # a harness defect must not lose the run's result
+            value = None
+        if isinstance(value, dict):
+            figures = value
+    return ProviderUsageSummary(
+        calls=proposer_calls,
+        input_tokens=int(figures.get("input_tokens") or 0),
+        output_tokens=int(figures.get("output_tokens") or 0),
+        cost_usd=figures.get("cost_usd"),
+        model=figures.get("model"),
+    )
+
+
+def _candidate_metadata(
+    result: CandidateResult, *, generation: int, authored_by: str
+) -> Dict[str, Any]:
+    """Preserve trace diagnostics and authorship in the public candidate ledger."""
+    if authored_by not in AUTHORING_CALLS:
+        raise ValueError(
+            f"authored_by must name an authoring call {AUTHORING_CALLS}, "
+            f"got {authored_by!r}"
+        )
     metadata: Dict[str, Any] = {
         "generation": generation,
+        "authored_by": authored_by,
         "valid": result.is_valid,
         "is_pareto": False,
         "evaluation_attempted": result.evaluation_attempted,
@@ -656,6 +720,7 @@ def _build_search_result(
     best_per_generation: Optional[List[Candidate]] = None,
     evaluations: int = 0,
     candidate_key: Callable[[Dict[str, Any]], str] = _default_candidate_key,
+    provider_usage: Optional[ProviderUsageSummary] = None,
 ) -> SearchResult:
     pareto_results = compute_pareto_front(
         [result_to_candidate(r) for r in all_valid], objectives
@@ -686,4 +751,5 @@ def _build_search_result(
         history=history,
         best_per_generation=list(best_per_generation or []),
         evaluations=evaluations,
+        provider_usage=provider_usage,
     )

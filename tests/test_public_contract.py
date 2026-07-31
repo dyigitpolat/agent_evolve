@@ -334,3 +334,42 @@ def test_check_names_the_model_and_its_price_before_spending():
     assert "/M in" in line and "/M out" in line
     assert _model_line("some:other-model").startswith("model some:other-model")
     assert "(default)" not in _model_line("some:other-model")
+
+
+# -- the declared Python floor is a claim, so it gets checked ---------------
+
+
+def test_the_package_runs_on_the_python_version_it_claims():
+    """A support claim nobody exercised is the same shape as a check that cannot fail.
+
+    ``requires-python`` said 3.10 while shipped code used ``BaseExceptionGroup``,
+    a 3.11 builtin. Nothing caught it until a matrix CI leg ran the floor,
+    because the only machine anyone tested on was newer than the claim.
+    """
+    import re
+    import sys
+    from pathlib import Path
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    declared = re.search(r'requires-python\s*=\s*">=(\d+)\.(\d+)"', pyproject.read_text())
+    assert declared, "pyproject declares no requires-python"
+    floor = (int(declared.group(1)), int(declared.group(2)))
+
+    # Names the shipped code uses unguarded, with the version that introduced
+    # them. Running on a newer interpreter proves nothing about the floor, so
+    # the check is against the declared floor rather than against sys.version.
+    builtins_needing = {"ExceptionGroup": (3, 11), "BaseExceptionGroup": (3, 11)}
+
+    src = Path(__file__).resolve().parents[1] / "src"
+    for name, introduced in builtins_needing.items():
+        used_in = [
+            p for p in src.rglob("*.py")
+            if re.search(rf"(?<![\w.]){name}\b", p.read_text(encoding="utf-8", errors="ignore"))
+        ]
+        if used_in:
+            assert floor >= introduced, (
+                f"{name} is used in {[str(p.name) for p in used_in]} and needs "
+                f"Python {introduced[0]}.{introduced[1]}, but requires-python "
+                f"declares {floor[0]}.{floor[1]}"
+            )
+    assert sys.version_info[:2] >= floor
