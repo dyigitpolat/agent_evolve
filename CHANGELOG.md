@@ -106,7 +106,6 @@ existence and positional arity at class-definition time.
 - Environment inputs on the public path: three that affect behaviour
   (`AGENTEVOLVE_MODEL`, `AGENTEVOLVE_HARNESS`, `AGENTEVOLVE_TEMPERATURE`) plus
   two credential-safety controls.
-
 - **Seeds now seed.** `optimize()` evaluated the caller's starting points and
   then sampled its first batch blind, so the one thing the caller supplied and
   paid to measure had no effect on what was proposed next. With valid seeds the
@@ -116,6 +115,17 @@ existence and positional arity at class-definition time.
 
 ### Fixed
 
+- **A failed measurement is now charged to the budget.** A candidate whose
+  evaluation raised was recorded as a failure and not counted, so a run
+  continued until it had accumulated `budget` *successes*, however many
+  artifacts that took, and then reported the budget as honoured. On an
+  evaluator whose failure mode is a timeout the uncharged evaluations are the
+  most expensive ones in the run.
+- **The generic prompt wording stopped describing one problem's structure.**
+  `DefaultDirectives` instructed every model on every problem to make
+  "per-dimension products EXACTLY correct" — the constraint of the single search
+  space the backbone was first written against. Problems with no dimensions and
+  no products were still told to verify them.
 - **The library no longer searches upward for a `.env`.** `load_dotenv()` with
   no argument walks up the directory tree until it finds any `.env`, so a run
   inside a monorepo silently adopted an unrelated project's credentials — and a

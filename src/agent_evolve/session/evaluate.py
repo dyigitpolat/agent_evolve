@@ -162,6 +162,13 @@ def evaluate_batch(
             try:
                 obj = bound.evaluate(artifact)
             except ValueError as exc:
+                # A measurement that failed was still a measurement. It ran the
+                # simulator, it took the wall-clock, and on a timeout it took
+                # the *most* wall-clock of anything in the batch. Not charging
+                # it let a run keep going until it had 40 successes, however
+                # many artifacts that took, and report the budget as honoured.
+                if isinstance(cache, EvaluationCache):
+                    cache.misses += 1
                 _record(
                     _failure(
                         config,

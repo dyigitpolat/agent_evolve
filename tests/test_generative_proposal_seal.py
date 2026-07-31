@@ -528,3 +528,48 @@ def test_the_default_directives_do_not_describe_one_problems_structure():
         for smuggled in ("per-dimension", "product is", "split its factors"):
             assert smuggled not in lowered, f"{smuggled!r} in generic directives"
         assert "thought_process" in text
+
+
+def test_a_failed_measurement_is_still_charged_to_the_budget():
+    """A simulator run that failed still cost the run its evaluation.
+
+    Not charging it let a campaign continue until it accumulated `budget`
+    *successes*, however many artifacts that took, and then report the budget as
+    honoured. On an evaluator whose failure mode is a timeout, the uncharged
+    evaluations are the most expensive ones in the run.
+    """
+
+    from agent_evolve.core.problem import ObjectiveSpec
+    from agent_evolve.session.evaluate import EvaluationCache, evaluate_batch
+
+    class Flaky:
+        candidate_model = Candidate
+        objectives = [ObjectiveSpec("y", "min")]
+
+        def seeds(self):
+            return ()
+
+        def validate(self, config):
+            return ValidationOutcome(True)
+
+        def materialize(self, config):
+            return dict(config)
+
+        def evaluate(self, artifact):
+            if artifact["x"] >= 5:
+                raise ValueError("simulator timed out")
+            return {"y": float(artifact["x"])}
+
+    cache = EvaluationCache()
+    cache.budget = 4
+    valid, failed, _ = evaluate_batch(
+        Flaky(),
+        [{"x": i} for i in (9, 8, 1, 2, 3)],
+        list(Flaky().objectives),
+        cache=cache,
+    )
+    assert len(failed) >= 2
+    assert cache.misses == 4, cache.misses
+    assert cache.exhausted()
+    # The fifth candidate is refused for budget, not measured.
+    assert any(r.failure_phase == "budget" for r in failed)
