@@ -302,6 +302,7 @@ from agent_evolve.application.finite_variation_eligibility import (
     exact_configuration_phenotype_bindings,
 )
 from agent_evolve.application.portfolio_evolution import (
+    ProviderTrafficWitness,
     EXACT_MEMORY_CONTEXT_PROJECTION_DEFINITION_SHA256,
     PORTFOLIO_MATERIALIZATION_POLICY_ID,
     PORTFOLIO_MATERIALIZATION_POLICY_VERSION,
@@ -1714,6 +1715,7 @@ def compose_portfolio_evolution(
     structured_output_budget_policy: StructuredOutputBudgetPolicy | None = None,
     temperature: float | None = 0.2,
     treatment_compliance_policy: TreatmentCompliancePolicy | None = None,
+    provider_traffic_witness: "ProviderTrafficWitness | None" = None,
 ) -> PortfolioEvolutionComposition:
     """Compose ranked finite-option evolution without an optimizer surrogate.
 
@@ -1794,6 +1796,7 @@ def compose_portfolio_evolution(
         selector=selector,
         ids=ids,
         memory=active_memory,
+        provider_traffic_witness=provider_traffic_witness,
     )
     return PortfolioEvolutionComposition(
         benchmark=benchmark,

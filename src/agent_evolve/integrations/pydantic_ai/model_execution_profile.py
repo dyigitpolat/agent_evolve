@@ -431,6 +431,32 @@ GPT_5_6_SOL_OPENAI_XHIGH = OpenRouterModelExecutionProfile(
 )
 
 
+GPT_5_6_LUNA_OPENAI_XHIGH = OpenRouterModelExecutionProfile(
+    profile_id="gpt_5_6_luna_openai_xhigh",
+    profile_version=1,
+    requested_model="openai/gpt-5.6-luna",
+    accepted_resolved_models=("openai/gpt-5.6-luna",),
+    provider_only=("openai",),
+    accepted_resolved_providers=("OpenAI",),
+    max_output_tokens=128_000,
+    reasoning_effort="xhigh",
+    # The pinned first-party endpoint does not advertise temperature.
+    temperature=None,
+    structured_output_mode=(
+        OpenRouterStructuredOutputMode.NATIVE_JSON_SCHEMA
+    ),
+    structured_output_strict=True,
+    json_schema_dialect=(
+        OpenRouterJsonSchemaDialect.OPENAI_STRICT_BOUNDED_TEXT_V1
+    ),
+    # Same OpenRouter spelling bridge as the sibling OpenAI route: the endpoint
+    # advertises ``max_tokens`` while the maintained transport emits
+    # ``max_completion_tokens``. Routing stays pinned to OpenAI, fallbacks
+    # forbidden.
+    provider_require_parameters=False,
+)
+
+
 GPT_OSS_120B_GROQ_HIGH = OpenRouterModelExecutionProfile(
     profile_id="gpt_oss_120b_groq_high",
     profile_version=7,
@@ -509,6 +535,7 @@ OPENROUTER_MODEL_EXECUTION_PROFILES = {
     "deepseek": DEEPSEEK_V4_PRO_STREAMLAKE_XHIGH,
     "gpt_oss_120b": GPT_OSS_120B_GROQ_HIGH,
     "gpt_oss_20b": GPT_OSS_20B_GROQ_HIGH,
+    "gpt_luna": GPT_5_6_LUNA_OPENAI_XHIGH,
     "gpt_sol": GPT_5_6_SOL_OPENAI_XHIGH,
     "mistral": MISTRAL_LARGE_3_MISTRAL,
     "qwen": QWEN_3_7_MAX_ALIBABA_XHIGH,

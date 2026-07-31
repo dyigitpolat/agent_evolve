@@ -112,6 +112,9 @@ from agent_evolve.application.campaign_evidence_registry import (  # noqa: E402
 from agent_evolve.application.action_forecast_partitioning import (  # noqa: E402
     ConcurrentActionForecastWave,
 )
+from agent_evolve.application.composition_portfolio_selection import (
+    CompositionPortfolioSelectionPolicy,
+)
 from agent_evolve.application.outcome_conditioned_portfolio_selection import (  # noqa: E402
     OUTCOME_CONDITIONED_PORTFOLIO_POLICY_DEFINITION_SHA256,
     OutcomeConditionedPortfolioSelectionPolicy,
@@ -449,6 +452,7 @@ from examples.benchmarks.boils_abc.global_restart_catalog import (  # noqa: E402
 from agent_evolve.policies.variation.source_union_finite_catalog import (  # noqa: E402
     SourceUnionFiniteVariationCatalog,
 )
+from agent_evolve.provider_accounting import measure_provider_usage  # noqa: E402
 from examples.development.durable_run_artifacts import (  # noqa: E402
     BatchedDurableJsonlJournal,
     DurableJsonlJournal,
@@ -477,10 +481,14 @@ PORTFOLIO_SELECTOR_MODE = os.environ.get(
     "AGENT_EVOLVE_PORTFOLIO_SELECTOR_MODE",
     "calibrated",
 )
-if PORTFOLIO_SELECTOR_MODE not in {"calibrated", "outcome_conditioned"}:
+if PORTFOLIO_SELECTOR_MODE not in {
+    "calibrated",
+    "outcome_conditioned",
+    "composition",
+}:
     raise ValueError(
-        "AGENT_EVOLVE_PORTFOLIO_SELECTOR_MODE must be calibrated or "
-        "outcome_conditioned"
+        "AGENT_EVOLVE_PORTFOLIO_SELECTOR_MODE must be calibrated, "
+        "outcome_conditioned or composition"
     )
 _ACTION_FORECAST_BLOCK_ROWS_RAW = os.environ.get(
     "AGENT_EVOLVE_ACTION_FORECAST_BLOCK_ROWS",
@@ -672,8 +680,48 @@ PLANNED_UNIQUE_EVALUATIONS = REQUIRED_SEED_COUNT + PARENTS_PER_PORTFOLIO * (
     len(PORTFOLIO_GENERATIONS) * PORTFOLIO_WIDTH
     + len(RECOMBINATION_GENERATIONS) * RECOMBINATIONS_PER_PARENT
 )
+# Single source of truth for the journals this run declares. The manifest seals
+# this exact mapping and the provider-traffic witness counts from it, so a claim
+# of "no provider call" is measured against the same sinks the receipt names.
+DURABLE_JOURNALS = {
+    "preparation": "preparation.jsonl",
+    "request": "request_evidence.jsonl",
+    "output": "output_evidence.jsonl",
+    "outcome": "queue_outcomes.jsonl",
+    "outbound": "outbound_requests.jsonl",
+    "progress": "stream_progress.jsonl",
+    "wave_preparation": "wave_preparations.jsonl",
+    "campaign": "campaign_events.jsonl",
+    "engine": "engine_events.jsonl",
+}
 MAX_CACHE_REUSE_OCCURRENCES = 6
-PLANNED_LOGICAL_CALLS = 7
+# Derived from the campaign plan, term by term, so the expectation is correct
+# for every selector rather than reproducing a literal.
+#
+# The schedule (evolution_campaign._materialize_stage_accounting) plans, per
+# generation: `parents_per_portfolio_generation` agent calls on a portfolio
+# generation -- one selection call per parent WAVE, not per generation -- and
+# `reflections_per_recombination_generation` on a recombination generation that
+# carries a reflection wave.
+#
+# A provider-free selector contributes zero SELECTION calls and the expectation
+# falls by exactly those; every other scheduled call still has to appear. The
+# gate is therefore correct for a model-based selector, for a provider-free one,
+# and for a configuration with no model at all, without any of them being a
+# special case.
+REFLECTIONS_PER_RECOMBINATION_GENERATION = 1
+REFLECTION_SOURCE_GENERATIONS = (2,)
+PLANNED_SELECTION_LOGICAL_CALLS = (
+    0
+    if PORTFOLIO_SELECTOR_MODE == "composition"
+    else PARENTS_PER_PORTFOLIO * len(PORTFOLIO_GENERATIONS)
+)
+PLANNED_REFLECTION_LOGICAL_CALLS = REFLECTIONS_PER_RECOMBINATION_GENERATION * len(
+    tuple(g for g in REFLECTION_SOURCE_GENERATIONS if g in RECOMBINATION_GENERATIONS)
+)
+PLANNED_LOGICAL_CALLS = (
+    PLANNED_SELECTION_LOGICAL_CALLS + PLANNED_REFLECTION_LOGICAL_CALLS
+)
 EVALUATOR_CONCURRENCY = 8
 AGENT_CONCURRENCY = MODEL_EXECUTION_PROFILE.effective_max_connections(default=3)
 AGENT_QUEUE_CAPACITY = 8
@@ -4029,6 +4077,9 @@ def _manifest(
         "schema_version": 1,
         "run_id": run_id,
         "mode": mode,
+        # top-level so a reader can tell from the manifest alone which
+        # selector produced a result, without descending into the receipts
+        "portfolio_selector_mode": PORTFOLIO_SELECTOR_MODE,
         "created_at_utc": _utc_now(),
         "claim_boundary": {
             "workflow_development_only": True,
@@ -4320,17 +4371,7 @@ def _manifest(
         },
         "utility": _affine_spec().to_record(),
         "utility_definition_sha256": _affine_spec().definition_sha256,
-        "durable_journals": {
-            "preparation": "preparation.jsonl",
-            "request": "request_evidence.jsonl",
-            "output": "output_evidence.jsonl",
-            "outcome": "queue_outcomes.jsonl",
-            "outbound": "outbound_requests.jsonl",
-            "progress": "stream_progress.jsonl",
-            "wave_preparation": "wave_preparations.jsonl",
-            "campaign": "campaign_events.jsonl",
-            "engine": "engine_events.jsonl",
-        },
+        "durable_journals": dict(DURABLE_JOURNALS),
         "prepare_contract": {
             "credential_read": False,
             "provider_calls": 0,
@@ -4632,6 +4673,25 @@ def _is_typed_candidate_infeasible(candidate: EvolutionCandidate) -> bool:
     )
 
 
+
+class _JournalProviderTrafficWitness:
+    """Counts real provider calls from the journals this run declared.
+
+    Delegates to ``measure_provider_usage``, which raises if a declared journal
+    is absent -- a missing sink is an instrumentation fault, not a zero. That is
+    what makes a provider-free claim measurable rather than merely asserted.
+    """
+
+    __slots__ = ("_run_dir", "_declared")
+
+    def __init__(self, run_dir: Path, declared: dict[str, str]) -> None:
+        self._run_dir = run_dir
+        self._declared = dict(declared)
+
+    def observed_provider_calls(self) -> int:
+        return measure_provider_usage(self._run_dir, self._declared).provider_calls
+
+
 async def _execute(
     *,
     bundle: _Bundle,
@@ -4692,6 +4752,11 @@ async def _execute(
         selector = (
             _outcome_conditioned_selector(runner=runner, bundle=bundle)
             if PORTFOLIO_SELECTOR_MODE == "outcome_conditioned"
+            # The composition policy makes no provider call: it spans the
+            # proposal sources and draws uniformly inside them. It is wired at
+            # the same seam as the other selectors and takes no runner.
+            else CompositionPortfolioSelectionPolicy()
+            if PORTFOLIO_SELECTOR_MODE == "composition"
             else bundle.coordinator.build_selector(runner)
         )
         expected_selector_type = (
@@ -4769,6 +4834,9 @@ async def _execute(
         ),
         max_output_tokens=MAX_OUTPUT_TOKENS,
         temperature=TEMPERATURE,
+        provider_traffic_witness=_JournalProviderTrafficWitness(
+            run_dir, DURABLE_JOURNALS
+        ),
     )
     learning, evidence, identifiable_evidence_source = _production_learning_runtime(
         bundle

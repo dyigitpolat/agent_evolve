@@ -3054,14 +3054,36 @@ class PortfolioSelectionSupplementalAudit:
 
 @dataclass(frozen=True, slots=True)
 class PortfolioSelectionResult:
+    """One selection outcome and the provider evidence that produced it.
+
+    ``telemetry`` and ``provider_free`` are mutually exclusive and exactly one
+    must be present. A bare ``None`` telemetry with no assertion is rejected:
+    absence must be asserted and then measured, never inferred from a missing
+    field. A policy that reaches the provider supplies telemetry as before; a
+    policy that does not must say so, and the runtime confirms it against the
+    outbound journals rather than taking the claim on trust.
+    """
+
     decision: RankedPortfolioDecision
     telemetry: AgenticCallTelemetry | None
     supplemental_audit: PortfolioSelectionSupplementalAudit | None = None
+    provider_free: bool = False
 
     def __post_init__(self) -> None:
         if type(self.decision) is not RankedPortfolioDecision:
             raise TypeError("decision must be an exact RankedPortfolioDecision")
         self.decision.__post_init__()
+        if type(self.provider_free) is not bool:
+            raise TypeError("provider_free must be an exact bool")
+        if self.provider_free and self.telemetry is not None:
+            raise ValueError(
+                "a provider-free selection cannot also carry call telemetry"
+            )
+        if not self.provider_free and self.telemetry is None:
+            raise ValueError(
+                "selection telemetry is absent and provider_free was not "
+                "asserted; absence must be asserted, not inferred"
+            )
         if self.telemetry is not None:
             if type(self.telemetry) is not AgenticCallTelemetry:
                 raise TypeError("telemetry must be exact or None")

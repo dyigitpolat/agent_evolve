@@ -1989,6 +1989,33 @@ class MaterializedPortfolioEngine(Protocol):
     ) -> tuple[InvocationOutcome, ...]: ...
 
 
+# A distinct, non-secret constant standing where a telemetry digest would go
+# for a selection that provably made no provider call. It is not a hash of any
+# telemetry record: there is no record, and inventing one would be the
+# fabrication this design exists to prevent.
+PROVIDER_FREE_SELECTION_TELEMETRY_SHA256 = hashlib.sha256(
+    b"agent-evolve:provider-free-portfolio-selection:v1\x00"
+    b"no-provider-call-observed-over-the-selection-window"
+).hexdigest()
+
+
+@runtime_checkable
+class ProviderTrafficWitness(Protocol):
+    """Counts provider calls actually observed, for verifying a claimed zero.
+
+    The runtime reads this immediately before and after a selection. A policy
+    that asserts ``provider_free`` must leave the count unchanged; if it moved,
+    the claim was false and the wave fails loudly rather than sealing a receipt
+    that says no call happened while one did.
+
+    Implementations should count from the journals the run declared -- see
+    ``agent_evolve.provider_accounting.measure_provider_usage`` -- so that a
+    missing sink is an instrumentation fault rather than a silent zero.
+    """
+
+    def observed_provider_calls(self) -> int: ...
+
+
 @dataclass(slots=True)
 class PortfolioEvolution:
     """Execute one ranked finite portfolio as a concurrent exact wave."""
@@ -1997,6 +2024,7 @@ class PortfolioEvolution:
     selector: PortfolioSelectionPolicy
     ids: IdFactory
     memory: InsightMemoryBank | None = None
+    provider_traffic_witness: ProviderTrafficWitness | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.engine, MaterializedPortfolioEngine):
@@ -2007,6 +2035,12 @@ class PortfolioEvolution:
             raise TypeError("ids must implement IdFactory")
         if self.memory is not None and type(self.memory) is not InsightMemoryBank:
             raise TypeError("memory must be an exact InsightMemoryBank or None")
+        if self.provider_traffic_witness is not None and not isinstance(
+            self.provider_traffic_witness, ProviderTrafficWitness
+        ):
+            raise TypeError(
+                "provider_traffic_witness must implement observed_provider_calls"
+            )
 
     def _materialize_member(
         self,
@@ -2454,14 +2488,37 @@ class PortfolioEvolution:
             wave.selection_request.finite_variation_contract.identity_sha256
         )
         parent_sha256 = wave.parent.occurrence.configuration_hash
+        observed_before = (
+            self.provider_traffic_witness.observed_provider_calls()
+            if self.provider_traffic_witness is not None
+            else None
+        )
         result = await self.selector.select(wave.selection_request)
         if type(result) is not PortfolioSelectionResult:
             raise TypeError("selector must return an exact PortfolioSelectionResult")
         PortfolioSelectionResult.__post_init__(result)
-        if result.telemetry is None:
-            raise ValueError("portfolio selection requires exact call telemetry")
-        telemetry = result.telemetry
-        telemetry_sha256 = portfolio_selection_telemetry_sha256(telemetry)
+        if result.provider_free:
+            # The assertion is not taken on trust. A provider-free selection is
+            # a measured zero over the selection window, and a selector that
+            # claims one while reaching the provider fails here rather than
+            # sealing a receipt that contradicts the journals.
+            if self.provider_traffic_witness is None:
+                raise ValueError(
+                    "a provider-free selection requires a provider traffic "
+                    "witness; an unverified claim is not evidence"
+                )
+            observed_after = self.provider_traffic_witness.observed_provider_calls()
+            if observed_after != observed_before:
+                raise ValueError(
+                    "selector asserted provider_free but "
+                    f"{observed_after - observed_before} provider call(s) were "
+                    "observed during the selection window"
+                )
+            telemetry = None
+            telemetry_sha256 = PROVIDER_FREE_SELECTION_TELEMETRY_SHA256
+        else:
+            telemetry = result.telemetry
+            telemetry_sha256 = portfolio_selection_telemetry_sha256(telemetry)
         validate_ranked_portfolio_decision(wave.selection_request, result.decision)
         if (
             wave.selection_request.request_sha256 != request_sha256

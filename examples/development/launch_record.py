@@ -143,15 +143,27 @@ def _sha256_file(path: Path) -> str | None:
     return digest.hexdigest()
 
 
-def _relative_to(path: Path, root: Path | None) -> str | None:
+def _relative_to(
+    path: Path, root: Path | None, *, follow_symlinks: bool = True
+) -> str | None:
+    """Locate ``path`` under ``root``.
+
+    ``follow_symlinks=False`` answers "where does this path LIVE", not "what
+    does it point at".  The distinction decides whether a repository-internal
+    virtual environment -- a directory of symlinks into the system
+    interpreter -- is seen as an input of the campaign or as part of the
+    machine, and getting it wrong loses the dependency silently.
+    """
+
     if root is None:
         return None
     try:
-        return (
+        candidate = (
             path.resolve(strict=False)
-            .relative_to(root.resolve(strict=False))
-            .as_posix()
+            if follow_symlinks
+            else Path(os.path.abspath(path))
         )
+        return candidate.relative_to(root.resolve(strict=False)).as_posix()
     except (ValueError, OSError):
         return None
 
@@ -1123,9 +1135,20 @@ def capture_ambient_filesystem_inputs(
     truncated_hashes = False
     for raw_path, intent in sorted(recorder.ambient_paths.snapshot().items()):
         try:
-            resolved = str(Path(raw_path).resolve(strict=False))
+            literal = Path(os.path.abspath(raw_path))
+            resolved = str(literal.resolve(strict=False))
         except OSError:  # pragma: no cover - defensive
+            literal = Path(raw_path)
             resolved = raw_path
+        # A path that LIVES inside the workspace is an input of the campaign
+        # even when it points at the system interpreter.  Classifying after
+        # resolving symlinks buckets every repository-internal virtual
+        # environment as "interpreter" and drops it, which is precisely the
+        # dependency a relaunch in a fresh workspace then cannot find.
+        inside_workspace = (
+            _relative_to(literal, workspace_root, follow_symlinks=False)
+            is not None
+        )
         if intent == "write":
             counts["written"] += 1
             continue
@@ -1135,10 +1158,10 @@ def capture_ambient_filesystem_inputs(
         if resolved_run_dir is not None and resolved.startswith(resolved_run_dir):
             counts["run_directory"] += 1
             continue
-        if resolved.startswith(interpreter_roots):
+        if not inside_workspace and resolved.startswith(interpreter_roots):
             counts["interpreter"] += 1
             continue
-        path = Path(resolved)
+        path = literal if inside_workspace else Path(resolved)
         if not path.is_file():
             counts["missing"] += 1
             continue
@@ -1158,8 +1181,10 @@ def capture_ambient_filesystem_inputs(
             truncated_hashes = True
         external.append(
             {
-                "path": resolved,
-                "workspace_relative_path": _relative_to(path, workspace_root),
+                "path": str(path),
+                "workspace_relative_path": _relative_to(
+                    path, workspace_root, follow_symlinks=not inside_workspace
+                ),
                 "size_bytes": size,
                 "sha256": digest,
             }
