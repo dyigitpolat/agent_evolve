@@ -223,11 +223,29 @@ def _read_dotenv_file(resolved: Path) -> Mapping[str, Optional[str]]:
     return dotenv_values(resolved)
 
 
+def credentials_present() -> bool:
+    """True when some provider credential is available in the environment.
+
+    Used only to decide whether ``proposer="auto"`` may reach a provider. A
+    name the operator scrubbed does not count as present, so a run launched to
+    demonstrate that it made no provider call falls back to random rather than
+    quietly finding a key somewhere else.
+    """
+    scrubbed = set(scrubbed_names())
+    for name, value in os.environ.items():
+        if not value or name in scrubbed:
+            continue
+        if is_credential_name(name):
+            return True
+    return False
+
+
 __all__ = [
     "AgentEvolveSettings",
     "CredentialLoad",
     "DOTENV_PATH_VAR",
     "SCRUBBED_VAR",
+    "credentials_present",
     "enforce_scrubbed_environment",
     "is_credential_name",
     "load_credentials",

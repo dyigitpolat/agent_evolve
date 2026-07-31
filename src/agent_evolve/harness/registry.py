@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List
+from typing import Any, Callable, Dict, List
 
 from agent_evolve.harness.base import Harness
 
@@ -18,12 +18,18 @@ class HarnessRegistry:
     def register(self, harness_id: str, factory: HarnessFactory) -> None:
         self._factories[harness_id] = factory
 
-    def create(self, harness_id: str) -> Harness:
+    def create(self, harness_id: str, **kwargs: Any) -> Harness:
         if harness_id not in self._factories:
             raise KeyError(
                 f"Unknown harness '{harness_id}'. Registered: {sorted(self._factories)}"
             )
-        return self._factories[harness_id]()
+        factory = self._factories[harness_id]
+        try:
+            return factory(**kwargs) if kwargs else factory()
+        except TypeError:
+            # A factory that does not take the requested options still builds;
+            # the option was advisory (a seed, say), not part of the contract.
+            return factory()
 
     def ids(self) -> List[str]:
         return sorted(self._factories)

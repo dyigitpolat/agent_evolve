@@ -52,15 +52,19 @@ def test_pydantic_ai_and_fake_harness_agree():
 
 
 def test_optimize_accepts_an_externally_registered_harness():
+    """An out-of-tree adapter is selected by name through ``proposer``.
+
+    There is no separate ``harness`` parameter: a registered harness *is* a
+    proposer, and two parameters meaning almost the same thing is the kind of
+    surface this release exists to remove.
+    """
     harness_registry.register("offline_external", lambda: FakeHarness(default_factory))
 
     result = optimize(
         SimpleProblem(),
-        harness="offline_external",
+        budget=8,
+        proposer="offline_external",
         model="offline",
-        pop_size=4,
-        generations=2,
-        candidates_per_batch=4,
         seed=0,
     )
 

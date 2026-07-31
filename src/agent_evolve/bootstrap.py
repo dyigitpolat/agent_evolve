@@ -1,19 +1,40 @@
-"""Idempotent integration loading: in-tree harnesses + setuptools entry points.
+"""Idempotent integration loading: in-tree proposers + setuptools entry points.
 
-The core never imports ``integrations``; this module (the composition root) does,
-once per process. Out-of-tree integrations advertise themselves through the
-``agent_evolve.integrations`` entry-point group.
+The core never imports ``integrations``; this module (the composition root)
+does, once per process. Out-of-tree integrations advertise themselves through
+the ``agent_evolve.integrations`` entry-point group.
+
+A failed optional integration must not stop the others loading, but it must not
+vanish either: the reason is kept and re-reported when someone asks for a
+harness that failed to register. Swallowing it produced ``Unknown harness
+'pydantic_ai'. Registered: []`` as the only symptom of a broken install.
 """
 
 from __future__ import annotations
 
 import importlib
+from typing import Dict
 
-_INTREE = (
-    "agent_evolve.integrations.pydantic_ai",
-)
+from agent_evolve.harness.registry import harness_registry
+from agent_evolve.proposers.random_proposer import RandomProposer
+
+_INTREE = ("agent_evolve.integrations.pydantic_ai",)
 
 _loaded = False
+
+#: Import failures, kept so a missing harness can explain itself.
+load_failures: Dict[str, str] = {}
+
+
+def _register_builtin() -> None:
+    """Register proposers that have no optional dependencies."""
+    try:
+        harness_registry.create("random")
+    except KeyError:
+        harness_registry.register("random", RandomProposer)
+
+
+_register_builtin()
 
 
 def load_integrations() -> None:
@@ -22,13 +43,12 @@ def load_integrations() -> None:
     if _loaded:
         return
     _loaded = True
+    _register_builtin()
     for module in _INTREE:
         try:
             importlib.import_module(module)
-        except Exception:
-            # A broken optional integration must not prevent external adapters
-            # from loading through entry points.
-            pass
+        except Exception as exc:  # noqa: BLE001 - recorded, then reported on use
+            load_failures[module] = f"{type(exc).__name__}: {exc}"
     _load_entry_points()
 
 
@@ -44,5 +64,17 @@ def _load_entry_points() -> None:
     for ep in eps:
         try:
             ep.load()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - recorded, then reported on use
+            load_failures[getattr(ep, "name", str(ep))] = f"{type(exc).__name__}: {exc}"
+
+
+def explain_missing_harness(harness_id: str) -> str:
+    """Return a usable message for a harness that is not registered."""
+    known = sorted(harness_registry.ids()) if hasattr(harness_registry, "ids") else []
+    if not load_failures:
+        return f"Unknown proposer {harness_id!r}. Available: {known}."
+    reasons = "; ".join(f"{name} failed to load ({why})" for name, why in load_failures.items())
+    return (
+        f"Unknown proposer {harness_id!r}. Available: {known}. {reasons}. "
+        "Install the optional dependency, e.g. pip install 'agent_evolve[llm]'."
+    )

@@ -4,28 +4,53 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent_evolve"
-version = "0.2.0"
-description = "Plug-and-play LLM-driven multi-objective optimization via Pareto-guided evolution"
+version = "0.3.0"
+description = "Multi-objective optimization driven by a language model, with the chance baseline built in"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
+keywords = ["optimization", "multi-objective", "pareto", "llm", "evolutionary"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 
+# Ranges, not pins. A library that pins its dependencies exactly cannot be
+# installed alongside anything else that uses them, and pydantic in particular
+# is in half the ecosystem. Upper bounds stop at the next major only.
 dependencies = [
-    "annotated-types==0.7.0",
-    "pydantic==2.13.4",
-    "pydantic-core==2.46.4",
-    "python-dotenv",
+    "pydantic>=2.7,<3",
+    "python-dotenv>=1.0,<2",
 ]
 
 [project.optional-dependencies]
-pydantic_ai = ["pydantic-ai==1.107.1"]
-dev = ["pytest"]
-all = ["pydantic-ai==1.107.1", "pytest"]
+# The model-driven proposer. Without it the package still installs and still
+# runs -- `proposer="random"` needs no provider and no credentials.
+llm = ["pydantic-ai>=1.0,<2"]
+pydantic_ai = ["pydantic-ai>=1.0,<2"]  # previous name, kept working
+dev = ["pytest>=7", "pytest-timeout>=2"]
+all = ["pydantic-ai>=1.0,<2", "pytest>=7", "pytest-timeout>=2"]
+
+[project.scripts]
+agent_evolve = "agent_evolve.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/dyigitpolat/agent_evolve"
+Source = "https://github.com/dyigitpolat/agent_evolve"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+agent_evolve = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --import-mode=importlib"
 pythonpath = [".", "tests"]
+markers = [
+    "research: needs the research corpus, which is not part of the distribution",
+]

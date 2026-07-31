@@ -11,7 +11,7 @@ import json
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, MutableMapping, Optional, Sequence
 
 from agent_evolve.core.formatting import (
     CandidateResult,
@@ -57,6 +57,15 @@ class LoopConfig:
     #: Separate, more patient budget for provider rate-limit (HTTP 429) errors,
     #: which are transient and should not exhaust the normal retry budget.
     rate_limit_retries: int = 12
+    #: Starting configurations, evaluated before anything is proposed, so a run
+    #: can say whether what it proposed beat what the caller already had.
+    seeds: tuple = ()
+    #: Hard ceiling on artifacts measured. ``None`` means the generation
+    #: structure alone decides.
+    evaluation_budget: Optional[int] = None
+    #: Artifact-identity cache shared across the run. Supplying one makes
+    #: repeated materializations free and reports what that saved.
+    evaluation_cache: Optional[MutableMapping] = None
 
 
 def _noop_log(msg: str) -> None:
@@ -238,6 +247,22 @@ def run_evolution_loop(
         f"batch={config.candidates_per_batch}, harness={getattr(harness, 'id', '?')}"
     )
 
+    # -- Generation 0: the caller's own starting points -------------------
+    # Evaluated before anything is proposed, so the run can say plainly
+    # whether what it proposed beat what the caller already had.
+    if config.seeds:
+        seed_configs = [dict(c) for c in config.seeds]
+        for c in seed_configs:
+            state.seen.add(key_fn(c))
+        seed_valid, seed_failed, _ = evaluate_batch(
+            problem, seed_configs, objectives, cache=config.evaluation_cache
+        )
+        all_valid.extend(seed_valid)
+        all_failed.extend(seed_failed)
+        for r in seed_valid + seed_failed:
+            all_candidates_meta.append((r, _candidate_metadata(r, generation=0)))
+        log(f"  [seeds] {len(seed_valid)} valid, {len(seed_failed)} rejected")
+
     # -- Generation 1: initial sampling with regeneration ----------------
     gen1_valid, gen1_failed, constraint_instruction = _run_initial_generation(
         state=state,
@@ -267,8 +292,25 @@ def run_evolution_loop(
     )
     _emit(on_event, {"kind": "generation_complete", "gen": 1, "pareto_size": len(pareto)})
 
+    def _spent() -> int:
+        """Artifacts actually measured, which is what the budget counts."""
+        cache = config.evaluation_cache
+        misses = getattr(cache, "misses", None)
+        if misses is not None:
+            return int(misses)
+        return sum(
+            1 for r in all_valid + all_failed if getattr(r, "evaluation_attempted", False)
+        )
+
     # -- Generations 2..N: evolution from the Pareto front ---------------
     for gen in range(2, config.generations + 1):
+        if config.evaluation_budget is not None and _spent() >= config.evaluation_budget:
+            log(
+                f"  [budget] {_spent()}/{config.evaluation_budget} evaluations "
+                "spent; stopping before generation "
+                f"{gen}"
+            )
+            break
         gen_valid, gen_failed, constraint_instruction = _run_evolution_generation(
             state=state,
             gen=gen,
@@ -399,7 +441,7 @@ def _run_initial_generation(
             )
         configs = state.dedup(configs)
 
-        valid_batch, failed_batch, _ = evaluate_batch(state.problem, configs, state.objectives)
+        valid_batch, failed_batch, _ = evaluate_batch(state.problem, configs, state.objectives, cache=state.config.evaluation_cache)
         _emit_candidates(state.on_event, 1, regen_round, valid_batch, failed_batch)
 
         if failed_batch:
@@ -447,7 +489,7 @@ def _run_evolution_generation(
         )
     configs = state.dedup(configs)
 
-    valid_batch, failed_batch, _ = evaluate_batch(state.problem, configs, state.objectives)
+    valid_batch, failed_batch, _ = evaluate_batch(state.problem, configs, state.objectives, cache=state.config.evaluation_cache)
     _emit_candidates(state.on_event, gen, 0, valid_batch, failed_batch)
 
     if failed_batch:
@@ -484,7 +526,7 @@ def _run_evolution_generation(
             )
         configs = state.dedup(configs)
 
-        valid_batch, failed_batch, _ = evaluate_batch(state.problem, configs, state.objectives)
+        valid_batch, failed_batch, _ = evaluate_batch(state.problem, configs, state.objectives, cache=state.config.evaluation_cache)
         _emit_candidates(state.on_event, gen, regen_round + 1, valid_batch, failed_batch)
 
         if failed_batch:
@@ -536,6 +578,11 @@ def _candidate_metadata(result: CandidateResult, *, generation: int) -> Dict[str
 
 def _attach_failure_insights(state: _RunState, failed: List[CandidateResult]) -> None:
     if not state.config.use_failure_insights:
+        return
+    # A proposer may declare that it produces no insights. An uninformed
+    # baseline is the case that matters: one that synthesised guidance would
+    # not be uninformed, so its empty return is correct and not a fault.
+    if not getattr(state.harness, "provides_insights", True):
         return
     insights = state.call(state.harness.failure_insights, state.failed_str(failed), len(failed))
     if isinstance(insights, list) and insights:
