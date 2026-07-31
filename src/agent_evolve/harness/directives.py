@@ -12,11 +12,20 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 #: Chain-of-thought instruction, paired with a Proposal(thought_process,
-#: candidates) output type so the model reasons before committing to factors.
+#: candidates) output type so the model reasons before committing.
+#:
+#: This wording used to instruct the model to "split its factors across the
+#: levels so every per-dimension product is EXACTLY correct" -- the constraint
+#: of the one problem the backbone was first written against, shipped as if it
+#: were generic. Every other problem received an instruction about a structure
+#: it does not have. ``DefaultDirectives`` is the *problem-agnostic* wording by
+#: definition; anything specific to one search space belongs in that problem's
+#: own ``Directives``, which is exactly what the port is for.
 _COT = (
-    " First, in thought_process, reason step by step as a mental draft: for EACH dimension "
-    "work out how to split its factors across the levels so every per-dimension product is "
-    "EXACTLY correct, and verify any structural rules. Then fill candidates."
+    " First, in thought_process, reason step by step as a mental draft: state what the "
+    "measurements so far imply about which parts of the configuration matter, decide what "
+    "to change and by how much, and check each proposal against the stated constraints and "
+    "the declared schema. Then fill candidates."
 )
 
 

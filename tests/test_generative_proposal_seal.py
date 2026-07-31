@@ -503,3 +503,28 @@ def test_without_seeds_the_first_call_is_still_initial_sampling():
         ),
     )
     assert harness.calls[0].op == "generate_initial"
+
+
+def test_the_default_directives_do_not_describe_one_problems_structure():
+    """Generic wording must not smuggle in another problem's constraint.
+
+    The shipped chain-of-thought instruction told every model, on every problem,
+    to make "per-dimension products EXACTLY correct" -- a rule belonging to the
+    single search space the backbone was first written against. A problem with
+    no dimensions and no products was still told to verify them.
+    """
+
+    from agent_evolve.harness.directives import DefaultDirectives
+
+    d = DefaultDirectives()
+    composed = [
+        d.compose_initial("ctx", 3),
+        d.compose_offspring("ctx", "pareto", 3, "ci", "pi"),
+        d.compose_regenerate("ctx", "failed", 3, "ci", "pi"),
+        d.compose_regenerate_offspring("ctx", "failed", "pareto", 3, "ci", "pi"),
+    ]
+    for text in composed:
+        lowered = text.lower()
+        for smuggled in ("per-dimension", "product is", "split its factors"):
+            assert smuggled not in lowered, f"{smuggled!r} in generic directives"
+        assert "thought_process" in text
