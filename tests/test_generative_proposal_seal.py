@@ -440,3 +440,66 @@ def test_optimize_seals_the_run_when_asked(tmp_path):
     assert summary["proposal_calls"] >= 1
     assert summary["emitted_configurations"] >= summary["accepted_configurations"]
     assert summary["candidate_schema_sha256s"] == [candidate_schema_sha256(Candidate)]
+
+
+def test_seeds_are_bred_from_rather_than_ignored():
+    """The first proposal must depend on the starting points, not precede them.
+
+    The loop used to evaluate the caller's seeds and then sample its first batch
+    blind, so the one thing the caller supplied and paid to measure had no
+    effect on what was proposed next.
+    """
+
+    from agent_evolve.session.evaluate import EvaluationCache
+    from agent_evolve.session.loop import LoopConfig, run_evolution_loop
+
+    problem = Problem()
+    scripted = ScriptedProposer([[{"x": 4}], [{"x": 2}], [{"x": 0}]])
+    harness = _bind(build_generative_proposer(problem, delegate=scripted))
+
+    cache = EvaluationCache()
+    run_evolution_loop(
+        problem=problem,
+        harness=harness,
+        config=LoopConfig(
+            pop_size=1,
+            generations=2,
+            candidates_per_batch=1,
+            max_regen_rounds=0,
+            seed=5,
+            seeds=({"x": 8},),
+            evaluation_budget=4,
+            evaluation_cache=cache,
+            use_failure_insights=False,
+        ),
+    )
+
+    ops = [c.op for c in harness.calls]
+    assert "generate_initial" not in ops, ops
+    assert ops[0] == "performance_insights", ops
+    assert ops[1] == "generate_offspring", ops
+
+
+def test_without_seeds_the_first_call_is_still_initial_sampling():
+    from agent_evolve.session.evaluate import EvaluationCache
+    from agent_evolve.session.loop import LoopConfig, run_evolution_loop
+
+    problem = Problem()
+    scripted = ScriptedProposer([[{"x": 4}], [{"x": 2}]])
+    harness = _bind(build_generative_proposer(problem, delegate=scripted))
+
+    run_evolution_loop(
+        problem=problem,
+        harness=harness,
+        config=LoopConfig(
+            pop_size=1,
+            generations=1,
+            candidates_per_batch=1,
+            max_regen_rounds=0,
+            seed=5,
+            evaluation_budget=2,
+            evaluation_cache=EvaluationCache(),
+            use_failure_insights=False,
+        ),
+    )
+    assert harness.calls[0].op == "generate_initial"
