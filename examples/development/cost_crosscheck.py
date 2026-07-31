@@ -65,9 +65,14 @@ __all__ = [
     "load_price_snapshots",
     "expected_cost",
     "crosscheck",
+    "UnpriceableCall",
     "ROUNDING_TOLERANCE",
     "MATERIAL_TOLERANCE",
 ]
+
+class UnpriceableCall(ValueError):
+    """The published rates do not cover something this call reports."""
+
 
 #: Below this relative difference a disagreement is decimal rounding in the
 #: provider's own reported figure, not a finding.
@@ -92,7 +97,9 @@ class RoutePrices:
     provider: str
     prompt: Decimal
     completion: Decimal
-    input_cache_read: Decimal
+    #: ``None`` when the endpoint publishes no cached-input rate. Harmless
+    #: until a call actually reports cache reads, which is then unpriceable.
+    input_cache_read: Optional[Decimal]
     source: str
     retrieved_at_utc: Optional[str] = None
     discount: Optional[float] = None
@@ -252,12 +259,18 @@ class CrosscheckReport:
         return all(r.agrees for r in self.routes.values())
 
 
-def load_price_snapshots(root) -> dict:
-    """Load every ``*pricing_snapshot*.json`` under *root*, newest per route.
+def load_price_snapshots(root, *, newest_only: bool = False) -> dict:
+    """Load every ``*pricing_snapshot*.json`` under *root*, keyed by route.
 
-    Snapshots are dated and several may describe one route; the most recently
-    retrieved wins, because an older price for a call made later is exactly the
-    staleness this is looking for.
+    Returns **every** dated snapshot per route, newest first, because prices
+    change and a campaign sealed in July cannot be priced with a rate captured
+    in December. A charge is explained if it matches any rate we recorded for
+    that route; a charge matching none is the finding.
+
+    Using only the newest is available for callers that want to ask "are the
+    current rates what we are being charged today", but it is the wrong
+    question to ask of a sealed campaign, and answering it there produced two
+    false "stale price" findings that were only the passage of time.
     """
     found: dict = {}
     for path in sorted(pathlib.Path(root).rglob("*pricing_snapshot*.json")):
@@ -270,16 +283,22 @@ def load_price_snapshots(root) -> dict:
                 provider=endpoint["provider_name"],
                 prompt=Decimal(str(rates["prompt"])),
                 completion=Decimal(str(rates["completion"])),
-                input_cache_read=Decimal(str(rates["input_cache_read"])),
+                input_cache_read=(
+                    Decimal(str(rates["input_cache_read"]))
+                    if rates.get("input_cache_read") is not None
+                    else None
+                ),
                 source=str(path),
                 retrieved_at_utc=doc.get("retrieved_at_utc"),
                 discount=endpoint.get("discount"),
             )
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             continue
-        previous = found.get(prices.key)
-        if previous is None or (prices.retrieved_at_utc or "") >= (previous.retrieved_at_utc or ""):
-            found[prices.key] = prices
+        found.setdefault(prices.key, []).append(prices)
+    for key, values in found.items():
+        values.sort(key=lambda v: v.retrieved_at_utc or "", reverse=True)
+        if newest_only:
+            found[key] = values[:1]
     return found
 
 
@@ -289,11 +308,13 @@ def expected_cost(response: Mapping, prices: RoutePrices) -> Decimal:
     completion_tokens = int(response.get("output_tokens") or 0)
     cached = int(response.get("cache_read_tokens") or 0)
     uncached = max(prompt_tokens - cached, 0)
-    return (
-        uncached * prices.prompt
-        + cached * prices.input_cache_read
-        + completion_tokens * prices.completion
-    )
+    if cached and prices.input_cache_read is None:
+        raise UnpriceableCall(
+            f"{prices.model} @ {prices.provider} publishes no input_cache_read "
+            f"rate, but this call reports {cached} cached input tokens"
+        )
+    cache_rate = prices.input_cache_read or Decimal(0)
+    return uncached * prices.prompt + cached * cache_rate + completion_tokens * prices.completion
 
 
 def _dedup_key(response: Mapping) -> tuple:
@@ -366,12 +387,34 @@ def crosscheck(paths: Iterable, prices_by_route: Mapping) -> CrosscheckReport:
         except (ValueError, ArithmeticError):
             report.unpriceable += 1
             continue
-        prices = prices_by_route.get((model, provider))
-        if prices is None:
+        candidates = prices_by_route.get((model, provider))
+        if isinstance(candidates, RoutePrices):
+            candidates = [candidates]
+        if not candidates:
             slot = report.uncovered[(model, provider)]
             slot[0] += 1
             slot[1] += reported
             continue
+        # The rate in force when the call was made is the one that should
+        # explain it, and a sealed campaign predates today's prices. Take the
+        # recorded rate that comes closest; a call explained by none of them is
+        # the finding, and one explained by an older one is simply older.
+        implied = None
+        best = None
+        for prices in candidates:
+            try:
+                value = expected_cost(response, prices)
+            except UnpriceableCall:
+                continue
+            gap = abs(value - reported)
+            if best is None or gap < best:
+                best, implied, matched = gap, value, prices
+        if implied is None:
+            slot = report.uncovered[(model, provider)]
+            slot[0] += 1
+            slot[1] += reported
+            continue
+        prices = matched
         call = CallCost(
             model=model,
             provider=provider,
@@ -379,7 +422,7 @@ def crosscheck(paths: Iterable, prices_by_route: Mapping) -> CrosscheckReport:
             output_tokens=int(response.get("output_tokens") or 0),
             cache_read_tokens=int(response.get("cache_read_tokens") or 0),
             reported=reported,
-            expected=expected_cost(response, prices),
+            expected=implied,
             journal=journal,
             cache_recorded=response.get("cache_read_tokens") is not None,
         )
@@ -435,7 +478,8 @@ def format_report(report: CrosscheckReport) -> str:
     out.append("")
     out.append(
         "  This is not independent verification: both figures come from our own\n"
-        "  journals, so a call that was never journaled is invisible to it."
+        "  journals, so a call that was never journaled is invisible to it.\n"
+        "  Standing limitations: research_artifacts/COST_ACCOUNTING_LIMITATIONS.md"
     )
     return "\n".join(out)
 

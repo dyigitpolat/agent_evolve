@@ -71,7 +71,7 @@ def call(cost, *, inp=1000, out=500, cache=0, model="m/one", provider="P", rid=N
 def test_reasoning_tokens_are_not_charged_again(tmp_path):
     """Fitted on real data: reasoning sits inside output_tokens already."""
     write_snapshot(tmp_path)
-    prices = load_price_snapshots(tmp_path)[("m/one", "P")]
+    prices = load_price_snapshots(tmp_path)[("m/one", "P")][0]
     plain = {"input_tokens": 1000, "output_tokens": 500, "cache_read_tokens": 0}
     with_reasoning = dict(plain, reasoning_tokens=400)
     assert expected_cost(plain, prices) == expected_cost(with_reasoning, prices)
@@ -79,7 +79,7 @@ def test_reasoning_tokens_are_not_charged_again(tmp_path):
 
 def test_cache_reads_are_a_discount_on_input_not_an_addition(tmp_path):
     write_snapshot(tmp_path)
-    prices = load_price_snapshots(tmp_path)[("m/one", "P")]
+    prices = load_price_snapshots(tmp_path)[("m/one", "P")][0]
     uncached = expected_cost({"input_tokens": 1000, "output_tokens": 0, "cache_read_tokens": 0}, prices)
     cached = expected_cost({"input_tokens": 1000, "output_tokens": 0, "cache_read_tokens": 1000}, prices)
     assert cached < uncached
@@ -191,12 +191,31 @@ def test_deduplication_can_be_switched_off(tmp_path):
 # -- snapshot selection -----------------------------------------------------
 
 
-def test_the_most_recently_retrieved_snapshot_wins(tmp_path):
-    """An old price applied to a newer call is exactly the staleness sought."""
-    write_snapshot(tmp_path, retrieved="2026-07-01T00:00:00Z", prompt="0.000009", name="old.json")
-    write_snapshot(tmp_path, retrieved="2026-07-20T00:00:00Z", prompt="0.000001", name="new.json")
+def test_every_dated_snapshot_is_kept_newest_first(tmp_path):
+    """A sealed campaign cannot be priced with a rate captured afterwards.
+
+    Keeping only the newest produced two false "stale price" findings that
+    were nothing but the passage of time, so every era is retained and a
+    charge is explained if any recorded rate accounts for it.
+    """
+    write_snapshot(tmp_path, retrieved="2026-07-01T00:00:00Z", prompt="0.000009", name="old")
+    write_snapshot(tmp_path, retrieved="2026-07-20T00:00:00Z", prompt="0.000001", name="new")
     prices = load_price_snapshots(tmp_path)[("m/one", "P")]
-    assert prices.prompt == Decimal("0.000001")
+    assert [p.prompt for p in prices] == [Decimal("0.000001"), Decimal("0.000009")]
+    newest = load_price_snapshots(tmp_path, newest_only=True)[("m/one", "P")]
+    assert len(newest) == 1 and newest[0].prompt == Decimal("0.000001")
+
+
+def test_a_call_priced_at_a_superseded_rate_still_agrees(tmp_path):
+    """The StreamLake case: 84 sealed calls charged at the rate then in force."""
+    write_snapshot(tmp_path, retrieved="2026-07-01T00:00:00Z", prompt="0.000009",
+                   completion="0.000009", name="old")
+    write_snapshot(tmp_path, retrieved="2026-07-20T00:00:00Z", prompt="0.000001",
+                   completion="0.000001", name="new")
+    old_price = (Decimal(1000) + Decimal(500)) * Decimal("0.000009")
+    write_journal(tmp_path, [call(old_price, rid=f"o{i}") for i in range(4)])
+    report = crosscheck(sorted(tmp_path.rglob("*.jsonl")), load_price_snapshots(tmp_path))
+    assert report.agrees, "a charge at a superseded rate is history, not a defect"
 
 
 def test_a_malformed_snapshot_is_skipped_not_fatal(tmp_path):
@@ -233,3 +252,43 @@ def test_uncovered_spend_also_exits_non_zero_unless_acknowledged(tmp_path):
 
 def test_tolerance_is_tighter_than_any_figure_we_publish():
     assert MATERIAL_TOLERANCE <= Decimal("0.001")
+
+
+# -- endpoints that publish no cached-input rate ---------------------------
+
+
+def test_a_route_without_a_cache_rate_still_prices_uncached_calls(tmp_path):
+    """DeepInfra publishes no input_cache_read rate; the route is still priceable."""
+    from examples.development.cost_crosscheck import UnpriceableCall, expected_cost
+
+    write_snapshot(tmp_path)
+    prices = load_price_snapshots(tmp_path)[("m/one", "P")][0]
+    no_cache = type(prices)(
+        model=prices.model, provider=prices.provider, prompt=prices.prompt,
+        completion=prices.completion, input_cache_read=None, source=prices.source,
+    )
+    plain = {"input_tokens": 1000, "output_tokens": 500, "cache_read_tokens": 0}
+    assert expected_cost(plain, no_cache) == Decimal(1000) * prices.prompt + Decimal(500) * prices.completion
+    with pytest.raises(UnpriceableCall, match="input_cache_read"):
+        expected_cost({**plain, "cache_read_tokens": 10}, no_cache)
+
+
+# -- the shared collapse -----------------------------------------------------
+
+
+def test_the_dedup_key_prefers_the_provider_id(tmp_path):
+    from examples.development.cost_crosscheck import _dedup_key
+
+    a = call(Decimal("1"), rid="same")
+    b = call(Decimal("2"), inp=99, rid="same")
+    assert _dedup_key(a) == _dedup_key(b), "one provider id is one call"
+
+
+def test_without_a_provider_id_the_billed_facts_identify_the_call(tmp_path):
+    from examples.development.cost_crosscheck import _dedup_key
+
+    a = call(Decimal("1"), inp=10, out=20)
+    b = call(Decimal("1"), inp=10, out=20)
+    c = call(Decimal("1"), inp=11, out=20)
+    assert _dedup_key(a) == _dedup_key(b)
+    assert _dedup_key(a) != _dedup_key(c)
