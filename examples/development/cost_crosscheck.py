@@ -32,20 +32,38 @@ in the output.
 THE BILLING MODEL
 =================
 
-Fitted against 229 sealed calls on two routes that have price snapshots, and
-exact to the last recorded digit on both::
+Fitted against sealed calls on the routes that have price snapshots, and exact
+to the last recorded digit::
 
-    cost = (input_tokens - cache_read_tokens) * prompt_price
-         +  cache_read_tokens                 * input_cache_read_price
-         +  output_tokens                     * completion_price
+    cost = (input_tokens - cache_read_tokens - cache_write_tokens) * prompt_price
+         +  cache_read_tokens                * input_cache_read_price
+         +  cache_write_tokens               * input_cache_write_price
+         +  output_tokens                    * completion_price
 
-Two facts worth stating because guessing either way is easy and wrong:
+Three facts worth stating because guessing any of them is easy and wrong:
 
 * ``reasoning_tokens`` are **already inside** ``output_tokens``. Adding them
   again overcharges by 18-45% on reasoning-heavy calls.
 * ``cache_read_tokens`` are **a subset of** ``input_tokens``, billed at the
   cheaper cached rate, so they are subtracted from the prompt term rather than
   added alongside it.
+* ``cache_write_tokens`` are **also a subset of** ``input_tokens``, disjoint
+  from the reads, and billed **dearer** -- 1.25x ``prompt`` on every gpt-5.6
+  route measured. A first-issue prompt writes nearly all of its input to cache.
+
+The write term was missing until 2026-07-31 and its absence was material. It
+under-expected affected calls by about 10% of the charge, and because each call
+has its own read/write/plain mix it produced *scattered* per-call ratios -- the
+shape this module names as "the serious case", and which was accordingly
+misread as a provider not following its own published rates. It was a defect in
+the check, not in the charge. Adding the term takes ``openai/gpt-5.6-sol @
+OpenAI`` from 10 distinct ratios and rel 4.12e-2 to a single ratio and exact
+agreement.
+
+The lesson generalises past this module: a recomputation that omits a term the
+provider charges cannot fail in the direction of the omission, and will instead
+accuse the provider. Prefer a model that reconciles to the last digit on a route
+you understand before trusting its verdict on one you do not.
 """
 
 from __future__ import annotations
@@ -103,6 +121,10 @@ class RoutePrices:
     source: str
     retrieved_at_utc: Optional[str] = None
     discount: Optional[float] = None
+    #: ``None`` when the endpoint publishes no cache-**write** rate. Input
+    #: tokens newly written to the prompt cache are billed at this rate, which
+    #: is 1.25x ``prompt`` on every gpt-5.6 route measured so far.
+    input_cache_write: Optional[Decimal] = None
 
     @property
     def key(self) -> tuple:
@@ -121,6 +143,7 @@ class CallCost:
     reported: Decimal
     expected: Decimal
     journal: str
+    cache_write_tokens: int = 0
     #: False when the journal carries no cache-token fields. Without them the
     #: cache split is unknown and ``expected`` is an upper bound, so the call
     #: is reported separately instead of counted as a disagreement.
@@ -291,6 +314,11 @@ def load_price_snapshots(root, *, newest_only: bool = False) -> dict:
                 source=str(path),
                 retrieved_at_utc=doc.get("retrieved_at_utc"),
                 discount=endpoint.get("discount"),
+                input_cache_write=(
+                    Decimal(str(rates["input_cache_write"]))
+                    if rates.get("input_cache_write") is not None
+                    else None
+                ),
             )
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             continue
@@ -303,18 +331,43 @@ def load_price_snapshots(root, *, newest_only: bool = False) -> dict:
 
 
 def expected_cost(response: Mapping, prices: RoutePrices) -> Decimal:
-    """Cost implied by the published rates for the tokens this call reports."""
+    """Cost implied by the published rates for the tokens this call reports.
+
+    Input tokens fall into three billing classes, not two. Cache **reads** are
+    cheaper than uncached input; cache **writes** are dearer. Both are subsets
+    of ``input_tokens`` and they are disjoint, so the plain term is what is left
+    after removing each.
+
+    Omitting the write term was a real defect and it was material: it is 1.25x
+    ``prompt`` on every gpt-5.6 route, and a first-issue prompt writes nearly
+    all of its input to cache, so the check under-expected such calls by about
+    10% of the total charge. It produced *scattered* per-call ratios rather than
+    a constant one -- because each call has its own read/write/plain mix -- and
+    was accordingly misdiagnosed as a provider not following its own rates.
+    """
     prompt_tokens = int(response.get("input_tokens") or 0)
     completion_tokens = int(response.get("output_tokens") or 0)
     cached = int(response.get("cache_read_tokens") or 0)
-    uncached = max(prompt_tokens - cached, 0)
+    written = int(response.get("cache_write_tokens") or 0)
+    uncached = max(prompt_tokens - cached - written, 0)
     if cached and prices.input_cache_read is None:
         raise UnpriceableCall(
             f"{prices.model} @ {prices.provider} publishes no input_cache_read "
             f"rate, but this call reports {cached} cached input tokens"
         )
+    if written and prices.input_cache_write is None:
+        raise UnpriceableCall(
+            f"{prices.model} @ {prices.provider} publishes no input_cache_write "
+            f"rate, but this call reports {written} cache-write input tokens"
+        )
     cache_rate = prices.input_cache_read or Decimal(0)
-    return uncached * prices.prompt + cached * cache_rate + completion_tokens * prices.completion
+    write_rate = prices.input_cache_write or Decimal(0)
+    return (
+        uncached * prices.prompt
+        + cached * cache_rate
+        + written * write_rate
+        + completion_tokens * prices.completion
+    )
 
 
 def _dedup_key(response: Mapping) -> tuple:
@@ -425,6 +478,7 @@ def crosscheck(paths: Iterable, prices_by_route: Mapping) -> CrosscheckReport:
             expected=implied,
             journal=journal,
             cache_recorded=response.get("cache_read_tokens") is not None,
+            cache_write_tokens=int(response.get("cache_write_tokens") or 0),
         )
         route = report.routes.setdefault((model, provider), RouteReport(model, provider))
         route.calls += 1

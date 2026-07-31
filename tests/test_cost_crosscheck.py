@@ -22,10 +22,12 @@ from examples.development.cost_crosscheck import (
 PROMPT = "0.000001"
 COMPLETION = "0.000002"
 CACHE_READ = "0.0000001"
+CACHE_WRITE = "0.00000125"
 
 
 def write_snapshot(root, *, model="m/one", provider="P", retrieved="2026-07-15T00:00:00Z",
-                   prompt=PROMPT, completion=COMPLETION, cache_read=CACHE_READ, name=None):
+                   prompt=PROMPT, completion=COMPLETION, cache_read=CACHE_READ,
+                   cache_write=CACHE_WRITE, name=None):
     data = root / "data"
     data.mkdir(parents=True, exist_ok=True)
     # The loader globs *pricing_snapshot*.json, so every fixture must match it.
@@ -39,6 +41,7 @@ def write_snapshot(root, *, model="m/one", provider="P", retrieved="2026-07-15T0
             "provider_name": provider,
             "pricing_usd_per_token": {
                 "prompt": prompt, "completion": completion, "input_cache_read": cache_read,
+                **({"input_cache_write": cache_write} if cache_write is not None else {}),
             },
         },
     }))
@@ -84,6 +87,53 @@ def test_cache_reads_are_a_discount_on_input_not_an_addition(tmp_path):
     cached = expected_cost({"input_tokens": 1000, "output_tokens": 0, "cache_read_tokens": 1000}, prices)
     assert cached < uncached
     assert cached == Decimal(1000) * Decimal(CACHE_READ)
+
+
+def test_cache_writes_are_a_surcharge_on_input_not_free(tmp_path):
+    """The term whose absence made the check accuse the provider. See module docstring."""
+    write_snapshot(tmp_path)
+    prices = load_price_snapshots(tmp_path)[("m/one", "P")][0]
+    plain = expected_cost({"input_tokens": 1000, "output_tokens": 0}, prices)
+    written = expected_cost(
+        {"input_tokens": 1000, "output_tokens": 0, "cache_write_tokens": 1000}, prices
+    )
+    assert written > plain
+    assert written == Decimal(1000) * Decimal(CACHE_WRITE)
+
+
+def test_reads_and_writes_are_disjoint_subsets_of_input(tmp_path):
+    write_snapshot(tmp_path)
+    prices = load_price_snapshots(tmp_path)[("m/one", "P")][0]
+    got = expected_cost(
+        {
+            "input_tokens": 1000,
+            "output_tokens": 0,
+            "cache_read_tokens": 400,
+            "cache_write_tokens": 500,
+        },
+        prices,
+    )
+    expected = (
+        Decimal(100) * Decimal(PROMPT)
+        + Decimal(400) * Decimal(CACHE_READ)
+        + Decimal(500) * Decimal(CACHE_WRITE)
+    )
+    assert got == expected
+
+
+def test_a_route_without_a_cache_write_rate_rejects_cache_write_tokens(tmp_path):
+    from examples.development.cost_crosscheck import UnpriceableCall
+
+    write_snapshot(tmp_path, cache_write=None)
+    prices = load_price_snapshots(tmp_path)[("m/one", "P")][0]
+    assert prices.input_cache_write is None
+    assert expected_cost({"input_tokens": 1000, "output_tokens": 0}, prices) == (
+        Decimal(1000) * Decimal(PROMPT)
+    )
+    with pytest.raises(UnpriceableCall, match="input_cache_write"):
+        expected_cost(
+            {"input_tokens": 1000, "output_tokens": 0, "cache_write_tokens": 10}, prices
+        )
 
 
 # -- agreement and disagreement --------------------------------------------
