@@ -7,6 +7,8 @@ import hashlib
 import json
 from pathlib import Path
 
+from examples.development.corpus_paths import resolve_corpus_path
+
 import pytest
 
 from examples.development.systematic_experiment_study import (
@@ -101,7 +103,7 @@ def test_l18_factorial_is_equal_budget_and_pairwise_orthogonal() -> None:
 def test_registry_fails_closed_on_profile_or_orthogonal_array_drift(
     tmp_path: Path,
 ) -> None:
-    record = json.loads(REGISTRY.read_text(encoding="utf-8"))
+    record = json.loads(resolve_corpus_path(REGISTRY).read_text(encoding="utf-8"))
     profile_drift = deepcopy(record)
     profile_drift["models"][0]["profile_sha256"] = "0" * 64
     profile_path = tmp_path / "profile_drift.json"
@@ -266,7 +268,7 @@ def test_v3_workload_contract_removes_central_runtime_and_cli_assumptions() -> N
 
 
 def test_v3_contract_hash_drift_fails_closed(tmp_path: Path) -> None:
-    record = json.loads(REGISTRY_V3.read_text(encoding="utf-8"))
+    record = json.loads(resolve_corpus_path(REGISTRY_V3).read_text(encoding="utf-8"))
     record["workloads"][0]["execution_contract_sha256"] = "0" * 64
     path = tmp_path / "contract_drift.json"
     path.write_text(json.dumps(record), encoding="utf-8")

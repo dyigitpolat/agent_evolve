@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+
+from examples.development.corpus_paths import resolve_corpus_path
 from typing import Any, Protocol, runtime_checkable
 
 from agent_evolve.agentic import (
@@ -629,7 +631,10 @@ def build_openrouter_config(
 
 def _read_snapshot(path: Path) -> tuple[dict[str, object], RuntimeFileBinding]:
     binding = capture_runtime_file(
-        path,
+        # Resolved here rather than inside capture_runtime_file: that helper is
+        # a general "hash one exact file" utility in the shipped package and
+        # has no business knowing this repository has a research corpus.
+        resolve_corpus_path(path),
         logical_path=("research_artifacts/data/" + path.name),
     )
     try:

@@ -34,6 +34,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+from examples.development.corpus_paths import resolve_corpus_path
 from typing import Any
 
 from agent_evolve.application.agentic_evolution import (
@@ -2771,7 +2773,7 @@ def prepare_release(
 ) -> AirfoilG3ReleasePreparation:
     """Prepare the release using only two sealed offline authority files."""
 
-    resolved_membership = membership_path.expanduser().resolve(strict=True)
+    resolved_membership = resolve_corpus_path(membership_path).expanduser().resolve(strict=True)
     membership_file_sha256 = _sha256_file(resolved_membership)
     if membership_file_sha256 != EXPECTED_HISTORICAL_MEMBERSHIP_FILE_SHA256:
         raise AirfoilG3ReleaseError(
@@ -3122,7 +3124,7 @@ def create_prelaunch_freeze_receipt(
     """Bind the finalized deterministic prep to one explicit prelaunch instant."""
 
     preparation.__post_init__()
-    resolved_membership = membership_path.expanduser().resolve(strict=True)
+    resolved_membership = resolve_corpus_path(membership_path).expanduser().resolve(strict=True)
     resolved_card_bank = card_bank_path.expanduser().resolve(strict=True)
     resolved_release = release_path.expanduser().resolve(strict=True)
     if _load_json_object(resolved_release) != preparation.to_record():

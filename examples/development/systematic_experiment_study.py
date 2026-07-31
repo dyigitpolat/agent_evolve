@@ -18,6 +18,8 @@ import re
 import sys
 from typing import Any
 
+from examples.development.corpus_paths import resolve_corpus_path
+
 
 _AGENT_EVOLVE_ROOT = Path(__file__).resolve().parents[2]
 if str(_AGENT_EVOLVE_ROOT) not in sys.path:
@@ -131,7 +133,7 @@ class SystematicExperimentStudy:
 
     @classmethod
     def load(cls, path: Path) -> "SystematicExperimentStudy":
-        resolved = path.expanduser().resolve(strict=True)
+        resolved = resolve_corpus_path(path).expanduser().resolve(strict=True)
         value = json.loads(resolved.read_text(encoding="utf-8"))
         if type(value) is not dict:
             raise TypeError("study registry root must be an object")

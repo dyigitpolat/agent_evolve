@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 import hashlib
 import os
 from pathlib import Path
+
+from examples.development.corpus_paths import resolve_corpus_path
 import threading
 
 from agent_evolve.ports.artifact_store import canonical_json_bytes, decode_json_bytes
@@ -149,7 +151,7 @@ class BatchedDurableJsonlJournal:
 
 
 def file_identity(path: Path, *, relative_to: Path | None = None) -> dict[str, object]:
-    resolved = path.expanduser().resolve(strict=True)
+    resolved = resolve_corpus_path(path).expanduser().resolve(strict=True)
     content = resolved.read_bytes()
     label = (
         resolved.name

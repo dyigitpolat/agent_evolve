@@ -30,6 +30,8 @@ from importlib import metadata as importlib_metadata
 import json
 import os
 from pathlib import Path
+
+from examples.development.corpus_paths import resolve_corpus_path
 import platform
 import re
 import subprocess
@@ -332,7 +334,7 @@ def _frozen_object(value: Mapping[str, object]) -> FrozenJsonObject:
 
 
 def _read_bound_object(path: Path, expected_sha256: str) -> dict[str, object]:
-    content = path.expanduser().resolve(strict=True).read_bytes()
+    content = resolve_corpus_path(path).expanduser().resolve(strict=True).read_bytes()
     if hashlib.sha256(content).hexdigest() != expected_sha256:
         raise AirfoilTwoStageRunError(f"frozen file changed: {path.name}")
     value = decode_json_bytes(content)
