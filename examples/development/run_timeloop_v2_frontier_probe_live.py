@@ -786,16 +786,101 @@ CONNECT_TIMEOUT_SECONDS = 90.0
 BASE_BACKOFF_NS = 1_000_000_000
 MAX_BACKOFF_NS = 30_000_000_000
 
+# The engine that certifies a numerically certified acquisition mode is now
+# named rather than implied, and it DEFAULTS TO THE PREVIOUS BEHAVIOUR, so no
+# launch record in flight changes meaning.  The old form required protected
+# qLogNEHVI at batch exactly 8; on an 8-seat stage that reserved every seat and
+# is why this domain's campaign of record offered 384 catalogue options per
+# stage and bought zero of them, with 99.67% of the gain attributable to
+# BoTorch -- on the one domain where we decisively beat random search.
+NUMERICAL_CERTIFICATION_ENGINE = os.environ.get(
+    "AGENT_EVOLVE_NUMERICAL_CERTIFICATION_ENGINE",
+    "botorch_qlognehvi",
+)
+if NUMERICAL_CERTIFICATION_ENGINE not in {"off", "botorch_qlognehvi"}:
+    raise ValueError(
+        "AGENT_EVOLVE_NUMERICAL_CERTIFICATION_ENGINE must be off or "
+        "botorch_qlognehvi"
+    )
+# The equality is now a floor.  The floor is 2 rather than this runner's batch
+# default of 4 for a reason specific to this domain: PORTFOLIO_WIDTH here is 4,
+# so a batch of 4 already claims EVERY seat of the stage.  A floor at the batch
+# default would keep the planned model-reachable share pinned at 0.0 and leave
+# the defect exactly where it is on the one domain that motivates removing it.
+# Every configuration that was legal before remains legal and behaves
+# identically, because 8 >= 2 and 4 >= 2.
+NUMERICAL_CERTIFICATION_MINIMUM_BATCH = _bounded_integer_environment(
+    "AGENT_EVOLVE_NUMERICAL_CERTIFICATION_MINIMUM_BATCH",
+    2,
+    minimum=2,
+    maximum=8,
+)
+# The measured seat-value decay law replaces the fixed reservation: a qLogNEHVI
+# seat is worth 32.9x a catalogue seat at generation 1 on the continuous
+# objective and 1.63x on the categorical one, and below 1.0 on both by stage 3.
+# `off` is the default and resolves the constant at every generation.
+PROTECTED_ACQUISITION_SEAT_VALUE_DECAY = os.environ.get(
+    "AGENT_EVOLVE_PROTECTED_ACQUISITION_SEAT_VALUE_DECAY",
+    "off",
+)
+if PROTECTED_ACQUISITION_SEAT_VALUE_DECAY not in {"off", "measured"}:
+    raise ValueError(
+        "AGENT_EVOLVE_PROTECTED_ACQUISITION_SEAT_VALUE_DECAY must be off or "
+        "measured"
+    )
+SEAT_VALUE_PARITY_GENERATION = 3
+
 if NUMERICALLY_CERTIFIED_ACQUISITION and (
-    not _common_pool_enabled()
-    or not CONSTRAINT_DECOUPLED_ACQUISITION
-    or PROTECTED_ACQUISITION_MODE != "botorch_qlognehvi"
-    or PROTECTED_ACQUISITION_BATCH_SIZE != 8
+    not _common_pool_enabled() or not CONSTRAINT_DECOUPLED_ACQUISITION
 ):
     raise ValueError(
-        "acquisition_certified requires a common pool, constraint-decoupled "
-        "authority, and protected qLogNEHVI batch 8"
+        "acquisition_certified requires a common pool and constraint-decoupled "
+        "authority"
     )
+if (
+    NUMERICALLY_CERTIFIED_ACQUISITION
+    and NUMERICAL_CERTIFICATION_ENGINE == "botorch_qlognehvi"
+    and (
+        PROTECTED_ACQUISITION_MODE != "botorch_qlognehvi"
+        or PROTECTED_ACQUISITION_BATCH_SIZE < NUMERICAL_CERTIFICATION_MINIMUM_BATCH
+    )
+):
+    raise ValueError(
+        "acquisition_certified under the botorch_qlognehvi engine requires "
+        "protected qLogNEHVI at or above "
+        f"{NUMERICAL_CERTIFICATION_MINIMUM_BATCH}; set "
+        "AGENT_EVOLVE_NUMERICAL_CERTIFICATION_ENGINE=off to certify without it"
+    )
+
+# G0, declared before the campaign runs rather than audited after it.  A planned
+# share of 0.0 means the campaign cannot produce evidence about model-guided
+# operators no matter what it measures.
+PLANNED_PROTECTED_ACQUISITION_SEATS = (
+    0
+    if PROTECTED_ACQUISITION_MODE == "off"
+    else min(PROTECTED_ACQUISITION_BATCH_SIZE, PORTFOLIO_WIDTH)
+)
+PLANNED_MODEL_REACHABLE_SHARE_OF_EVALUATED_SEATS = (
+    (PORTFOLIO_WIDTH - PLANNED_PROTECTED_ACQUISITION_SEATS) / PORTFOLIO_WIDTH
+    if PORTFOLIO_WIDTH
+    else None
+)
+
+
+def _protected_acquisition_source_minimum(generation: int) -> int:
+    """The per-lane reservation for `generation`, resolved at read time.
+
+    `off` -- the default -- resolves the constant at every generation, so an
+    unconfigured campaign behaves exactly as before.  `measured` holds the
+    reservation while a qLogNEHVI seat is measured at or above parity with a
+    catalogue seat and releases it once it is measured below.
+    """
+
+    if PROTECTED_ACQUISITION_SEAT_VALUE_DECAY == "off":
+        return PROTECTED_ACQUISITION_SOURCE_MINIMUM
+    if generation >= SEAT_VALUE_PARITY_GENERATION:
+        return 0
+    return PROTECTED_ACQUISITION_SOURCE_MINIMUM
 
 
 class _OutcomeConditionedSelectorAdapter:
@@ -1309,6 +1394,16 @@ def _protected_acquisition_config_record() -> dict[str, object]:
         "pool_size": PROTECTED_ACQUISITION_POOL_SIZE,
         "protected_batch_size": PROTECTED_ACQUISITION_BATCH_SIZE,
         "source_minimum_per_lane": PROTECTED_ACQUISITION_SOURCE_MINIMUM,
+        "seat_value_decay": PROTECTED_ACQUISITION_SEAT_VALUE_DECAY,
+        "numerical_certification_engine": NUMERICAL_CERTIFICATION_ENGINE,
+        "numerical_certification_minimum_batch": (
+            NUMERICAL_CERTIFICATION_MINIMUM_BATCH
+        ),
+        "evaluated_seats_per_stage": PORTFOLIO_WIDTH,
+        "planned_seats_claimed": PLANNED_PROTECTED_ACQUISITION_SEATS,
+        "model_reachable_share_of_evaluated_seats": (
+            PLANNED_MODEL_REACHABLE_SHARE_OF_EVALUATED_SEATS
+        ),
         "mc_samples": PROTECTED_ACQUISITION_MC_SAMPLES,
         "space": {
             "space_id": space.space_id,

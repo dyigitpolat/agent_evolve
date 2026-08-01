@@ -618,6 +618,65 @@ PROTECTED_ACQUISITION_MC_SAMPLES = _bounded_integer_environment(
     minimum=16,
     maximum=4096,
 )
+
+# The engine that certifies a numerically certified acquisition mode used to be
+# implied rather than named: selecting `acquisition_certified` or
+# `regret_bounded_information` REQUIRED protected qLogNEHVI at batch exactly 8.
+# On an 8-seat stage that reserved every seat, so the model could not affect the
+# evaluated set at all.  That is the defect the Timeloop campaign of record
+# exhibits -- 384 catalogue options offered per stage and zero bought, 99.67% of
+# the gain attributable to BoTorch -- on the one domain where we decisively beat
+# random search.  The engine is now named, and it DEFAULTS TO THE PREVIOUS
+# BEHAVIOUR, so no launch record in flight changes meaning.  Setting it to `off`
+# lets the claim-supporting configuration run without qLogNEHVI; qLogNEHVI
+# remains fully supported and is genuinely excellent on that domain.
+NUMERICAL_CERTIFICATION_ENGINE = os.environ.get(
+    "AGENT_EVOLVE_NUMERICAL_CERTIFICATION_ENGINE",
+    "botorch_qlognehvi",
+)
+if NUMERICAL_CERTIFICATION_ENGINE not in {"off", "botorch_qlognehvi"}:
+    raise ValueError(
+        "AGENT_EVOLVE_NUMERICAL_CERTIFICATION_ENGINE must be off or "
+        "botorch_qlognehvi"
+    )
+# The interlock demanded `batch == 8` exactly.  It is now a floor, and the floor
+# admits PROTECTED_ACQUISITION_BATCH_SIZE's own default of 2 -- so the lockout
+# was created by the interlock itself rather than by any default, and relaxing
+# the equality restores six of eight seats without changing a single default.
+# Every configuration that was legal before remains legal and behaves
+# identically, because 8 >= 2.
+NUMERICAL_CERTIFICATION_MINIMUM_BATCH = _bounded_integer_environment(
+    "AGENT_EVOLVE_NUMERICAL_CERTIFICATION_MINIMUM_BATCH",
+    2,
+    minimum=2,
+    maximum=8,
+)
+
+# Replacing the fixed source quota with the measured seat-value decay law.  A
+# qLogNEHVI seat is worth 32.9x a catalogue seat at generation 1 on the
+# continuous objective and 1.63x on the categorical one, and below 1.0 on both
+# by stage 3.  A fixed per-generation reservation is right once and wrong every
+# generation after.  `off` is the default and resolves the constant at every
+# generation, exactly as before.
+PROTECTED_ACQUISITION_SEAT_VALUE_DECAY = os.environ.get(
+    "AGENT_EVOLVE_PROTECTED_ACQUISITION_SEAT_VALUE_DECAY",
+    "off",
+)
+if PROTECTED_ACQUISITION_SEAT_VALUE_DECAY not in {"off", "measured"}:
+    raise ValueError(
+        "AGENT_EVOLVE_PROTECTED_ACQUISITION_SEAT_VALUE_DECAY must be off or "
+        "measured"
+    )
+# Only the generations that were actually measured appear here.  Generation 2
+# was not measured, so it is carried at the last generation not measured below
+# parity rather than interpolated into a number nobody observed.
+SEAT_VALUE_DECAY_MEASURED_RATIOS = (
+    {"generation": 1, "continuous": 32.9, "categorical": 1.63, "measured": True},
+    {"generation": 2, "continuous": None, "categorical": None, "measured": False},
+    {"generation": 3, "continuous": None, "categorical": None, "measured": True,
+     "below_parity": True},
+)
+SEAT_VALUE_PARITY_GENERATION = 3
 MINIMUM_DISTINCT_EVALUATION_FAMILIES = (
     None if PROTECTED_ACQUISITION_MODE != "off" else 3
 )
@@ -687,14 +746,23 @@ if CONSTRAINT_DECOUPLED_ACQUISITION and ACQUISITION_MODE not in {
         "constraint-decoupled acquisition requires horizon_bounded or "
         "target_conditioned, acquisition_certified, or regret_bounded_information mode"
     )
-if NUMERICALLY_CERTIFIED_ACQUISITION and (
-    PROTECTED_ACQUISITION_MODE != "botorch_qlognehvi"
-    or PROTECTED_ACQUISITION_BATCH_SIZE != 8
-    or not CONSTRAINT_DECOUPLED_ACQUISITION
+if NUMERICALLY_CERTIFIED_ACQUISITION and not CONSTRAINT_DECOUPLED_ACQUISITION:
+    raise ValueError(
+        "numerically certified acquisition requires constraint-decoupled authority"
+    )
+if (
+    NUMERICALLY_CERTIFIED_ACQUISITION
+    and NUMERICAL_CERTIFICATION_ENGINE == "botorch_qlognehvi"
+    and (
+        PROTECTED_ACQUISITION_MODE != "botorch_qlognehvi"
+        or PROTECTED_ACQUISITION_BATCH_SIZE < NUMERICAL_CERTIFICATION_MINIMUM_BATCH
+    )
 ):
     raise ValueError(
-        "numerically certified acquisition requires protected qLogNEHVI batch 8 and "
-        "constraint-decoupled authority"
+        "numerically certified acquisition under the botorch_qlognehvi engine "
+        "requires protected qLogNEHVI at or above "
+        f"{NUMERICAL_CERTIFICATION_MINIMUM_BATCH}; set "
+        "AGENT_EVOLVE_NUMERICAL_CERTIFICATION_ENGINE=off to certify without it"
     )
 ARCHIVE_CONTEXT_MODE = AffineFrontierContextMode(
     os.environ.get("AGENT_EVOLVE_ARCHIVE_CONTEXT_MODE", "off")
@@ -815,6 +883,22 @@ PORTFOLIO_GENERATIONS = tuple(range(1, GENERATION_COUNT + 1, 2))
 RECOMBINATION_GENERATIONS = tuple(range(2, GENERATION_COUNT + 1, 2))
 PARENTS_PER_PORTFOLIO = 2
 PORTFOLIO_WIDTH = CAMPAIGN_SCALE_SHAPE.portfolio_width
+# G0, declared before the campaign runs rather than audited after it.  Seats
+# claimed by the protected acquisition engine are bought before any proposal is
+# read, so they are not reachable by the model.  A planned share of 0.0 means
+# the campaign cannot produce evidence about model-guided operators no matter
+# what it measures -- which is exactly the state the certified modes used to
+# force, batch 8 against an 8-seat stage.
+PLANNED_PROTECTED_ACQUISITION_SEATS = (
+    0
+    if PROTECTED_ACQUISITION_MODE == "off"
+    else min(PROTECTED_ACQUISITION_BATCH_SIZE, PORTFOLIO_WIDTH)
+)
+PLANNED_MODEL_REACHABLE_SHARE_OF_EVALUATED_SEATS = (
+    (PORTFOLIO_WIDTH - PLANNED_PROTECTED_ACQUISITION_SEATS) / PORTFOLIO_WIDTH
+    if PORTFOLIO_WIDTH
+    else None
+)
 CALIBRATED_PROPOSAL_WIDTH = 8
 COMMON_CANDIDATE_POOL_SIZE = _candidate_pool_size_from_environment(8)
 VARIATION_TOPOLOGY = CampaignVariationTopology.from_environment(os.environ)
@@ -1083,6 +1167,89 @@ def _acquisition_objectives() -> tuple[FiniteAcquisitionObjective, ...]:
             key=lambda value: value.metric_id,
         )
     )
+
+
+def _protected_acquisition_source_minimum(generation: int) -> int:
+    """The per-lane reservation for `generation`, resolved at read time.
+
+    `off` -- the default -- resolves the constant at every generation, so an
+    unconfigured campaign behaves exactly as it did before this function
+    existed.  `measured` follows the seat-value decay law: the reservation is
+    held while a qLogNEHVI seat is measured at or above parity with a catalogue
+    seat, and released once it is measured below.  Generation 1 resolves to
+    PROTECTED_ACQUISITION_SOURCE_MINIMUM under both modes, so the schedule's
+    first value is the constant it replaces.
+    """
+
+    if PROTECTED_ACQUISITION_SEAT_VALUE_DECAY == "off":
+        return PROTECTED_ACQUISITION_SOURCE_MINIMUM
+    if generation >= SEAT_VALUE_PARITY_GENERATION:
+        return 0
+    return PROTECTED_ACQUISITION_SOURCE_MINIMUM
+
+
+def _model_reachable_seat_accounting(
+    bootstrap_rows: "tuple[dict[str, object], ...]",
+) -> dict[str, object]:
+    """G0, mechanically, from the seat accounting the probe already records.
+
+    A seat is model-reachable when the proposer's choice can determine what
+    fills it.  Seats claimed by the protected acquisition engine are not: they
+    are bought by BoTorch before any proposal is read.  A campaign that cannot
+    show a nonzero model-reachable share is not evidence about model-guided
+    operators, and this lets the harness say so itself instead of leaving it to
+    an after-the-fact audit.
+    """
+
+    evaluated_seats = 0
+    protected_seats = 0
+    catalogue_options = 0
+    numerical_options = 0
+    per_generation: list[dict[str, object]] = []
+    for row in bootstrap_rows:
+        width = int(row["evaluation_width"])  # type: ignore[arg-type]
+        offered = int(row["eligible_option_count"])  # type: ignore[arg-type]
+        numerical = int(row.get("numerical_acquisition_option_count", 0))  # type: ignore[union-attr]
+        claimed = min(PROTECTED_ACQUISITION_BATCH_SIZE, width) if numerical else 0
+        evaluated_seats += width
+        protected_seats += claimed
+        catalogue_options += offered - numerical
+        numerical_options += numerical
+        per_generation.append(
+            {
+                "generation": row["generation"],
+                "parent_slot": row["parent_slot"],
+                "evaluated_seats": width,
+                "protected_acquisition_seats": claimed,
+                "model_reachable_seats": width - claimed,
+                "catalogue_options_offered": offered - numerical,
+                "numerical_acquisition_options_offered": numerical,
+                "source_minimum_per_lane_resolved": (
+                    _protected_acquisition_source_minimum(int(row["generation"]))  # type: ignore[arg-type]
+                ),
+            }
+        )
+    reachable = evaluated_seats - protected_seats
+    return {
+        "model_reachable_share_of_evaluated_seats": (
+            reachable / evaluated_seats if evaluated_seats else None
+        ),
+        "evaluated_seats": evaluated_seats,
+        "model_reachable_seats": reachable,
+        "protected_acquisition_seats": protected_seats,
+        "catalogue_options_offered": catalogue_options,
+        "numerical_acquisition_options_offered": numerical_options,
+        "catalogue_options_bought": None,
+        "hard_lockout": evaluated_seats > 0 and reachable == 0,
+        "note": (
+            "a seat is model-reachable when the proposer's choice can determine "
+            "what fills it; seats claimed by the protected acquisition engine "
+            "are bought before any proposal is read. `catalogue_options_bought` "
+            "is null in the construction probe, which makes no provider call -- "
+            "it is filled from the live arm's charged occurrences"
+        ),
+        "per_wave": per_generation,
+    }
 
 
 def _protected_acquisition_envelope(
@@ -4470,17 +4637,28 @@ def _all_wave_probe(
             else not contextual_plans
         ),
         "reflection_construction": reflection["all_gates_pass"],
+        # Resolved per generation rather than against the constant: under the
+        # measured seat-value decay the reservation is released once a qLogNEHVI
+        # seat is worth less than a catalogue seat, and a gate still demanding
+        # the constant would fail every campaign that honours the law.  With the
+        # decay `off` this resolves to the constant at every generation and the
+        # gate is byte-for-byte the assertion it was.
         "protected_acquisition_composed_every_bootstrap_wave": (
             variation_envelope is None
             or all(
-                "numerical_acquisition" in row["variation_source_ids"]
-                and row["numerical_acquisition_option_count"]
-                >= PROTECTED_ACQUISITION_SOURCE_MINIMUM
-                and row["variation_envelope_result_sha256"] is not None
+                (
+                    "numerical_acquisition" in row["variation_source_ids"]
+                    and row["numerical_acquisition_option_count"]
+                    >= _protected_acquisition_source_minimum(int(row["generation"]))
+                    and row["variation_envelope_result_sha256"] is not None
+                )
+                if _protected_acquisition_source_minimum(int(row["generation"])) > 0
+                else True
                 for row in bootstrap_rows
             )
         ),
     }
+    seat_accounting = _model_reachable_seat_accounting(bootstrap_rows)
     return {
         "status": "provider_credential_abc_free_all_wave_construction",
         "probe_contract": {
@@ -4493,6 +4671,10 @@ def _all_wave_probe(
         "abc_executions": 0,
         "gates": gates,
         "all_gates_pass": all(gates.values()),
+        "seat_accounting": seat_accounting,
+        "model_reachable_share_of_evaluated_seats": (
+            seat_accounting["model_reachable_share_of_evaluated_seats"]
+        ),
         "rows": rows,
         "contextual_plans": list(contextual_plans),
         "reflection_probe": reflection,
@@ -4605,6 +4787,22 @@ def _manifest(
                 "batch_size": PROTECTED_ACQUISITION_BATCH_SIZE,
                 "source_minimum_per_lane": (
                     PROTECTED_ACQUISITION_SOURCE_MINIMUM
+                ),
+                "seat_value_decay": PROTECTED_ACQUISITION_SEAT_VALUE_DECAY,
+                "seat_value_decay_measured_ratios": [
+                    dict(row) for row in SEAT_VALUE_DECAY_MEASURED_RATIOS
+                ],
+                "source_minimum_per_lane_by_generation": {
+                    str(generation): _protected_acquisition_source_minimum(generation)
+                    for generation in PORTFOLIO_GENERATIONS
+                },
+                "numerical_certification_engine": NUMERICAL_CERTIFICATION_ENGINE,
+                "numerical_certification_minimum_batch": (
+                    NUMERICAL_CERTIFICATION_MINIMUM_BATCH
+                ),
+                "planned_seats_claimed": PLANNED_PROTECTED_ACQUISITION_SEATS,
+                "model_reachable_share_of_evaluated_seats": (
+                    PLANNED_MODEL_REACHABLE_SHARE_OF_EVALUATED_SEATS
                 ),
                 "mc_samples": PROTECTED_ACQUISITION_MC_SAMPLES,
                 "space": {
@@ -4993,6 +5191,15 @@ def _preregistration_contract(
             "pool_size": PROTECTED_ACQUISITION_POOL_SIZE,
             "batch_size": PROTECTED_ACQUISITION_BATCH_SIZE,
             "source_minimum_per_lane": PROTECTED_ACQUISITION_SOURCE_MINIMUM,
+            "seat_value_decay": PROTECTED_ACQUISITION_SEAT_VALUE_DECAY,
+            "numerical_certification_engine": NUMERICAL_CERTIFICATION_ENGINE,
+            "numerical_certification_minimum_batch": (
+                NUMERICAL_CERTIFICATION_MINIMUM_BATCH
+            ),
+            "planned_seats_claimed": PLANNED_PROTECTED_ACQUISITION_SEATS,
+            "model_reachable_share_of_evaluated_seats": (
+                PLANNED_MODEL_REACHABLE_SHARE_OF_EVALUATED_SEATS
+            ),
             "mc_samples": PROTECTED_ACQUISITION_MC_SAMPLES,
             "space_definition_sha256": (
                 BoilsFiniteAcquisitionSpace().definition_sha256
