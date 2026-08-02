@@ -1254,3 +1254,133 @@ def test_static_candidate_infeasibility_is_terminal_without_a_simulator_call() -
 
     assert events == (event,)
     assert _pre_simulator_infeasible_count(events) == 1
+
+
+def _full_support_allocator_record(allocator_identity: dict[str, object]) -> dict[str, object]:
+    """The record FullSupportSlatePolicy.to_record actually emits: seven keys."""
+
+    return {
+        **allocator_identity,
+        "configuration_sha256": _sha("full-support-configuration"),
+        "selection_scope": "entire_authenticated_slate",
+        "outcome_access": False,
+        "workload_identifier_access": False,
+    }
+
+
+def test_live_audit_decodes_full_support_rich_policy_receipt() -> None:
+    """A correct full-support receipt must certify.
+
+    Regression: the gate fell through to an UNPROJECTED
+    `allocator == expected_allocator_identity`, which no allocator recording
+    provenance beyond the bare identity can satisfy.  FullSupportSlatePolicy
+    emits seven keys, so `active_selector_policy_bound` was unsatisfiable by
+    construction for this configuration whatever the campaign did.
+    """
+
+    policy_id, policy_version, definition_sha256 = _allocation_policy_identity()
+    allocator_identity = {
+        "policy_id": policy_id,
+        "policy_version": policy_version,
+        "definition_sha256": definition_sha256,
+    }
+    decision_identity = {
+        "policy_id": "pydantic_ai_full_support_calibrated_portfolio",
+        "policy_version": 1,
+        "policy_definition_sha256": _sha("full-support-wrapper"),
+    }
+    result = SimpleNamespace(
+        decision=SimpleNamespace(**decision_identity),
+        supplemental_audit=SimpleNamespace(
+            audit_kind="full_support_calibrated_portfolio_k8_to_k8",
+            payload=_object(
+                {
+                    # composed from binding-dependent flags, deliberately not 5
+                    "schema_version": 21,
+                    **decision_identity,
+                    "allocator_policy": _full_support_allocator_record(
+                        allocator_identity
+                    ),
+                }
+            ),
+        ),
+    )
+
+    assert _selector_policy_binding_valid(result)
+
+
+def test_live_audit_refuses_full_support_receipt_that_names_another_policy() -> None:
+    """The gate must still bind the receipt's policy to the deciding policy.
+
+    This is the assertion that stops the regression fix from becoming a
+    loosening: a receipt describing one selector while another made the
+    decision is unattributable evidence and must not certify, however
+    well-formed its allocator identity is.
+    """
+
+    policy_id, policy_version, definition_sha256 = _allocation_policy_identity()
+    allocator_identity = {
+        "policy_id": policy_id,
+        "policy_version": policy_version,
+        "definition_sha256": definition_sha256,
+    }
+    result = SimpleNamespace(
+        decision=SimpleNamespace(
+            policy_id="pydantic_ai_full_support_calibrated_portfolio",
+            policy_version=1,
+            policy_definition_sha256=_sha("the-policy-that-actually-decided"),
+        ),
+        supplemental_audit=SimpleNamespace(
+            audit_kind="full_support_calibrated_portfolio_k8_to_k8",
+            payload=_object(
+                {
+                    "schema_version": 21,
+                    "policy_id": "pydantic_ai_full_support_calibrated_portfolio",
+                    "policy_version": 1,
+                    # a different policy than the one that decided
+                    "policy_definition_sha256": _sha("a-policy-that-did-not"),
+                    "allocator_policy": _full_support_allocator_record(
+                        allocator_identity
+                    ),
+                }
+            ),
+        ),
+    )
+
+    assert not _selector_policy_binding_valid(result)
+
+
+def test_live_audit_fails_closed_on_an_unknown_audit_kind() -> None:
+    """An audit kind the gate was never taught to read must not certify.
+
+    Even with a perfectly formed bare allocator identity -- the only shape the
+    old unprojected comparison could ever have accepted -- an unrecognised
+    receipt carries no checked binding and must be refused explicitly.
+    """
+
+    policy_id, policy_version, definition_sha256 = _allocation_policy_identity()
+    result = SimpleNamespace(
+        decision=SimpleNamespace(
+            policy_id="pydantic_ai_some_future_portfolio",
+            policy_version=1,
+            policy_definition_sha256=_sha("future"),
+        ),
+        supplemental_audit=SimpleNamespace(
+            audit_kind="some_future_portfolio_kind_k8_to_k2",
+            payload=_object(
+                {
+                    "schema_version": 5,
+                    "policy_id": "pydantic_ai_some_future_portfolio",
+                    "policy_version": 1,
+                    "policy_definition_sha256": _sha("future"),
+                    "allocator_policy": {
+                        "policy_id": policy_id,
+                        "policy_version": policy_version,
+                        "definition_sha256": definition_sha256,
+                    },
+                }
+            ),
+        ),
+    )
+
+    assert not _selector_policy_binding_valid(result)

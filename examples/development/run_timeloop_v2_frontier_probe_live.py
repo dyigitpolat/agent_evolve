@@ -570,7 +570,38 @@ def _selector_policy_binding_valid(result: object) -> bool:
             and type(allocation.get("selected_option_ids")) is list
             and type(allocation.get("selected_future_value")) is dict
         )
-    return allocator == expected_allocator_identity
+    if audit.audit_kind == "full_support_calibrated_portfolio_k8_to_k8":
+        # Full support selects the entire authenticated slate, so it has no
+        # residual/regret allocation certificate to check.  What it must still
+        # prove is the same thing every other kind proves, and the only thing
+        # this gate is named for: the policy the receipt CLAIMS is the policy
+        # that made the decision.  Without that the receipt could describe one
+        # selector while another chose, which is exactly the unattributable
+        # evidence G0 exists to stop.
+        #
+        # `schema_version` is deliberately NOT asserted against a literal here.
+        # `_payload_schema_version` composes a base with binding-dependent flags,
+        # so the sibling branches' `== 5` holds only for their configurations;
+        # asserting a literal for this one would encode a configuration, not a
+        # binding.
+        return (
+            payload.get("policy_id") == decision.policy_id
+            and payload.get("policy_version") == decision.policy_version
+            and payload.get("policy_definition_sha256")
+            == decision.policy_definition_sha256
+            and _is_sha256(decision.policy_definition_sha256)
+        )
+    # Fail closed on an audit kind this gate has never been taught to read.
+    # This used to be `allocator == expected_allocator_identity`, an UNPROJECTED
+    # dict comparison that no allocator in this system can satisfy: every
+    # allocator that records provenance beyond the bare identity carries extra
+    # keys (FullSupportSlatePolicy carries seven, AcquisitionCertifiedSlatePolicy
+    # carries nested context_provider and scorer records).  The named branches
+    # survived only because they return before reaching it, so the comparison
+    # read as a designed refusal while actually being unsatisfiable.  The
+    # refusal is kept -- an unknown receipt must not certify -- but it is now
+    # explicit rather than an accident of dict equality.
+    return False
 
 
 def _candidate_universe_binding_valid(
