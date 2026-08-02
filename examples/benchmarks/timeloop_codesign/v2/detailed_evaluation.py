@@ -822,6 +822,34 @@ class TimeloopV2DetailedEvaluationAdapter:
             objectives=tuple(
                 (name, float(objective_values[name])) for name in OBJECTIVE_NAMES
             ),
+            # The three medoids are separate sub-problems that this evaluator
+            # aggregates into one charged evaluation, and it has always computed
+            # them separately -- energy and latency are exact
+            # multiplicity-weighted sums over per-medoid mapper results.  Until
+            # now those parts reached the sealed receipt and stopped there,
+            # because the only typed channel out of an adapter was the aggregate
+            # objective vector.  They are published here as observations: sealed
+            # with the evaluation, never scored, and the aggregate objectives
+            # above are untouched so the reward target does not move.
+            observations=tuple(
+                (
+                    f"medoid_{layer.medoid_ordinal}_{metric}",
+                    float(getattr(layer, metric)),
+                )
+                for layer in sorted(
+                    observation.layer_results, key=lambda item: item.medoid_ordinal
+                )
+                for metric in ("energy_joules", "latency_seconds")
+            )
+            + tuple(
+                (
+                    f"medoid_{layer.medoid_ordinal}_layer_multiplicity",
+                    float(layer.layer_multiplicity),
+                )
+                for layer in sorted(
+                    observation.layer_results, key=lambda item: item.medoid_ordinal
+                )
+            ),
             violations=(),
             checks=(
                 _check(

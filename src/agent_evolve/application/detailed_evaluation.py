@@ -213,6 +213,28 @@ class DetailedEvaluationPayload:
     evaluator: EvaluatorIdentity
     active_wall_seconds: float | None = None
     resource_queue_wall_seconds: float | None = None
+    observations: tuple[tuple[str, float], ...] = ()
+    """Sub-problem measurements the evaluator already computed, carried but
+    **never scored**.
+
+    An evaluation unit that aggregates sub-problems -- a panel of layers, a set
+    of instances, a multi-medoid network -- publishes the parts and then throws
+    them away, because the only typed channel out of an adapter was the
+    aggregate objective vector.  On Timeloop that discarded exactly the
+    per-medoid split, measured to be worth 43.1 % of that domain's attainable
+    range.
+
+    `observations` is that channel.  It is deliberately parallel to
+    `violations`: a named finite vector, adapter-authored, sealed with the
+    evaluation.  It differs from `objectives` in the one way that matters --
+    **nothing reads it to compute reward**.  The reward path consumes
+    `objectives` alone, so widening the observation does not move the target,
+    and every existing `objectives` equality invariant holds unchanged.
+
+    Not required to be sorted, because sub-problem order is meaningful (medoid
+    0, 1, 2 is not an alphabetical fact), and not required nonnegative, because
+    a sub-problem measurement may legitimately be signed.
+    """
 
     def __post_init__(self) -> None:
         if self.failure is not None:
@@ -231,10 +253,28 @@ class DetailedEvaluationPayload:
             nonnegative=True,
             require_sorted=True,
         )
+        _named_finite_values(
+            self.observations,
+            name="observations",
+            nonnegative=False,
+            require_sorted=False,
+        )
         if self.failure is None and not self.objectives:
             raise ValueError("successful detailed evaluations require objectives")
-        if self.failure is not None and (self.objectives or self.violations):
+        if self.failure is not None and (
+            self.objectives or self.violations or self.observations
+        ):
             raise ValueError("failed detailed evaluations cannot carry projections")
+        observation_names = tuple(name for name, _ in self.observations)
+        if len(set(observation_names)) != len(observation_names):
+            raise ValueError("observation names must be unique")
+        objective_names = {name for name, _ in self.objectives}
+        collisions = objective_names & set(observation_names)
+        if collisions:
+            raise ValueError(
+                "observations must not shadow objective names: "
+                f"{sorted(collisions)}"
+            )
         if type(self.checks) is not tuple or any(
             type(check) is not EvaluationCheck for check in self.checks
         ):
@@ -339,8 +379,12 @@ class DetailedEvaluation:
     def success(self) -> bool:
         return self.failure is None
 
+    @property
+    def observations(self) -> tuple[tuple[str, float], ...]:
+        return self.payload.observations
+
     def _identity_record(self) -> dict[str, object]:
-        return {
+        record: dict[str, object] = {
             "phenotype": {
                 **self.phenotype.to_trace_record(),
                 "identity_sha256": self.phenotype.identity_sha256,
@@ -356,6 +400,20 @@ class DetailedEvaluation:
                 for name, value in self.timings.to_record().items()
             },
         }
+        # `observations` enters the seal only when an adapter actually supplies
+        # one.  `evidence_sha256` is a published identity: it is carried in
+        # sealed campaign journals and in the prompt-shape commitment as
+        # `parent_evidence_sha256s` and `common_ancestor_evidence_sha256`.
+        # Adding an always-present key would re-hash every evaluation ever
+        # recorded and invalidate that material.  Omitting the key when the
+        # tuple is empty makes the serialization byte-identical for every
+        # existing payload, so old records verify unchanged while new
+        # observations are still sealed rather than merely reported.
+        if self.observations:
+            record["observations"] = [
+                [name, value.hex()] for name, value in self.observations
+            ]
+        return record
 
     @property
     def evidence_sha256(self) -> str:
@@ -373,6 +431,7 @@ class DetailedEvaluation:
             **self._identity_record(),
             "objectives": {name: value for name, value in self.objectives},
             "violations": {name: value for name, value in self.violations},
+            "observations": {name: value for name, value in self.observations},
             "timings": self.timings.to_record(),
             "evidence_sha256": self.evidence_sha256,
         }
