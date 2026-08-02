@@ -104,6 +104,7 @@ from agent_evolve.application.portfolio_campaign_runtime import (  # noqa: E402
     CampaignPortfolioWaveContext,
 )
 from agent_evolve.application.portfolio_evolution import (  # noqa: E402
+    MEMORY_ESTIMAND_CONTEXT_KEY,
     PortfolioMemoryContextProjectionBinding,
     PortfolioMemoryCreditPlan,
     PortfolioRewardAggregationBinding,
@@ -182,15 +183,19 @@ def _object(value: dict[str, object]) -> FrozenJsonObject:
 
 
 
-def _reflection_contract() -> ReflectionInsightContract:
+def _reflection_contract(
+    objective_ids: tuple[str, ...],
+    families: tuple[str, ...],
+    decision_paths: tuple[str, ...],
+) -> ReflectionInsightContract:
     return ReflectionInsightContract(
-        required_metric_ids=OBJECTIVE_IDS,
-        allowed_option_families=REFLECTION_FAMILIES,
-        allowed_decision_paths=REFLECTION_PATHS,
+        required_metric_ids=objective_ids,
+        allowed_option_families=families,
+        allowed_decision_paths=decision_paths,
         allowed_insight_kinds=(ReflectionInsightKind.EMPIRICAL_PREDICTIVE_RULE,),
         allowed_consumer_scopes=(ReflectionConsumerScope.MUTATION_SELECTION,),
         allowed_comparison_anchor_kinds=(MetricComparisonAnchorKind.CURRENT_PARENT,),
-        allowed_factor_capabilities=REFLECTION_FAMILIES,
+        allowed_factor_capabilities=families,
     )
 
 
@@ -211,75 +216,106 @@ def _prediction(metric_id: str, direction: MetricEffectDirection):
 def _reflection_drafts(
     generation: int,
     contrast_ids: tuple[str, ...],
+    objective_ids: tuple[str, ...],
+    objective_goals: tuple[str, ...],
+    families: tuple[str, ...],
+    decision_paths: tuple[str, ...],
 ) -> tuple[InsightDraft, ...]:
+    """One draft per (family, locus) pair the workload actually published.
+
+    Every noun here is derived.  The objective names come from the problem's own
+    ``ObjectiveSpec.name``, the improving direction from its ``goal``, the
+    families and loci from the selected finite catalogue.  Nothing in this
+    function knows what the workload optimises, which is the property the
+    registry-derived invariant in the acceptance tests enforces.
+    """
+
     if len(contrast_ids) < 2:
         raise ValueError("workload reflection proof requires two source contrasts")
-    return (
-        InsightDraft(
-            claim=(
-                f"Generation {generation}: an early AIG-balance replacement can "
-                "reduce mapped depth and LUT demand."
-            ),
-            trigger="An early parent-local AIG-balance option is available.",
-            mechanism=(
-                "Early balancing can shorten critical paths before later rewriting "
-                "and mapping under the frozen evaluator protocol."
-            ),
-            affected_paths=("$.sequence[0]",),
-            evidence_summary="One authenticated recombination contrast motivated testing.",
-            confidence=0.5,
-            evidence_contrast_ids=(contrast_ids[0],),
-            effect_predictions=(
-                _prediction("total_levels", MetricEffectDirection.DECREASE),
-                _prediction("total_lut_count", MetricEffectDirection.DECREASE),
-            ),
-            recommended_option_families=("aig_balance",),
-            action_template="Apply one sealed early AIG-balance finite action.",
-            falsification_condition=(
-                "A held-out exact early AIG-balance action violates a predicted "
-                "metric direction."
-            ),
-            insight_kind=ReflectionInsightKind.EMPIRICAL_PREDICTIVE_RULE,
-            consumer_scopes=(ReflectionConsumerScope.MUTATION_SELECTION,),
-            factor_capabilities=("aig_balance",),
-        ),
-        InsightDraft(
-            claim=(
-                f"Generation {generation}: an early AIG-refactor replacement can "
-                "reduce mapped LUT demand and depth."
-            ),
-            trigger="An early parent-local AIG-refactor option is available.",
-            mechanism=(
-                "Early algebraic refactoring can expose a smaller logic structure "
-                "to later rewriting and mapping under the frozen evaluator protocol."
-            ),
-            affected_paths=("$.sequence[1]",),
-            evidence_summary="One authenticated recombination contrast motivated testing.",
-            confidence=0.5,
-            evidence_contrast_ids=(contrast_ids[1],),
-            effect_predictions=(
-                _prediction("total_levels", MetricEffectDirection.DECREASE),
-                _prediction("total_lut_count", MetricEffectDirection.DECREASE),
-            ),
-            recommended_option_families=("aig_refactor",),
-            action_template="Apply one sealed early AIG-refactor finite action.",
-            falsification_condition=(
-                "A held-out exact early AIG-refactor action violates a predicted metric "
-                "direction."
-            ),
-            insight_kind=ReflectionInsightKind.EMPIRICAL_PREDICTIVE_RULE,
-            consumer_scopes=(ReflectionConsumerScope.MUTATION_SELECTION,),
-            factor_capabilities=("aig_refactor",),
-        ),
+    if not objective_ids:
+        raise ValueError("the workload problem published no objectives")
+    if not families:
+        raise ValueError(
+            "the workload catalogue published no option families, so no "
+            "reflection draft can be derived; declare them in the adapter"
+        )
+    if not decision_paths:
+        raise ValueError("the workload catalogue published no reflection-editable loci")
+
+    predictions = tuple(
+        _prediction(
+            metric_id,
+            MetricEffectDirection.DECREASE
+            if goal == "min"
+            else MetricEffectDirection.INCREASE,
+        )
+        for metric_id, goal in zip(objective_ids, objective_goals)
     )
+    improving = ", ".join(
+        f"{metric_id} {'down' if goal == 'min' else 'up'}"
+        for metric_id, goal in zip(objective_ids, objective_goals)
+    )
+
+    drafts: list[InsightDraft] = []
+    for index in range(min(len(contrast_ids), max(2, min(len(families), len(decision_paths))))):
+        family = families[index % len(families)]
+        path = decision_paths[index % len(decision_paths)]
+        drafts.append(
+            InsightDraft(
+                claim=(
+                    f"Generation {generation}: replacing the option at {path} "
+                    f"from family {family} can move the declared objectives in "
+                    f"their improving direction ({improving})."
+                ),
+                trigger=f"A parent-local option of family {family} is available at {path}.",
+                mechanism=(
+                    f"A sealed single-locus replacement at {path} changes the "
+                    f"configuration the frozen evaluator protocol scores, so the "
+                    f"declared objectives may move under the same contract."
+                ),
+                affected_paths=(path,),
+                evidence_summary="One authenticated recombination contrast motivated testing.",
+                confidence=0.5,
+                evidence_contrast_ids=(contrast_ids[index],),
+                effect_predictions=predictions,
+                recommended_option_families=(family,),
+                action_template=(
+                    f"Apply one sealed finite action of family {family} at {path}."
+                ),
+                falsification_condition=(
+                    f"A held-out exact action of family {family} at {path} "
+                    f"violates a predicted metric direction."
+                ),
+                insight_kind=ReflectionInsightKind.EMPIRICAL_PREDICTIVE_RULE,
+                consumer_scopes=(ReflectionConsumerScope.MUTATION_SELECTION,),
+                factor_capabilities=(family,),
+            )
+        )
+    return tuple(drafts)
 
 
 
 
 class _ReflectionExecutor:
-    """Engine-authored canonical envelope replacing only the provider call."""
+    """Engine-authored canonical envelope replacing only the provider call.
 
-    def __init__(self) -> None:
+    Constructed with the vocabulary the workload published, never with any of
+    its own: objective ids and goals from the problem, families and loci from
+    the selected finite catalogue.
+    """
+
+    def __init__(
+        self,
+        *,
+        objective_ids: tuple[str, ...],
+        objective_goals: tuple[str, ...],
+        families: tuple[str, ...],
+        decision_paths: tuple[str, ...],
+    ) -> None:
+        self.objective_ids = objective_ids
+        self.objective_goals = objective_goals
+        self.families = families
+        self.decision_paths = decision_paths
         self.generations: list[int] = []
         self.records: list[FrozenJsonObject] = []
 
@@ -307,8 +343,17 @@ class _ReflectionExecutor:
                 sorted(member.target_candidate_id for member in members)
             ),
             evidence_catalog=catalog,
-            insight_contract=_reflection_contract(),
-            insights=_reflection_drafts(generation, contrast_ids),
+            insight_contract=_reflection_contract(
+                self.objective_ids, self.families, self.decision_paths
+            ),
+            insights=_reflection_drafts(
+                generation,
+                contrast_ids,
+                self.objective_ids,
+                self.objective_goals,
+                self.families,
+                self.decision_paths,
+            ),
             finite_action_bindings=(),
             empirical_evidence=tuple(
                 EmpiricalEvidenceSnapshot(
@@ -359,10 +404,14 @@ def _portfolio_quality(outcomes) -> float:
 
 
 class _WaveFactory:
-    def __init__(self, composition, learning_runtime, seed_card) -> None:
+    def __init__(
+        self, composition, learning_runtime, seed_card, objective_ids, outer_seed
+    ) -> None:
         self.composition = composition
         self.learning_runtime = learning_runtime
         self.seed_card = seed_card
+        self.objective_ids = objective_ids
+        self.outer_seed = outer_seed
         self.diagnostic_assignments: list[tuple[int, int, tuple[InsightRef, ...]]] = []
         self.assignment_plans: dict[tuple[int, str], BalancedSubsetBlockPlan] = {}
 
@@ -378,7 +427,7 @@ class _WaveFactory:
             finite_variation_contract=context.variation.contract,
             cards=cards,
             portfolio_size=context.stage_request.step.offspring_per_parent,
-            required_metric_ids=OBJECTIVE_IDS,
+            required_metric_ids=self.objective_ids,
             min_distinct_families=None,
             require_supporting_cards=False,
             temperature=None,
@@ -414,7 +463,7 @@ class _WaveFactory:
         permutation_rank = (
             int(
                 _sha(
-                    f"{OUTER_SEED}:{generation}:{exposure.receipt_sha256}:"
+                    f"{self.outer_seed}:{generation}:{exposure.receipt_sha256}:"
                     "balanced-subset-permutation"
                 ),
                 16,
@@ -431,9 +480,23 @@ class _WaveFactory:
         return plan
 
     def _diagnostic_wave(self, context, exposure):
-        projection = PortfolioMemoryContextProjectionBinding.from_selector_context(
-            context.evidence_context
-        )
+        # The reserved memory-estimand subtree is present only when the kit
+        # configured a memory estimand projector; the runtime injects it in
+        # `_project_memory_estimand` and nowhere else.  Calling
+        # `from_selector_context` unconditionally therefore raised on any
+        # workload that does not configure one -- which is every workload but
+        # the one this driver was distilled from.  This mirrors the framework's
+        # own guard in portfolio_campaign_runtime (`if
+        # MEMORY_ESTIMAND_CONTEXT_KEY in context_values`).
+        context_values = dict(context.evidence_context.items)
+        if MEMORY_ESTIMAND_CONTEXT_KEY in context_values:
+            projection = PortfolioMemoryContextProjectionBinding.from_selector_context(
+                context.evidence_context
+            )
+        else:
+            projection = PortfolioMemoryContextProjectionBinding.exact_identity(
+                typed_json_sha256(context.evidence_context)
+            )
         plan = self._assignment_plan(context, exposure, projection)
         assignment_slot = plan.assignment_for(
             context.stage_request.step.generation,
@@ -619,13 +682,7 @@ class _NeverGenerator:
 def _derive_editable_paths(kit) -> tuple[str, ...]:
     """Reflection-editable JSON paths, read off the catalogue's own loci."""
 
-    catalog = None
-    for value in kit.benchmark.finite_variation_catalogs:
-        if value.catalog_id == kit.selected_finite_catalog_id:
-            catalog = value
-            break
-    if catalog is None and kit.benchmark.finite_variation_catalogs:
-        catalog = kit.benchmark.finite_variation_catalogs[0]
+    catalog = _selected_catalog(kit)
     seed_cfg = freeze_json(kit.seeds[0].configuration)
     paths: list[str] = []
     for option in catalog.options(seed_cfg):
@@ -640,6 +697,50 @@ def _derive_editable_paths(kit) -> tuple[str, ...]:
             "paths can be derived; declare them in the adapter"
         )
     return tuple(sorted(set(paths)))
+
+
+def _selected_catalog(kit):
+    """The finite catalogue the kit selected, or its first if none is named."""
+
+    for value in kit.benchmark.finite_variation_catalogs:
+        if value.catalog_id == kit.selected_finite_catalog_id:
+            return value
+    if kit.benchmark.finite_variation_catalogs:
+        return kit.benchmark.finite_variation_catalogs[0]
+    raise ValueError("the workload benchmark published no finite variation catalogue")
+
+
+def _derive_objective_ids(kit) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Objective ids and goals, read off the problem's own ObjectiveSpec list."""
+
+    objectives = tuple(kit.benchmark.problem.objectives)
+    if not objectives:
+        raise ValueError(
+            "the workload problem published no objectives, so no reflection "
+            "metric contract can be derived; declare them in the adapter"
+        )
+    return (
+        tuple(spec.name for spec in objectives),
+        tuple(spec.goal for spec in objectives),
+    )
+
+
+def _derive_option_families(kit) -> tuple[str, ...]:
+    """Option families, read off the selected catalogue's own options."""
+
+    catalog = _selected_catalog(kit)
+    seed_cfg = freeze_json(kit.seeds[0].configuration)
+    families: list[str] = []
+    for option in catalog.options(seed_cfg):
+        family = getattr(option, "family", None)
+        if family and family not in families:
+            families.append(family)
+    if not families:
+        raise ValueError(
+            "the workload catalogue published no option families, so no "
+            "reflection family contract can be derived; declare them in the adapter"
+        )
+    return tuple(sorted(families))
 
 
 def _derive_evaluator_contract_sha256(kit) -> str:
@@ -767,7 +868,13 @@ def run_workload_campaign(
     )
     learning = ClosedLoopCampaignLearning(memory=memory)
     parent_selector = ArchiveReservoirCampaignParentSelector(reservoir_limit=8)
-    reflection_executor = _ReflectionExecutor()
+    objective_ids, objective_goals = _derive_objective_ids(kit)
+    reflection_executor = _ReflectionExecutor(
+        objective_ids=objective_ids,
+        objective_goals=objective_goals,
+        families=_derive_option_families(kit),
+        decision_paths=editable_paths,
+    )
     preparation_policies = CampaignPolicies(
         cadence=AlternatingPortfolioRecombinationCadence(),
         parent_selection=_binding("archive_reservoir", parent_selector),
@@ -847,7 +954,9 @@ def run_workload_campaign(
             hypothesis_matcher=PortableFiniteActionHypothesisMatcher(),
         ),
     )
-    wave_factory = _WaveFactory(composition, learning_runtime, seed_card)
+    wave_factory = _WaveFactory(
+        composition, learning_runtime, seed_card, objective_ids, outer_seed
+    )
     policies = CampaignPolicies(
         cadence=preparation_policies.cadence,
         parent_selection=preparation_policies.parent_selection,
