@@ -43,12 +43,27 @@ _TOKEN = re.compile(r"^[a-z][a-z0-9_.:-]{0,127}$")
 _WORKLOAD_DEFINITION_DOMAIN = b"agent-evolve:workload-kit-definition:v1\x00"
 _INTEGRATION_RECEIPT_DOMAIN = b"agent-evolve:workload-kit-receipt:v1\x00"
 GENERIC_SCHEMA_EVIDENCE_PROJECTION_ID = "generic_schema_evidence"
-GENERIC_SCHEMA_EVIDENCE_PROJECTION_VERSION = 1
+# v2: the default projection now emits ONE schema-derived bootstrap card.
+#
+# v1 returned no cards, and `CampaignPortfolioWaveContext` requires
+# `evidence_cards` to be a non-empty tuple, so **every workload that omitted an
+# evidence projection was unable to run a portfolio campaign at all** -- it
+# raised "portfolio context requires evidence cards" at the first stage.  That
+# is four shipped workloads, not one: analog_sizing, heat2d, pybamm_fastcharge
+# and scip_miplib all report `uses_default_schema_evidence`.  It stayed
+# invisible because every workload with a hand-written runner supplies its own
+# projection, so the default was never driven to a portfolio stage until a
+# second workload went through the generic driver.
+#
+# The card is derived entirely from material already in scope -- the benchmark
+# descriptor, the finite variation contract and the parent/memory hashes -- so
+# the projection remains workload-neutral and carries no workload constant.
+GENERIC_SCHEMA_EVIDENCE_PROJECTION_VERSION = 2
 GENERIC_SCHEMA_EVIDENCE_PROJECTION_DEFINITION_SHA256 = hashlib.sha256(
-    b"agent-evolve:generic-schema-evidence:v1;"
+    b"agent-evolve:generic-schema-evidence:v2;"
     b"empty-bootstrap-memory=true;objective-declarations=true;"
     b"catalog-identity-and-cardinality=true;parent-and-memory-hashes=true;"
-    b"workload-prose=false;cards=empty"
+    b"workload-prose=false;cards=one-schema-derived-bootstrap-card"
 ).hexdigest()
 
 
@@ -146,8 +161,46 @@ def _generic_cards(
     variation,
     memory,
 ) -> tuple[FrozenJsonObject, ...]:
-    del benchmark, session, parent, variation, memory
-    return ()
+    """One schema-derived bootstrap card.
+
+    The portfolio wave context requires at least one evidence card, so a
+    projection that returns none cannot reach a portfolio stage.  This card
+    states only what the schema already declares: which objectives are being
+    optimized, which finite catalogue the options come from, how many options
+    are eligible, and which parent and memory the selection is conditioned on.
+    It asserts nothing about the workload's semantics and contains no workload
+    constant -- a workload that wants richer evidence supplies its own
+    projection, which is what every hand-written runner already does.
+    """
+
+    del benchmark
+    descriptor = thaw_json(session.benchmark)
+    contract = variation.contract
+    record = {
+        "schema_version": 1,
+        "card_kind": "schema_bootstrap",
+        "projection_id": GENERIC_SCHEMA_EVIDENCE_PROJECTION_ID,
+        "claim": (
+            "Selection is conditioned on the declared objectives and the sealed "
+            "finite option contract below; no workload-specific evidence has "
+            "been supplied by this projection."
+        ),
+        "workload_id": descriptor["workload_id"],
+        "objectives": descriptor["objectives"],
+        "finite_variation": {
+            "catalog_id": contract.catalog_id,
+            "catalog_version": contract.catalog_version,
+            "catalog_definition_sha256": contract.catalog_definition_sha256,
+            "contract_identity_sha256": contract.identity_sha256,
+            "eligible_option_count": len(contract.options),
+        },
+        "parent_configuration_sha256": typed_json_sha256(parent),
+        "memory_sha256": typed_json_sha256(memory),
+    }
+    frozen = freeze_json(record)
+    if type(frozen) is not FrozenJsonObject:  # pragma: no cover
+        raise AssertionError("generic card did not freeze as an object")
+    return (frozen,)
 
 
 def generic_schema_evidence_projections() -> AgenticCampaignEvidenceProjections:

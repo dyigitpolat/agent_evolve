@@ -162,7 +162,7 @@ _PORTFOLIO_ENDPOINT_SHA256 = hashlib.sha256(
     b"agent-evolve:driver:portfolio-endpoint:v1"
 ).hexdigest()
 _REFLECTION_FACT_SCHEMA_SHA256 = hashlib.sha256(
-    b"agent-evolve:driver:reflection-fact-schema:v1"
+    b"agent-evolve:driver:reflection-fact-schema:v2"
 ).hexdigest()
 
 WORKLOAD_ID = "workload"
@@ -316,10 +316,16 @@ class _ReflectionExecutor:
                     fact_schema_id=f"{WORKLOAD_ID}_recombination_contrast",
                     fact_schema_version=1,
                     fact_schema_definition_sha256=_REFLECTION_FACT_SCHEMA_SHA256,
+                    # `"provider_calls": 0` was asserted here as a literal. It
+                    # cannot come out any other way at this site, so it
+                    # evidenced nothing while reading as a provider-free claim
+                    # -- exactly what the provider-accounting ratchet forbids.
+                    # Run-level provider traffic is measured instead, on
+                    # WorkloadCampaignRun.provider_calls, from the execution
+                    # counters.
                     facts=_object(
                         {
                             "source_outcome_sha256": contrast_id,
-                            "provider_calls": 0,
                             "evaluation_source": "authenticated_engine_receipt",
                         }
                     ),
@@ -555,7 +561,10 @@ class _PreparationRuntime:
             runtime_version=1,
             definition_sha256=_sha(f"{WORKLOAD_ID}-run-runtime-v1"),
             accepted=True,
-            evidence=_object({"provider_calls": 0, "real_evaluator": True}),
+            # Same reason as the reflection fact above: a literal zero here
+            # is unfalsifiable at this site. The acceptance evidence states
+            # what it can actually witness.
+            evidence=_object({"real_evaluator": True}),
         )
 
 
