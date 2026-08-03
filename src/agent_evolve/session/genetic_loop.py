@@ -215,6 +215,16 @@ def run_genetic_loop(
         ranks = domination_rank([obj for _c, obj in population], specs)
         ranked = [(c, r) for (c, _o), r in zip(population, ranks)]
         choices = list(pick(ranked, want))[:want]
+        # A chooser that returns too few must not silently shrink the
+        # generation: the arm would then spend less budget than the control it
+        # is compared against. Top up at random and record how many, so the
+        # shortfall shows up in the result instead of in the conclusion.
+        filled = 0
+        if len(choices) < want:
+            filled = want - len(choices)
+            choices = list(choices) + list(
+                random_chooser(rng, n_loci)(ranked, filled)
+            )
         kids: List[Config] = []
         for choice in choices:
             a = population[choice.parent_a % len(population)][0]
@@ -236,7 +246,12 @@ def run_genetic_loop(
         pool: List[tuple[Config, Mapping[str, float]]] = list(population)
         pool.extend((r.configuration, dict(r.objectives)) for r in valid)
         population = survive(pool)
-        history.append({"gen": gen, "valid_count": len(valid), "pop": len(population)})
+        history.append({"gen": gen, "valid_count": len(valid),
+                        "pop": len(population),
+                        "choices_filled_at_random": filled})
+        if filled:
+            log(f"generation {gen}: the chooser supplied {want - filled} of "
+                f"{want} choices; {filled} were filled at random")
         log(f"generation {gen}: {len(valid)} evaluated, {spent()} of "
             f"{config.evaluation_budget} budget used")
 
