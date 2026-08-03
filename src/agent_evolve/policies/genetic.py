@@ -118,6 +118,11 @@ def locus_domain(candidate_model: Any, locus: Locus) -> tuple[Any, ...]:
         return ()
     if "enum" in node:
         return tuple(node["enum"])
+    if node.get("type") == "boolean":
+        # A boolean is a finite domain. Without this, a bool field has no
+        # declared values, mutate() leaves it alone, and a real design axis is
+        # silently frozen at whatever the seed happened to carry.
+        return (False, True)
     for key in ("anyOf", "oneOf"):
         for branch in node.get(key, ()) or ():
             branch = resolve(branch)

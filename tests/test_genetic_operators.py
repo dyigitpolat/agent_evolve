@@ -157,3 +157,13 @@ def test_uniform_candidate_without_any_domain_falls_back_to_mutate() -> None:
     template = {"label": "x"}
     out = uniform_candidate(template, None, rng=random.Random(0))
     assert out == template  # mutate() with no model is a no-op, never a crash
+
+
+def test_a_boolean_locus_has_the_two_value_domain() -> None:
+    # Without this a bool field has no declared values, mutate() leaves it
+    # alone, and a real design axis is silently frozen at the seed's value.
+    class _WithFlag(BaseModel):
+        flag: bool
+        width: Literal[2, 4]
+
+    assert set(locus_domain(_WithFlag, Locus("flag"))) == {False, True}
