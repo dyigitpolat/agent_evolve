@@ -108,12 +108,40 @@ def _build_harness(kind: str, seed: Optional[int], settings: AgentEvolveSettings
         raise KeyError(bootstrap.explain_missing_harness(harness_id)) from error
 
 
+def _resolve_strategy(strategy: str, has_seeds: bool, announce) -> str:
+    """Pick the search loop. ``auto`` prefers genetics wherever they are usable.
+
+    The authoring loop asks a model to write whole configurations from a text
+    rendering of the Pareto front. Measured against uniform random sampling on
+    every genome length tried, that loses (-0.086 to -0.531 excess capture)
+    while recombination over a population wins (+0.0042 to +0.1798). So
+    ``genetic`` is preferred wherever it can run, which is wherever the problem
+    supplies at least one seed to give a candidate its shape.
+    """
+
+    if strategy not in ("auto", "genetic", "authoring"):
+        raise ValueError(
+            f"strategy must be 'auto', 'genetic' or 'authoring', got {strategy!r}"
+        )
+    if strategy != "auto":
+        return strategy
+    if has_seeds:
+        return "genetic"
+    announce(
+        "No seeds were supplied, so candidates are authored from scratch rather "
+        "than recombined. Give Problem.seeds() one configuration to use the "
+        "genetic loop, which measures better against random search."
+    )
+    return "authoring"
+
+
 def optimize(
     problem: Any,
     *,
     budget: int = 40,
     model: Optional[str] = None,
     proposer: str = "auto",
+    strategy: str = "auto",
     seed: Optional[int] = None,
     seal: Optional[str] = None,
     on_progress: Optional[Callable[[str], None]] = None,
@@ -138,7 +166,39 @@ def optimize(
     bound = as_problem(problem)
     announce = on_progress or (lambda _message: None)
     settings = AgentEvolveSettings.from_env()
+
+    # Arguments are validated before any branching. A caller who passes a
+    # nonsense proposer must be told so whichever loop ends up running --
+    # skipping validation on one path is how an invalid argument becomes a
+    # silent no-op.
     kind = _resolve_proposer(proposer, announce)
+
+    seeds = tuple(dict(c) for c in bound.seeds())
+    chosen = _resolve_strategy(strategy, bool(seeds), announce)
+    if chosen == "genetic":
+        # Only the loop is imported locally. Importing EvaluationCache here too
+        # would make that name function-local for the whole body and break the
+        # authoring path below, which uses the module-level import.
+        from agent_evolve.session.genetic_loop import GeneticConfig, run_genetic_loop
+
+        cache = EvaluationCache()
+        cache.budget = budget
+        pop = max(2, min(len(seeds) * 2, budget // 4) or 2)
+        offspring = max(1, pop - 1)
+        return run_genetic_loop(
+            problem=bound,
+            config=GeneticConfig(
+                population_size=pop,
+                offspring_per_generation=offspring,
+                generations=max(1, (budget - pop) // offspring),
+                seed=seed,
+                seeds=seeds,
+                evaluation_budget=budget,
+                evaluation_cache=cache,
+            ),
+            log=announce,
+        )
+
     harness = _build_harness(kind, seed, settings)
 
     ctx = HarnessContext(
@@ -174,8 +234,7 @@ def optimize(
             LLMConfig(model=model or settings.model, temperature=settings.temperature),
         )
 
-    seeds = tuple(dict(c) for c in bound.seeds())
-    cache = EvaluationCache()
+    cache = EvaluationCache()   # `seeds` was already read above, once
     cache.budget = budget
     config = LoopConfig(
         pop_size=min(budget, _BATCH),
