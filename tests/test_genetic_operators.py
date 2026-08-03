@@ -136,3 +136,24 @@ def test_operators_never_reference_a_workload() -> None:
         assert f" {noun} " not in source and f"_{noun}" not in source, (
             f"workload vocabulary {noun!r} leaked into a generic operator module"
         )
+
+
+def test_uniform_candidate_redraws_declared_loci_and_keeps_the_rest() -> None:
+    from agent_evolve.policies.genetic import uniform_candidate
+
+    template = {"sequence": ["a", "a"], "width": 2, "label": "keep me"}
+    seen_widths = set()
+    for s in range(30):
+        out = uniform_candidate(template, _Candidate, rng=random.Random(s))
+        assert out["label"] == "keep me", "an undeclared locus was invented"
+        assert all(v in ("a", "b", "c") for v in out["sequence"])
+        seen_widths.add(out["width"])
+    assert seen_widths == {2, 4, 8}, "declared domains were not actually sampled"
+
+
+def test_uniform_candidate_without_any_domain_falls_back_to_mutate() -> None:
+    from agent_evolve.policies.genetic import uniform_candidate
+
+    template = {"label": "x"}
+    out = uniform_candidate(template, None, rng=random.Random(0))
+    assert out == template  # mutate() with no model is a no-op, never a crash

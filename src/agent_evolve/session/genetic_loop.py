@@ -28,6 +28,7 @@ from agent_evolve.policies.genetic import (
     loci_of,
     mutate,
     truncation_survival,
+    uniform_candidate,
 )
 from agent_evolve.session.evaluate import EvaluationCache, evaluate_batch
 
@@ -190,15 +191,40 @@ def run_genetic_loop(
         # population does not keep: what was tried and rejected is exactly the
         # evidence that a locus is saturated.
         state.evaluated.extend((r.configuration, dict(r.objectives)) for r in valid)
+        # --- actionable side information ----------------------------------
+        # Failures verbatim: what the validator or evaluator said is exactly
+        # the diagnostic the score-only condition throws away.
+        for result in failed:
+            message = getattr(result, "error_message", None)
+            if message:
+                state.side_information.append(f"rejected: {message}")
+        # Optional problem hook -- an opt-in sixth obligation, never required.
+        hook = getattr(problem, "side_information", None)
+        if callable(hook):
+            for result in valid:
+                try:
+                    text = hook(result.configuration, dict(result.objectives))
+                except Exception as exc:            # a hook must not kill a run,
+                    state.side_information.append(  # but must not vanish either
+                        f"side_information hook raised {type(exc).__name__}: {exc}"
+                    )
+                    break
+                if text:
+                    state.side_information.append(str(text))
+        del state.side_information[:-64]            # bounded, newest kept
         return valid
 
-    # --- initial population: the seeds, then mutants of them ---------------
+    # --- initial population: the seeds, then SCHEMA-UNIFORM draws -----------
+    # Not mutants of the seed. A population of near-copies of one
+    # configuration is an anchored cloud around it; measured on a third-party
+    # optimizer, correcting exactly this anchor moved its result from +0.095
+    # (loses badly to uniform) to +0.0066 (parity), and the standard seed on
+    # log2 scores worse than a typical uniform draw.
     n_loci = len(loci_of(seeds[0]))
     initial = list(seeds)
     while len(initial) < config.population_size:
-        parent = initial[rng.randrange(len(initial))]
-        initial.append(mutate(parent, candidate_model,
-                              rate=config.mutation_rate, rng=rng))
+        template = initial[rng.randrange(len(initial))]
+        initial.append(uniform_candidate(template, candidate_model, rng=rng))
     valid = measure(initial, 0)
     if not valid:
         raise RuntimeError(

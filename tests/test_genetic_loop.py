@@ -160,3 +160,88 @@ def test_domination_rank_is_weight_free_and_pareto_correct() -> None:
 def test_domination_rank_respects_max_direction() -> None:
     specs = (ObjectiveSpec(name="a", goal="max"),)
     assert domination_rank([{"a": 5.0}, {"a": 1.0}], specs) == [0.0, 1.0]
+
+
+def test_initial_population_is_uniform_draws_not_an_anchored_cloud() -> None:
+    # Mutants of one seed cluster around it (about one locus changed each);
+    # schema-uniform draws do not. Measured on a third-party optimizer, the
+    # anchor alone was worth +0.095 -> +0.0066 against uniform.
+    problem = _CountOnes(length=8)
+    result = run_genetic_loop(
+        problem=problem,
+        config=GeneticConfig(population_size=8, offspring_per_generation=1,
+                             generations=1, seed=3, evaluation_budget=9),
+    )
+    gen0 = [c.configuration["genome"] for c in result.all_candidates
+            if c.metadata.get("generation") == 0]
+    seed_distance = [sum(1 for bit in genome if bit != 0) for genome in gen0]
+    # an anchored cloud has median distance ~1 from the all-zero seed; uniform
+    # draws over {0,1}^8 sit near 4
+    far = [d for d in seed_distance if d >= 2]
+    assert len(far) >= 3, (
+        f"initial population hugs the seed (distances {sorted(seed_distance)})"
+    )
+
+
+def test_validation_failures_reach_side_information_verbatim() -> None:
+    from agent_evolve.core.problem import ValidationOutcome
+    from agent_evolve.policies.search_state import SearchState
+
+    class _Picky(_CountOnes):
+        def validate(self, config):
+            if sum(config["genome"]) > 4:
+                return ValidationOutcome(
+                    ok=False, failure_phase="constraint",
+                    message="too many ones; at most 4 are feasible")
+            return ValidationOutcome(ok=True)
+
+    state = SearchState()
+    run_genetic_loop(
+        problem=_Picky(length=8),
+        config=GeneticConfig(population_size=6, offspring_per_generation=4,
+                             generations=4, seed=9, evaluation_budget=30,
+                             state=state),
+    )
+    assert any("at most 4 are feasible" in line
+               for line in state.side_information), (
+        "the validator's message never reached the chooser's context"
+    )
+
+
+def test_problem_side_information_hook_is_used_when_present() -> None:
+    from agent_evolve.policies.search_state import SearchState
+
+    class _Talkative(_CountOnes):
+        def side_information(self, config, objectives):
+            return f"diag: ones={objectives['ones']:.0f}"
+
+    state = SearchState()
+    run_genetic_loop(
+        problem=_Talkative(length=6),
+        config=GeneticConfig(population_size=4, offspring_per_generation=3,
+                             generations=2, seed=4, evaluation_budget=12,
+                             state=state),
+    )
+    assert any(line.startswith("diag: ones=") for line in state.side_information)
+
+
+def test_a_raising_hook_is_recorded_not_swallowed_and_not_fatal() -> None:
+    from agent_evolve.policies.search_state import SearchState
+
+    class _Broken(_CountOnes):
+        def side_information(self, config, objectives):
+            raise RuntimeError("diagnostics backend down")
+
+    state = SearchState()
+    result = run_genetic_loop(
+        problem=_Broken(length=6),
+        config=GeneticConfig(population_size=4, offspring_per_generation=3,
+                             generations=2, seed=4, evaluation_budget=12,
+                             state=state),
+    )
+    assert result.evaluations > 0, "a diagnostics hook must never kill a run"
+    assert any("hook raised RuntimeError" in line
+               for line in state.side_information), (
+        "a raising hook vanished silently -- that is how a degraded arm "
+        "produces a null indistinguishable from an honest one"
+    )
