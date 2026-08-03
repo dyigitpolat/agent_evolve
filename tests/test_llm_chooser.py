@@ -82,7 +82,7 @@ def test_chooser_reports_a_shortfall_instead_of_hiding_it() -> None:
     seen: list[tuple[int, int]] = []
     chooser = llm_chooser(lambda _p: "no json here", objectives=_SPECS,
                           budget=10, on_shortfall=lambda got, want: seen.append((got, want)))
-    out = chooser(_POP, 3)
+    out = chooser(_POP, 3, None)
     assert out == []
     assert seen == [(0, 3)]
 
@@ -93,7 +93,7 @@ def test_provider_errors_are_counted_not_propagated() -> None:
 
     t = ChooserTelemetry()
     chooser = llm_chooser(boom, objectives=_SPECS, budget=10, telemetry=t)
-    assert chooser(_POP, 2) == []
+    assert chooser(_POP, 2, None) == []
     assert t.errors == 1
 
 
@@ -104,7 +104,7 @@ def test_the_prompt_carries_the_population_and_forbids_authoring() -> None:
         captured.append(prompt)
         return '[{"parent_a": 0, "parent_b": 1, "mask": [0,0,0,0]}]'
 
-    llm_chooser(capture, objectives=_SPECS, budget=10)(_POP, 1)
+    llm_chooser(capture, objectives=_SPECS, budget=10)(_POP, 1, None)
     prompt = captured[0]
     assert "genome" in prompt, "the population was not shown"
     assert "Do NOT write candidates" in prompt
@@ -125,3 +125,45 @@ def test_chooser_module_names_no_workload() -> None:
     source = pathlib.Path(module.__file__).read_text(encoding="utf-8").lower()
     for noun in ("abc", "boils", "timeloop", "lut", "circuit", "spice"):
         assert f" {noun} " not in source and f"_{noun}" not in source
+
+
+def test_the_search_state_reaches_the_prompt() -> None:
+    # The whole point of design v2: the model reasons over measurements. If the
+    # state does not arrive, the guided arm is the thin-question arm wearing a
+    # different name.
+    from agent_evolve.policies.search_state import SearchState
+
+    captured: list[str] = []
+
+    def capture(prompt: str) -> str:
+        captured.append(prompt)
+        return '[{"parent_a": 0, "parent_b": 1, "mask": [0,0,0,0]}]'
+
+    state = SearchState(evaluated=[
+        ({"genome": [0, 0, 0, 0]}, {"ones": 0.0}),
+        ({"genome": [0, 1, 1, 1]}, {"ones": 3.0}),
+    ])
+    llm_chooser(capture, objectives=_SPECS, budget=10)(_POP, 1, state)
+    assert "PER-LOCUS MEASUREMENTS" in captured[0]
+    assert "genome[0]" in captured[0], "the locus table did not render"
+
+
+def test_no_state_leaves_the_prompt_exactly_as_it_was() -> None:
+    # The score-only baseline must be the prompt this chooser sent before the
+    # search state existed. An empty heading would still tell the model a
+    # channel exists, and an ablation must not carry that difference.
+    from agent_evolve.policies.search_state import SearchState, StateChannels
+
+    seen: list[str] = []
+
+    def capture(prompt: str) -> str:
+        seen.append(prompt)
+        return '[{"parent_a": 0, "parent_b": 1, "mask": [0,0,0,0]}]'
+
+    llm_chooser(capture, objectives=_SPECS, budget=10)(_POP, 1, None)
+    off = SearchState(channels=StateChannels.none(),
+                      evaluated=[({"genome": [0, 0, 0, 0]}, {"ones": 0.0})])
+    llm_chooser(capture, objectives=_SPECS, budget=10)(_POP, 1, off)
+
+    assert seen[0] == seen[1], "all channels off is not identical to no state"
+    assert "PER-LOCUS" not in seen[0]

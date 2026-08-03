@@ -58,7 +58,7 @@ _PROMPT = """You are choosing recombination operations for a genetic optimizer.
 
 OBJECTIVES (this is what the numbers mean):
 {objectives}
-
+{state}
 CURRENT POPULATION -- index, then the candidate, then its measured objectives:
 {population}
 
@@ -164,14 +164,24 @@ def llm_chooser(
     stats = telemetry if telemetry is not None else ChooserTelemetry()
     spent = {"n": 0}
 
-    def choose(population: Sequence[tuple[Config, float]], count: int):
+    def choose(population: Sequence[tuple[Config, float]], count: int,
+               state: Any = None):
         if not population:
             return []
         loci = loci_of(population[0][0])
+        # An absent state renders to nothing at all, so the score-only baseline
+        # is byte-identical to the prompt this chooser sent before the search
+        # state existed -- an ablation must not carry an empty heading.
+        block = ""
+        if state is not None:
+            rendered = state.render([spec.name for spec in objectives])
+            if rendered:
+                block = "\n" + rendered + "\n"
         prompt = _PROMPT.format(
             objectives="\n".join(
                 f"  {spec.name}: {spec.goal}imise" for spec in objectives
             ),
+            state=block,
             population=render_population(population, objectives),
             n_loci=len(loci),
             loci="  " + ", ".join(str(locus) for locus in loci),

@@ -179,7 +179,25 @@ def optimize(
         # Only the loop is imported locally. Importing EvaluationCache here too
         # would make that name function-local for the whole body and break the
         # authoring path below, which uses the module-level import.
+        from agent_evolve.policies.search_state import SearchState
         from agent_evolve.session.genetic_loop import GeneticConfig, run_genetic_loop
+
+        chooser = None
+        if kind == "llm":
+            # Guided operator choice: the model picks parents and cut points,
+            # reasoning over the accumulated search state. It cannot author a
+            # candidate -- OperatorChoice has no field that could hold one.
+            from agent_evolve.integrations.completion import completion_for
+            from agent_evolve.policies.llm_chooser import llm_chooser
+
+            complete = completion_for(model or settings.model, settings)
+            if complete is not None:
+                chooser = llm_chooser(
+                    complete, objectives=list(bound.objectives), budget=budget,
+                    on_shortfall=lambda got, want: announce(
+                        f"the model supplied {got} of {want} operator choices; "
+                        "the rest were filled at random"),
+                )
 
         cache = EvaluationCache()
         cache.budget = budget

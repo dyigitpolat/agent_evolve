@@ -51,9 +51,14 @@ class OperatorChoice:
     mutate_loci: Optional[tuple[Locus, ...]] = None
 
 
-#: Given the ranked population and how many offspring are wanted, return that
-#: many operator choices. Indices address the population list.
-OperatorChooser = Callable[[Sequence[tuple[Config, float]], int], Sequence[OperatorChoice]]
+#: Given the ranked population, how many offspring are wanted, and the search
+#: state accumulated so far, return that many operator choices. Indices address
+#: the population list. The state argument is explicit rather than captured so
+#: that a chooser's inputs are visible at the call site and an ablation can be
+#: read off the signature.
+OperatorChooser = Callable[
+    [Sequence[tuple[Config, float]], int, Any], Sequence[OperatorChoice]
+]
 
 
 @dataclass(slots=True)
@@ -66,6 +71,8 @@ class GeneticConfig:
     seeds: tuple = ()
     evaluation_budget: Optional[int] = None
     evaluation_cache: EvaluationCache = field(default_factory=EvaluationCache)
+    #: What the chooser may reason over. Left None for the score-only baseline.
+    state: Any = None
 
 
 def domination_rank(
@@ -102,7 +109,9 @@ def domination_rank(
 def random_chooser(rng: random.Random, n_loci: int) -> OperatorChooser:
     """The unguided control: tournament parents, uniform mask, random loci."""
 
-    def choose(population: Sequence[tuple[Config, float]], count: int):
+    def choose(population: Sequence[tuple[Config, float]], count: int,
+               state: Any = None):
+        del state                       # the unguided control reasons over nothing
         out: List[OperatorChoice] = []
         for _ in range(count):
             def pick() -> int:
@@ -156,9 +165,16 @@ def run_genetic_loop(
             return 1 << 30
         return max(0, config.evaluation_budget - spent())
 
+    from agent_evolve.policies.search_state import SearchState
+
     all_valid: List[Any] = []
     all_meta: List[tuple] = []
     history: List[Dict[str, Any]] = []
+    # The state accumulates across generations and is handed to the chooser
+    # each time. The unguided chooser ignores it, which is what makes the two
+    # arms differ in exactly one thing.
+    state = config.state if config.state is not None else SearchState()
+    state.history = history
 
     def measure(configs: List[Config], gen: int) -> List[Any]:
         room = budget_left()
@@ -170,6 +186,10 @@ def run_genetic_loop(
         all_valid.extend(valid)
         for result in list(valid) + list(failed):
             all_meta.append((result, {"generation": gen}))
+        # Every measured candidate feeds the per-locus table, including ones the
+        # population does not keep: what was tried and rejected is exactly the
+        # evidence that a locus is saturated.
+        state.evaluated.extend((r.configuration, dict(r.objectives)) for r in valid)
         return valid
 
     # --- initial population: the seeds, then mutants of them ---------------
@@ -214,7 +234,7 @@ def run_genetic_loop(
         # combine, and a rank is the comparable form of "how good is this one".
         ranks = domination_rank([obj for _c, obj in population], specs)
         ranked = [(c, r) for (c, _o), r in zip(population, ranks)]
-        choices = list(pick(ranked, want))[:want]
+        choices = list(pick(ranked, want, state))[:want]
         # A chooser that returns too few must not silently shrink the
         # generation: the arm would then spend less budget than the control it
         # is compared against. Top up at random and record how many, so the
@@ -223,7 +243,7 @@ def run_genetic_loop(
         if len(choices) < want:
             filled = want - len(choices)
             choices = list(choices) + list(
-                random_chooser(rng, n_loci)(ranked, filled)
+                random_chooser(rng, n_loci)(ranked, filled, None)
             )
         kids: List[Config] = []
         for choice in choices:

@@ -99,7 +99,7 @@ def test_chooser_decisions_are_actually_applied() -> None:
     # null indistinguishable from an honest one.
     seen: List[int] = []
 
-    def chooser(population, count):
+    def chooser(population, count, state=None):
         seen.append(len(population))
         return [
             OperatorChoice(parent_a=0, parent_b=0,
@@ -122,7 +122,7 @@ def test_chooser_decisions_are_actually_applied() -> None:
 def test_a_malformed_mask_does_not_crash_the_run() -> None:
     # A model-backed chooser will sometimes return the wrong length. Losing a
     # whole run to that is worse than repairing it and carrying on.
-    def bad(population, count):
+    def bad(population, count, state=None):
         return [OperatorChoice(parent_a=0, parent_b=1, mask=(True,))
                 for _ in range(count)]
 
