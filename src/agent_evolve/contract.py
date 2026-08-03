@@ -151,9 +151,20 @@ class _LegacyProblem:
 
     def seeds(self) -> Sequence[Config]:
         seeds = getattr(self._inner, "seeds", None)
-        if seeds is None:
-            return ()
-        return tuple(seeds() if callable(seeds) else seeds)
+        if seeds is not None:
+            declared = tuple(seeds() if callable(seeds) else seeds)
+            if declared:
+                return declared
+        # A problem that declares an `example_config` has already named a
+        # configuration it considers representative, which is exactly what a
+        # seed is. Using it means the run reports whether anything it proposed
+        # beat what the caller already had, and it lets the genetic loop run at
+        # all -- without it such a problem silently falls back to authoring,
+        # which measures worse than random search on every genome length tried.
+        example = getattr(self._inner, "example_config", None)
+        if isinstance(example, Mapping) and example:
+            return (dict(example),)
+        return ()
 
     def validate(self, config: Config) -> ValidationOutcome:
         inner = self._inner

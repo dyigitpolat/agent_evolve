@@ -183,14 +183,21 @@ def optimize(
 
         cache = EvaluationCache()
         cache.budget = budget
-        pop = max(2, min(len(seeds) * 2, budget // 4) or 2)
-        offspring = max(1, pop - 1)
+        # Sized from the BUDGET, not from how many seeds the caller happened to
+        # supply: one seed would otherwise give a population of two, which
+        # cannot recombine into anything its parents do not already contain.
+        pop = max(4, min(budget // 4, 12))
+        offspring = max(2, pop - 2)
+        # `generations` is a cap, not a schedule. Duplicate offspring hit the
+        # evaluation cache without spending budget, so a fixed generation count
+        # would end the run with budget unspent; the loop's real stop condition
+        # is the budget.
         return run_genetic_loop(
             problem=bound,
             config=GeneticConfig(
                 population_size=pop,
                 offspring_per_generation=offspring,
-                generations=max(1, (budget - pop) // offspring),
+                generations=max(1, 4 * budget // max(1, offspring)),
                 seed=seed,
                 seeds=seeds,
                 evaluation_budget=budget,
