@@ -71,6 +71,13 @@ Choose {k} recombination operations. For each, name TWO parents by INDEX and a
 crossover MASK of exactly {n_loci} bits: bit i = 0 takes position i from
 parent_a, bit i = 1 takes it from parent_b.
 
+CHOOSE FOR COMPLEMENTARITY, NOT RANK. Recombination only helps when the two
+parents carry DIFFERENT useful material: repeatedly pairing the top-ranked
+candidate, or masks that copy nearly everything from one side, spend
+evaluations on near-clones. Across your {k} choices use varied parent pairs --
+including mid-rank candidates whose positions differ from the leaders' -- and
+prefer masks that genuinely mix both parents.
+
 Do NOT write candidates. Choose indices and mask bits only.
 
 Reply with ONLY a JSON list of {k} objects and no other text:
