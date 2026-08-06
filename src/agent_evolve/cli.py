@@ -199,6 +199,23 @@ def _cmd_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_diagnose(args: argparse.Namespace) -> int:
+    """Probe the problem itself: search space, pipeline health, and headroom.
+
+    Where ``check`` asks whether a *model* beats uninformed sampling, this asks
+    the prior question: whether *anything* could demonstrate an advantage on
+    this problem at this budget. It needs no model and no credentials, and it
+    spends at most ``--probe`` evaluations.
+    """
+    from agent_evolve.policies.check import check as check_problem
+
+    problem = _load_problem(args.problem)
+    print(f"agent_evolve diagnose: {args.problem}\n")
+    report = check_problem(problem, args.budget, probe=args.probe, seed=args.seed)
+    print(report.render())
+    return 0
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     from agent_evolve.api import optimize
 
@@ -259,6 +276,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     check.add_argument("--verbose", action="store_true")
     check.set_defaults(func=_cmd_check)
+
+    diagnose = sub.add_parser(
+        "diagnose",
+        help="could ANY optimizer show an advantage on your problem at this budget?",
+        description=(
+            "Probes the problem with schema-uniform draws through its own "
+            "validate/materialize/evaluate pipeline and reports the locus and "
+            "domain structure, failure rate, evaluation cost, per-objective "
+            "spread, and whether best-of-budget random draws already reach the "
+            "best the probe found. Spends at most --probe evaluations; needs "
+            "no model and no credentials. Run it before `check`, which spends "
+            "model money to answer the next question."
+        ),
+    )
+    diagnose.add_argument("problem", help="module:attribute naming your problem")
+    diagnose.add_argument(
+        "--budget", type=int, default=40,
+        help="the optimizer budget being assessed (not the probe's spend)",
+    )
+    diagnose.add_argument(
+        "--probe", type=int, default=120,
+        help="schema-uniform draws the probe spends (default 120)",
+    )
+    diagnose.add_argument("--seed", type=int, default=None)
+    diagnose.set_defaults(func=_cmd_diagnose)
 
     run = sub.add_parser("run", help="optimize a problem")
     run.add_argument("problem", help="module:attribute naming your problem")
