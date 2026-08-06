@@ -74,6 +74,12 @@ class GeneticConfig:
     evaluation_cache: EvaluationCache = field(default_factory=EvaluationCache)
     #: What the chooser may reason over. Left None for the score-only baseline.
     state: Any = None
+    #: A prior over WHERE to sample: narrows the declared domain of any locus it
+    #: names, for initialization and mutation alike. Left None, every sampler
+    #: sees exactly the schema's own domains, so the loop is byte-identical to
+    #: the pre-restriction seam. This is guidance over the sampling
+    #: distribution rather than over operator choice within a fixed one.
+    restriction: Any = None
 
 
 def domination_rank(
@@ -224,7 +230,8 @@ def run_genetic_loop(
     initial = list(seeds)
     while len(initial) < config.population_size:
         template = initial[rng.randrange(len(initial))]
-        initial.append(uniform_candidate(template, candidate_model, rng=rng))
+        initial.append(uniform_candidate(template, candidate_model, rng=rng,
+                                         restriction=config.restriction))
     valid = measure(initial, 0)
     if not valid:
         raise RuntimeError(
@@ -282,6 +289,7 @@ def run_genetic_loop(
                 )
             kid = crossover(a, b, mask=mask)
             kid = mutate(kid, candidate_model, rate=config.mutation_rate,
+                         restriction=config.restriction,
                          loci=choice.mutate_loci, rng=rng)
             kids.append(kid)
 

@@ -167,3 +167,77 @@ def test_a_boolean_locus_has_the_two_value_domain() -> None:
         width: Literal[2, 4]
 
     assert set(locus_domain(_WithFlag, Locus("flag"))) == {False, True}
+
+
+# --- DomainRestriction: guidance over the sampling distribution -------------
+
+def _RestrictedModel():
+    from typing import Literal
+    from pydantic import BaseModel
+
+    class M(BaseModel):
+        width: Literal[8, 16]
+        depth: Literal[256, 512, 1024]
+        flag: bool
+    return M
+
+
+def test_restriction_narrows_only_and_is_a_subset():
+    from agent_evolve.policies.genetic import DomainRestriction, Locus, locus_domain
+    M = _RestrictedModel()
+    r = DomainRestriction({"width": [8], "flag": [True]})
+    assert locus_domain(M, Locus("width"), restriction=r) == (8,)
+    assert locus_domain(M, Locus("flag"), restriction=r) == (True,)
+    # an unnamed locus keeps its declared domain untouched
+    assert locus_domain(M, Locus("depth"), restriction=r) == (256, 512, 1024)
+
+
+def test_restriction_cannot_widen_a_declared_domain():
+    # A restriction naming values the schema never declared must not smuggle
+    # them in: the caller would be authoring values the problem forbids.
+    from agent_evolve.policies.genetic import DomainRestriction, Locus, locus_domain
+    M = _RestrictedModel()
+    r = DomainRestriction({"width": [8, 32, 64]})
+    assert locus_domain(M, Locus("width"), restriction=r) == (8,)
+
+
+def test_restriction_that_empties_a_domain_is_ignored_and_counted():
+    # Sampling nothing, or sampling off-schema, are both worse than ignoring a
+    # prior that does not match the problem -- but it must not pass silently.
+    from agent_evolve.policies.genetic import DomainRestriction, Locus, locus_domain
+    M = _RestrictedModel()
+    r = DomainRestriction({"width": [999]})
+    assert locus_domain(M, Locus("width"), restriction=r) == (8, 16)
+    assert r.misses == ["width"]
+
+
+def test_no_restriction_is_byte_identical_to_the_pre_restriction_seam():
+    import random
+    from agent_evolve.policies.genetic import mutate, uniform_candidate
+    M = _RestrictedModel()
+    cfg = {"width": 16, "depth": 512, "flag": False}
+    a = [uniform_candidate(cfg, M, rng=random.Random(7)) for _ in range(3)]
+    b = [uniform_candidate(cfg, M, rng=random.Random(7), restriction=None)
+         for _ in range(3)]
+    assert a == b
+    assert (mutate(cfg, M, rng=random.Random(3))
+            == mutate(cfg, M, rng=random.Random(3), restriction=None))
+
+
+def test_samplers_respect_the_restriction():
+    import random
+    from agent_evolve.policies.genetic import (
+        DomainRestriction, Locus, mutate, uniform_candidate)
+    M = _RestrictedModel()
+    cfg = {"width": 16, "depth": 512, "flag": False}
+    r = DomainRestriction({"width": [8], "flag": [True]})
+    rng = random.Random(11)
+    for _ in range(40):
+        drawn = uniform_candidate(cfg, M, rng=rng, restriction=r)
+        assert drawn["width"] == 8 and drawn["flag"] is True
+        assert drawn["depth"] in (256, 512, 1024)
+    # mutate targeting a restricted locus can only move inside the restriction;
+    # with a single allowed value that means it stays put rather than escaping.
+    stuck = mutate({"width": 8, "depth": 512, "flag": True}, M,
+                   loci=[Locus("width")], rng=random.Random(5), restriction=r)
+    assert stuck["width"] == 8

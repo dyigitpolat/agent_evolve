@@ -17,7 +17,7 @@ whole reason a genome differs from a paragraph of text.
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
 __all__ = [
@@ -26,6 +26,7 @@ __all__ = [
     "read_locus",
     "write_locus",
     "locus_domain",
+    "DomainRestriction",
     "crossover",
     "mutate",
     "uniform_candidate",
@@ -84,13 +85,62 @@ def write_locus(config: Mapping[str, Any], locus: Locus, value: Any) -> dict[str
     return out
 
 
-def locus_domain(candidate_model: Any, locus: Locus) -> tuple[Any, ...]:
+@dataclass(frozen=True)
+class DomainRestriction:
+    """A narrowing of declared locus domains -- a prior over where to sample.
+
+    Every operator that draws a value reads its domain through
+    :func:`locus_domain`, so restricting there restricts initialization and
+    mutation together without either operator knowing a restriction exists.
+
+    Two invariants, both enforced rather than documented. A restriction can only
+    ever *narrow*: the result is always a subset of what the problem declared,
+    because a caller that could widen a domain would be authoring values the
+    problem never allowed. And it can never empty a domain: an empty
+    intersection means the restriction is about a schema it does not match, so
+    the declared domain is returned unchanged and the miss is counted in
+    :attr:`misses` for the caller to act on. Silently sampling nothing, or
+    sampling outside the schema, are both worse than ignoring a bad prior.
+    """
+
+    allowed: Mapping[str, Sequence[Any]] = field(default_factory=dict)
+    misses: list[str] = field(default_factory=list, compare=False, repr=False)
+
+    def narrow(self, locus: "Locus", domain: tuple[Any, ...]) -> tuple[Any, ...]:
+        want = self.allowed.get(locus.field)
+        if want is None or not domain:
+            return domain
+        kept = tuple(v for v in domain if v in tuple(want))
+        if not kept:
+            self.misses.append(locus.field)
+            return domain
+        return kept
+
+
+def locus_domain(
+    candidate_model: Any,
+    locus: Locus,
+    *,
+    restriction: "DomainRestriction | None" = None,
+) -> tuple[Any, ...]:
     """Allowed values for *locus*, read from the problem's own schema.
 
     Returns ``()`` when the schema does not constrain the value to a finite set;
     callers fall back to recombination-only for that locus rather than inventing
     a domain the problem never declared.
+
+    *restriction* narrows the declared domain (see :class:`DomainRestriction`).
+    Omitted, the result is exactly what the schema declares.
     """
+
+    domain = _declared_domain(candidate_model, locus)
+    if restriction is None:
+        return domain
+    return restriction.narrow(locus, domain)
+
+
+def _declared_domain(candidate_model: Any, locus: Locus) -> tuple[Any, ...]:
+    """The schema's own domain for *locus*, before any narrowing."""
 
     if candidate_model is None:
         return ()
@@ -168,6 +218,7 @@ def mutate(
     rate: float | None = None,
     loci: Iterable[Locus] | None = None,
     rng: random.Random | None = None,
+    restriction: DomainRestriction | None = None,
 ) -> dict[str, Any]:
     """Resample loci from their declared domains.
 
@@ -185,7 +236,7 @@ def mutate(
     )
     out = dict(config)
     for locus in targets:
-        domain = locus_domain(candidate_model, locus)
+        domain = locus_domain(candidate_model, locus, restriction=restriction)
         if not domain:
             continue                        # undeclared domain: leave it alone
         current = read_locus(out, locus)
@@ -199,6 +250,7 @@ def uniform_candidate(
     candidate_model: Any,
     *,
     rng: random.Random | None = None,
+    restriction: DomainRestriction | None = None,
 ) -> dict[str, Any]:
     """A fresh draw over every locus with a declared domain.
 
@@ -218,12 +270,12 @@ def uniform_candidate(
     out = dict(template)
     drew = False
     for locus in loci_of(template):
-        domain = locus_domain(candidate_model, locus)
+        domain = locus_domain(candidate_model, locus, restriction=restriction)
         if domain:
             out = write_locus(out, locus, r.choice(domain))
             drew = True
     if not drew:
-        return mutate(template, candidate_model, rng=r)
+        return mutate(template, candidate_model, rng=r, restriction=restriction)
     return out
 
 
