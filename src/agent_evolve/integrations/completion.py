@@ -42,12 +42,20 @@ def completion_for(
     attempts: int = 4,
     timeout_s: float = 300.0,
     journal: Any = None,
+    effort: Optional[str] = None,
 ) -> Optional[Completion]:
     """A completion callable for *model*, or ``None`` with no credential.
 
     ``None`` rather than an exception: a caller without a key should fall back
     to the unguided loop, which is a working optimizer, rather than fail. The
     caller announces the fallback so it is never silent.
+
+    ``effort`` is an ADDITIVE reasoning-effort pin: when given, the request
+    body carries ``{"reasoning": {"effort": <level>}}`` and each journalled
+    record additionally echoes ``effort_requested`` plus the reply's
+    ``finish_reason``/``native_finish_reason`` (so honoring is verifiable
+    from journals alone). When omitted, the request body and the journal
+    record are byte-identical to the pre-effort seam.
     """
 
     found = credential_for()
@@ -59,10 +67,13 @@ def completion_for(
         import urllib.error
         import urllib.request
 
-        body = json.dumps({
+        fields: dict[str, Any] = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-        }).encode()
+        }
+        if effort is not None:
+            fields["reasoning"] = {"effort": effort}
+        body = json.dumps(fields).encode()
         last: str | None = None
         for attempt in range(attempts):
             request = urllib.request.Request(
@@ -79,9 +90,16 @@ def completion_for(
                 last = f"{type(error).__name__}: {error}"[:200]
             if payload is not None and "choices" in payload:
                 if journal is not None:
-                    journal(dict(model_requested=model,
-                                 model_served=payload.get("model"),
-                                 usage=payload.get("usage") or {}))
+                    record = dict(model_requested=model,
+                                  model_served=payload.get("model"),
+                                  usage=payload.get("usage") or {})
+                    if effort is not None:
+                        choice = payload["choices"][0]
+                        record["effort_requested"] = effort
+                        record["finish_reason"] = choice.get("finish_reason")
+                        record["native_finish_reason"] = choice.get(
+                            "native_finish_reason")
+                    journal(record)
                 return payload["choices"][0]["message"]["content"]
             if payload is not None:                     # a provider error body
                 last = json.dumps(payload.get("error", payload))[:300]
