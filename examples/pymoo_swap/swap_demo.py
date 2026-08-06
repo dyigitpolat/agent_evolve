@@ -1,4 +1,4 @@
-"""The pymoo swap: same problem object, ten lines each way, 60 evaluations each.
+"""The pymoo swap: same problem object, three code lines each way, 60 evaluations each.
 
 A pymoo user runs NSGA-II with ``minimize(...)``. The agent_evolve user wraps
 the *same* problem object with ``from_pymoo`` and calls ``optimize(...)``.

@@ -108,3 +108,23 @@ an uncommitted working-tree addition, additive-only, backed by
       `examples/development/run_analog_sizing_driver_cell.py` — commit or drop.
 - [ ] Wheel metadata says `Development Status :: 4 - Beta` — confirm that is
       still the intended signal for the first public cut.
+
+---
+
+## State update 2026-08-07 (append-only; line references above are the 2026-08-06 snapshot)
+
+- FIXED: `pareto_front` duplicate entries — `compute_pareto_front` now collapses
+  exact duplicates (same configuration identity + same objectives, first
+  occurrence wins) while keeping noisy re-evaluations distinct; quickstart
+  repro prints 4 rows / 4 distinct configs. Tests in `tests/test_results.py`.
+- FIXED: version skew — editable install re-synced; `importlib.metadata`,
+  `__version__`, and `uv.lock` all agree on 0.3.0.
+- FIXED: CLI gaps — `run` now takes `--strategy {auto,genetic,authoring}` and
+  `--seal PATH`. `optimize(seal=)` on the genetic path now REFUSES by name
+  (the seal format records generative proposals, not operator choices) instead
+  of silently writing nothing; tests in `tests/test_optimize_strategy.py`.
+- FIXED: `swap_demo.py` docstring said "ten lines each way" — now "three code
+  lines each way", matching the file and the scorecard/strategy claim.
+- Still open: HarnessBase not public while `harness_registry` is; `--json`
+  output; `check` model-arm single-shot; `_LEGACY_EXPORTS` trim decision;
+  LICENSE owner review; Beta classifier; untracked-file hygiene for sdist.

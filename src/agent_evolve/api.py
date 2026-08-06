@@ -175,6 +175,17 @@ def optimize(
 
     seeds = tuple(dict(c) for c in bound.seeds())
     chosen = _resolve_strategy(strategy, bool(seeds), announce)
+    if chosen == "genetic" and seal is not None:
+        # The seal journal holds generative proposals; the genetic loop's model
+        # calls are operator choices, which that format cannot represent. A
+        # journal the caller asked for and never got would be a silent no-op,
+        # so refuse loudly and name the two ways out.
+        raise ValueError(
+            "seal journaling is not supported by the genetic strategy yet: "
+            "the seal format records generative proposals, and the genetic "
+            "loop makes operator choices instead. Pass strategy='authoring' "
+            "to seal a generative run, or drop seal=."
+        )
     if chosen == "genetic":
         # Only the loop is imported locally. Importing EvaluationCache here too
         # would make that name function-local for the whole body and break the

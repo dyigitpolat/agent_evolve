@@ -1,0 +1,9 @@
+{
+  "note": "closure provenance for run aug02_timeloop_seats_luna_smoke_r3",
+  "head_commit": "5df56f08afc435e8425731c790d2e72ffa418a73",
+  "closure_sha256_before": "36b6b60a51d0b65870ff477ec46e35422c23dc397e192280003dcf7bdc2b7fea",
+  "closure_file_count": 408,
+  "dirty_closure_files": [
+  ],
+  "warning": "if any dirty_closure_files are listed, the sealed closure pins content that is NOT any committed revision. Acceptable for a smoke cell proving the seats work; NOT acceptable for a campaign of record, which must be relaunched against a committed tree."
+}

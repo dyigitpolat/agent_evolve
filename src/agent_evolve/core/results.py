@@ -173,14 +173,32 @@ def compute_pareto_front(
     candidates: Sequence[Candidate[ConfigT]],
     objectives: Sequence[ObjectiveSpec],
 ) -> List[Candidate[ConfigT]]:
-    """Return the non-dominated subset of *candidates*."""
+    """Return the non-dominated subset of *candidates*.
+
+    Exact duplicates — same configuration identity and same measured
+    objectives — collapse to their first occurrence, so a configuration a
+    population re-visits across generations appears once on the front rather
+    than once per visit. A configuration re-evaluated to *different*
+    objectives is a genuinely different measurement and both rows remain;
+    dropping one silently would be the library's judgement, not the caller's.
+    """
     if not candidates:
         return []
+    from agent_evolve.contract import artifact_key
+
+    unique: List[Candidate[ConfigT]] = []
+    seen: set = set()
+    for c in candidates:
+        key = (artifact_key(c.configuration), tuple(sorted(c.objectives.items())))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(c)
     front: List[Candidate[ConfigT]] = []
-    for i, c in enumerate(candidates):
+    for i, c in enumerate(unique):
         if not any(
             dominates(other.objectives, c.objectives, objectives)
-            for j, other in enumerate(candidates)
+            for j, other in enumerate(unique)
             if j != i
         ):
             front.append(c)

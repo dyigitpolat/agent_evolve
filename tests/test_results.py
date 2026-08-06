@@ -70,3 +70,28 @@ def test_minimax_rejects_missing_objective():
     broken = Candidate(configuration={}, objectives={"value": 1.0})
     with pytest.raises(ProblemContractError):
         select_minimax_rank([broken, _c(2, 1)], OBJS)
+
+
+def test_pareto_front_collapses_exact_duplicates():
+    # A population re-visiting the same configuration across generations must
+    # not put it on the front once per visit (the quickstart's 59-rows /
+    # 4-distinct-configs bug). First occurrence survives, order preserved.
+    a, b = _c(10, 5), _c(8, 2)
+    front = compute_pareto_front([a, _c(10, 5), b, _c(10, 5), _c(8, 2)], OBJS)
+    assert len(front) == 2
+    assert front[0] is a and front[1] is b
+
+
+def test_pareto_front_keeps_noisy_reevaluations_distinct():
+    # Same configuration, different measured objectives: two genuine
+    # measurements. The library must not silently pick one.
+    noisy_a = Candidate(configuration={"v": 1}, objectives={"value": 10.0, "cost": 5.0})
+    noisy_b = Candidate(configuration={"v": 1}, objectives={"value": 10.5, "cost": 5.5})
+    front = compute_pareto_front([noisy_a, noisy_b], OBJS)
+    assert len(front) == 2
+
+
+def test_pareto_front_duplicate_of_dominated_still_filtered():
+    dup_dominated = [_c(10, 5), _c(5, 5), _c(5, 5)]
+    front = compute_pareto_front(dup_dominated, OBJS)
+    assert [(c.objectives["value"], c.objectives["cost"]) for c in front] == [(10, 5)]

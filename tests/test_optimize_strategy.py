@@ -150,3 +150,19 @@ def test_an_explicit_empty_seeds_is_respected_not_overridden() -> None:
             return ()
 
     assert tuple(as_problem(_ChoseNone()).seeds()) == ()
+
+
+def test_seal_on_the_genetic_path_refuses_rather_than_no_ops(tmp_path) -> None:
+    # The seal journal records generative proposals; the genetic loop makes
+    # operator choices. A caller asking for a journal the run would never
+    # write must be refused, not handed an absent file.
+    with pytest.raises(ValueError, match="genetic strategy"):
+        optimize(_Seeded(), budget=8, proposer="random",
+                 seal=str(tmp_path / "run.jsonl"))
+
+
+def test_seal_still_reaches_the_authoring_path(tmp_path) -> None:
+    path = tmp_path / "run.jsonl"
+    optimize(_Seeded(), budget=4, proposer="random",
+             strategy="authoring", seal=str(path))
+    assert path.exists()

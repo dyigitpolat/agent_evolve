@@ -227,7 +227,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         budget=args.budget,
         model=args.model,
         proposer=args.proposer,
+        strategy=args.strategy,
         seed=args.seed,
+        seal=args.seal,
         on_progress=(lambda m: print(m, flush=True)) if args.verbose else print,
     )
     print(f"\nbest        {result.best.configuration}")
@@ -312,7 +314,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         choices=("auto", "llm", "random"),
         help="'random' needs no credentials and is the honest baseline",
     )
+    run.add_argument(
+        "--strategy",
+        default="auto",
+        choices=("auto", "genetic", "authoring"),
+        help="'auto' prefers the genetic loop when the problem has seeds",
+    )
     run.add_argument("--seed", type=int, default=None)
+    run.add_argument(
+        "--seal",
+        default=None,
+        metavar="PATH",
+        help=(
+            "write the run's chained proposal journal here; requires the "
+            "authoring strategy (the genetic loop refuses it by name)"
+        ),
+    )
     run.add_argument("--verbose", action="store_true")
     run.set_defaults(func=_cmd_run)
 
