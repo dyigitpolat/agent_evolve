@@ -98,6 +98,12 @@ class GeneticConfig:
     #: leaves the loop byte-identical to the pre-screening seam; the pool's
     #: extra construction runs on its own RNG stream for the same reason.
     screening: Any = None
+    #: Variation-arm portfolio (a policies.operator_portfolio
+    #: .OperatorPortfolio). When present it constructs the generation's
+    #: offspring -- classical, rule, and authored arms under survival credit
+    #: -- and the loop reports each measured child's fate back to it. None
+    #: leaves offspring construction byte-identical to the classical path.
+    portfolio: Any = None
 
 
 def domination_rank(
@@ -372,7 +378,17 @@ def run_genetic_loop(
                           restriction=restriction,
                           loci=choice.mutate_loci, rng=r)
 
-        kids: List[Config] = [build_kid(choice, rng) for choice in choices]
+        kid_origins: Optional[List[str]] = None
+        if config.portfolio is not None:
+            pairs = [
+                (population[choice.parent_a % len(population)][0],
+                 population[choice.parent_b % len(population)][0])
+                for choice in choices
+            ]
+            kids, kid_origins = config.portfolio.construct_generation(
+                pairs, candidate_model, restriction, rng, generation=gen)
+        else:
+            kids = [build_kid(choice, rng) for choice in choices]
 
         # --- virtual pre-screening: build more than we can afford, pay for
         # the promising. The surrogate is re-validated on today's data before
@@ -393,6 +409,9 @@ def run_genetic_loop(
                     ranked, extra_n, None)
                 pool_kids = kids + [build_kid(c, rng_pool)
                                     for c in extra_choices]
+                pool_origins = (None if kid_origins is None else
+                                list(kid_origins)
+                                + ["pool"] * (len(pool_kids) - len(kids)))
                 report = config.screening.screen(
                     pool_kids, [obj for _c, obj in population], specs)
                 if report is not None:
@@ -405,6 +424,9 @@ def run_genetic_loop(
                         if index >= floor_n:
                             keep.append(index)
                     kids = [pool_kids[index] for index in keep[:want]]
+                    if pool_origins is not None:
+                        kid_origins = [pool_origins[index]
+                                       for index in keep[:want]]
                     screen_note = {
                         "pool": len(pool_kids), "held_out": floor_n,
                         "advanced": len(kids) - floor_n, "active": True,
@@ -418,6 +440,23 @@ def run_genetic_loop(
         pool: List[tuple[Config, Mapping[str, float]]] = list(population)
         pool.extend((r.configuration, dict(r.objectives)) for r in valid)
         population = survive(pool)
+
+        # --- survival credit: an arm is what its measured children survive --
+        if config.portfolio is not None and kid_origins is not None and valid:
+            surviving = {_default_candidate_key(c) for c, _o in population}
+            origin_by_key: Dict[str, str] = {}
+            for kid, origin in zip(kids, kid_origins):
+                origin_by_key.setdefault(_default_candidate_key(kid), origin)
+            for result in valid:
+                key = _default_candidate_key(result.configuration)
+                origin = origin_by_key.get(key)
+                if origin and origin != "pool":
+                    config.portfolio.record_measured(
+                        origin, survived=key in surviving)
+            for name in config.portfolio.review():
+                log(f"generation {gen}: operator arm {name!r} retired -- no "
+                    "survivors in at least 4 measured children while the "
+                    "classical arm has some")
 
         # --- the prior is a bet, and a bet must be checkable -----------------
         # A restriction that removed the good region cannot recover on its own,
@@ -441,6 +480,8 @@ def run_genetic_loop(
                  "choices_filled_at_random": filled}
         if screen_note is not None:
             entry["screen"] = screen_note
+        if config.portfolio is not None:
+            entry["portfolio"] = config.portfolio.summary()
         history.append(entry)
         if filled:
             log(f"generation {gen}: the chooser supplied {want - filled} of "
@@ -464,6 +505,7 @@ def run_genetic_loop(
             config.screening.telemetry, "virtual_evaluations", 0))
     return replace(result, telemetry=harvest_telemetry(
         (pick, prior_proposer_used, config.screening,
-         getattr(config.screening, "author", None)),
+         getattr(config.screening, "author", None),
+         config.portfolio, getattr(config.portfolio, "author", None)),
         real_evaluations=spent(), virtual_evaluations=virtual,
     ))

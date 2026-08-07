@@ -14,10 +14,10 @@ from typing import Any, Callable, Optional, Sequence
 
 from agent_evolve.infrastructure.authored_runtime import RuntimeLimits
 
-__all__ = ["AuthorshipConfig", "build_authorship"]
+__all__ = ["AuthorshipConfig", "AuthorshipPolicies", "build_authorship"]
 
 _SURROGATE = ("off", "rule", "llm")
-_OPERATORS = ("off",)
+_OPERATORS = ("off", "rule", "llm")
 
 
 @dataclass(frozen=True)
@@ -36,6 +36,7 @@ class AuthorshipConfig:
     pool_factor: int = 4
     exploration_floor: float = 0.25
     authoring_attempts: int = 2
+    max_authored_fraction: float = 0.5
     limits: RuntimeLimits = field(default_factory=RuntimeLimits)
 
     def __post_init__(self) -> None:
@@ -46,8 +47,7 @@ class AuthorshipConfig:
             )
         if self.operators not in _OPERATORS:
             raise ValueError(
-                f"authorship.operators must be one of {_OPERATORS} for now "
-                f"(the operator portfolio is the next layer), got "
+                f"authorship.operators must be one of {_OPERATORS}, got "
                 f"{self.operators!r}"
             )
 
@@ -61,6 +61,9 @@ class AuthorshipConfig:
             "off": cls(),
             "surrogate": cls(surrogate="rule"),
             "surrogate-llm": cls(surrogate="llm"),
+            "operators": cls(operators="rule"),
+            "operators-llm": cls(operators="llm"),
+            "full": cls(surrogate="llm", operators="llm"),
         }
         if name not in presets:
             raise ValueError(
@@ -68,6 +71,14 @@ class AuthorshipConfig:
                 f"{name!r}"
             )
         return presets[name]
+
+
+@dataclass(frozen=True)
+class AuthorshipPolicies:
+    """What the factory built: policy objects the loop consumes directly."""
+
+    screening: Optional[Any] = None
+    portfolio: Optional[Any] = None
 
 
 def build_authorship(
@@ -78,19 +89,33 @@ def build_authorship(
     schema_text: str = "",
     seed: Optional[int] = None,
     announce: Optional[Callable[[str], None]] = None,
-) -> Optional[Any]:
-    """The screening policy for *config*, or ``None`` when nothing is on.
+) -> AuthorshipPolicies:
+    """The policy objects for *config*; fields are ``None`` where nothing is on.
 
-    With ``surrogate="llm"`` the model is asked ONCE, before any evaluation,
-    to author a surrogate from the schema and objective meanings; the
-    authored builder then competes against the rule builders under the same
-    per-generation validation gate, and the best-passing one screens. No
-    usable authorship -- no credential, no code block, forbidden imports --
-    degrades to the rule builders, out loud, never silently.
+    With an ``"llm"`` value the model is asked ONCE, before any evaluation,
+    to author from the schema and objective meanings; authored machinery then
+    competes against the shipped rules under measurement -- the validation
+    gate for surrogates, survival credit for operators. No usable authorship
+    (no credential, no code block, forbidden imports) degrades to the rules,
+    out loud, never silently.
     """
 
-    del seed
     say = announce or (lambda _m: None)
+    return AuthorshipPolicies(
+        screening=_build_screening(config, complete, objectives,
+                                   schema_text, say),
+        portfolio=_build_portfolio(config, complete, objectives,
+                                   schema_text, say),
+    )
+
+
+def _build_screening(
+    config: AuthorshipConfig,
+    complete: Any,
+    objectives: Sequence[Any],
+    schema_text: str,
+    say: Callable[[str], None],
+) -> Optional[Any]:
     if config.surrogate == "off":
         return None
     from agent_evolve.policies.surrogate import additive_surrogate, knn_surrogate
@@ -151,3 +176,69 @@ def build_authorship(
         # part of the run's story even when nothing usable came back.
         screening.author = author_note
     return screening
+
+
+def _build_portfolio(
+    config: AuthorshipConfig,
+    complete: Any,
+    objectives: Sequence[Any],
+    schema_text: str,
+    say: Callable[[str], None],
+) -> Optional[Any]:
+    if config.operators == "off":
+        return None
+    from agent_evolve.policies.operator_portfolio import (
+        OperatorPortfolio,
+        VariationArm,
+        classical_arm,
+        segment_arm,
+    )
+
+    arms: list = [classical_arm(), segment_arm()]
+    runtime = None
+    author_note: Optional[SimpleNamespace] = None
+    if config.operators == "llm":
+        from agent_evolve.policies.llm_operator import author_operators
+        from agent_evolve.policies.llm_surrogate import AuthorTelemetry
+
+        telemetry = AuthorTelemetry()
+        author_note = SimpleNamespace(
+            telemetry=telemetry, mechanism="operator_author", authored_by="llm"
+        )
+        if complete is None:
+            say(
+                "authorship.operators='llm' needs a model call and none is "
+                "available; the rule arms carry the portfolio."
+            )
+        else:
+            artifacts = author_operators(
+                complete,
+                objectives=list(objectives),
+                schema_text=schema_text,
+                attempts=config.authoring_attempts,
+                telemetry=telemetry,
+            )
+            if not artifacts:
+                say(
+                    "the model authored no usable operator in "
+                    f"{config.authoring_attempts} attempt(s); the rule arms "
+                    "carry the portfolio."
+                )
+            else:
+                from agent_evolve.infrastructure.authored_runtime import (
+                    AuthoredRuntime)
+                runtime = AuthoredRuntime(limits=config.limits)
+                arms.extend(
+                    VariationArm(
+                        name=f"{artifact.name}:{artifact.source_sha256[:8]}",
+                        kind="authored", artifact=artifact,
+                    )
+                    for artifact in artifacts
+                )
+    portfolio = OperatorPortfolio(
+        arms, runtime=runtime,
+        max_authored_fraction=config.max_authored_fraction,
+    )
+    if author_note is not None:
+        portfolio.author = author_note
+    return portfolio

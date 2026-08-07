@@ -376,12 +376,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run.add_argument(
         "--authorship",
         default="off",
-        choices=("off", "surrogate", "surrogate-llm"),
+        choices=("off", "surrogate", "surrogate-llm", "operators",
+                 "operators-llm", "full"),
         help=(
-            "authored machinery: 'surrogate' turns on virtual pre-screening "
-            "with the rule surrogates; 'surrogate-llm' additionally has the "
-            "model write one, which screens only when it out-validates the "
-            "rules on held-out data"
+            "authored machinery: 'surrogate[-llm]' turns on virtual "
+            "pre-screening (model-written surrogates screen only when they "
+            "out-validate the rules); 'operators[-llm]' runs variation arms "
+            "under survival credit; 'full' is both, model-authored"
         ),
     )
     run.add_argument(

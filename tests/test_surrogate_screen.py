@@ -184,7 +184,7 @@ def test_bogus_authorship_is_rejected_by_name():
         optimize(_Problem(), budget=8, authorship="bogus")
     with pytest.raises(ValueError, match="operator"):
         from agent_evolve.session.authorship import AuthorshipConfig
-        AuthorshipConfig(operators="rule")
+        AuthorshipConfig(operators="bogus")
 
 
 def test_authorship_refuses_the_authoring_strategy_by_name():

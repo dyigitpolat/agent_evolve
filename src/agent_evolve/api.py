@@ -345,7 +345,7 @@ def optimize(
                         complete, objectives=list(bound.objectives))
 
             from agent_evolve.session.authorship import build_authorship
-            screening = build_authorship(
+            policies = build_authorship(
                 authorship_config, complete=complete,
                 objectives=list(bound.objectives),
                 schema_text=_describe(bound), seed=seed, announce=announce)
@@ -374,7 +374,8 @@ def optimize(
                     evaluation_cache=cache,
                     structure_budget=structure_budget,
                     prior_proposer=prior_proposer,
-                    screening=screening,
+                    screening=policies.screening,
+                    portfolio=policies.portfolio,
                 ),
                 chooser=chooser,
                 log=announce,
