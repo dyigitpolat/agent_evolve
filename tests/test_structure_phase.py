@@ -241,6 +241,83 @@ def test_a_weighted_prior_runs_the_phase_and_the_seed_survives():
     assert res.evaluations <= 20
 
 
+class _Seq(BaseModel):
+    genome: list[Literal["a", "b", "c"]]
+
+
+SEQ_TEMPLATE = {"genome": ["a", "a", "a", "a", "a", "a"]}
+
+
+def test_pooled_screen_makes_pure_then_spiked_candidates():
+    screen = crossed_screen(SEQ_TEMPLATE, _Seq, size=5, pool_by_field=True)
+    assert len(screen) == 5
+    # one pure candidate per vocabulary value first
+    assert screen[0]["genome"] == ["a"] * 6
+    assert screen[1]["genome"] == ["b"] * 6
+    assert screen[2]["genome"] == ["c"] * 6
+    # then spiked: the value holds every other position
+    assert screen[3]["genome"][0::2] == ["a", "a", "a"]
+    assert len(set(screen[3]["genome"])) > 1, "a spike is not a pure repeat"
+
+
+def test_pooled_attribution_counts_every_position_as_an_observation():
+    screen = crossed_screen(SEQ_TEMPLATE, _Seq, size=3, pool_by_field=True)
+    # value 'a' is good, everything else is bad
+    rows = [(c, {"energy": 1.0 if set(c["genome"]) == {"a"} else 4.0,
+                 "speed": 1.0}) for c in screen]
+    attr = attribute(rows, SPECS, _Seq, pool_by_field=True)
+    by_value = {s.value: s for s in attr.for_locus("genome")}
+    assert by_value["a"].n == 6, "6 positions of the pure-a candidate"
+    assert by_value["a"].nondominated == 6
+    assert by_value["b"].nondominated == 0
+    prior = statistical_prior(attr, _Seq)
+    assert prior.allowed == {"genome": ["a"]}
+
+
+def test_bare_sequence_locus_resolves_the_shared_vocabulary():
+    from agent_evolve.policies.genetic import Locus, locus_domain
+    assert locus_domain(_Seq, Locus("genome")) == ("a", "b", "c")
+
+
+def test_pooled_phase_runs_inside_the_loop_and_narrows_the_field():
+    from agent_evolve.contract import as_problem
+    from agent_evolve.core.problem import ValidationOutcome
+    from agent_evolve.session.genetic_loop import GeneticConfig, run_genetic_loop
+
+    class P:
+        candidate_model = _Seq
+        objectives = (ObjectiveSpec("energy", "min"), ObjectiveSpec("speed", "max"))
+
+        def __init__(self):
+            self.seen = []
+
+        def seeds(self):
+            return [dict(SEQ_TEMPLATE)]
+
+        def validate(self, config):
+            return ValidationOutcome(ok=True)
+
+        def materialize(self, config):
+            return dict(config)
+
+        def evaluate(self, artifact):
+            self.seen.append(dict(artifact))
+            good = artifact["genome"].count("a")
+            return {"energy": 10.0 - good, "speed": 1.0}
+
+    p = P()
+    res = run_genetic_loop(
+        problem=as_problem(p),
+        config=GeneticConfig(population_size=4, offspring_per_generation=2,
+                             generations=20, evaluation_budget=16,
+                             structure_budget=3, structure_pooled=True,
+                             seed=8))
+    record = next(h["structure"] for h in res.history if "structure" in h)
+    assert record["evaluated"] == 3
+    assert record["allowed"].get("genome") == ["a"]
+    assert res.evaluations <= 16
+
+
 def test_a_wrong_weighted_prior_is_unwound():
     # Zero weights are exclusions, so a graded prior that zeroes the good
     # region makes exactly the refutable claim the unwind test checks.

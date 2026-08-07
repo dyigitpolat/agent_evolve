@@ -95,6 +95,7 @@ def crossed_screen(
     size: int,
     blocking: Sequence[str] | None = None,
     rng: random.Random | None = None,
+    pool_by_field: bool = False,
 ) -> list[dict[str, Any]]:
     """A screening design of *size* candidates that can identify structure.
 
@@ -107,9 +108,22 @@ def crossed_screen(
     Chosen automatically when *blocking* is omitted: the loci with the smallest
     declared domains, taking as many as fit in *size*. Small domains are where
     structural switches live, and they are the cheapest to cross.
+
+    ``pool_by_field`` changes the design for SEQUENCE fields, whose positions
+    share one vocabulary: crossing them is out of reach (k^n cells) and
+    per-position ladders leave per-level n tiny, but if positions are roughly
+    exchangeable the value effect can be measured POOLED across positions.
+    The design is then per-value: first one PURE candidate per value (every
+    position set to it -- the cleanest pooled contrast), then SPIKED
+    candidates (the value at every other position, the rest cycling through
+    the vocabulary) until *size* is spent. Whether positions really are
+    exchangeable is the bet this design makes; the caller's prior gets
+    unwound by the standard test when they are not.
     """
 
     r = rng or random.Random()
+    if pool_by_field:
+        return _pooled_screen(template, candidate_model, size=size)
     all_loci = [lc for lc in loci_of(template) if locus_domain(candidate_model, lc)]
     if not all_loci or size <= 0:
         return []
@@ -161,6 +175,45 @@ def crossed_screen(
     return out[:size]
 
 
+def _pooled_screen(
+    template: Mapping[str, Any],
+    candidate_model: Any,
+    *,
+    size: int,
+) -> list[dict[str, Any]]:
+    """Pure and spiked candidates over each sequence field's shared vocabulary."""
+
+    sequence_loci = [lc for lc in loci_of(template) if lc.index is not None
+                     and locus_domain(candidate_model, lc)]
+    if not sequence_loci or size <= 0:
+        return []
+    fields: dict[str, list[Locus]] = {}
+    for lc in sequence_loci:
+        fields.setdefault(lc.field, []).append(lc)
+
+    out: list[dict[str, Any]] = []
+    spike_round = 0
+    while len(out) < size:
+        for name, loci in fields.items():
+            domain = locus_domain(candidate_model, loci[0])
+            for value_index, value in enumerate(domain):
+                if len(out) >= size:
+                    break
+                cfg = dict(template)
+                for position, lc in enumerate(loci):
+                    if spike_round == 0:
+                        cfg = write_locus(cfg, lc, value)      # pure
+                    elif position % 2 == 0:
+                        cfg = write_locus(cfg, lc, value)      # spiked
+                    else:
+                        fill = domain[(value_index + position + spike_round)
+                                      % len(domain)]
+                        cfg = write_locus(cfg, lc, fill)
+                out.append(cfg)
+        spike_round += 1
+    return out[:size]
+
+
 def _nondominated(points: Sequence[Sequence[float]]) -> list[bool]:
     out = []
     for a, pa in enumerate(points):
@@ -178,12 +231,19 @@ def attribute(
     candidate_model: Any,
     *,
     blocking: Sequence[str] = (),
+    pool_by_field: bool = False,
 ) -> Attribution:
     """Summarise screened candidates per locus value.
 
     Non-domination is computed WITHIN the screen, in minimisation-normalised
     coordinates, because that is the only comparison an optimizer can make from
     its own evaluations -- no global frontier is available at run time.
+
+    ``pool_by_field`` treats a sequence field's positions as exchangeable:
+    every (candidate, position) pair becomes one observation of the value it
+    holds, keyed by the bare field name. Per-position n on a short screen is
+    unusably small; pooled n is positions times larger. The exchangeability
+    bet itself is the caller's, and the standard unwind test is its check.
     """
 
     if not evaluated:
@@ -193,16 +253,37 @@ def attribute(
     pts = [[sign[n] * float(obj[n]) for n in names] for _, obj in evaluated]
     nd = _nondominated(pts)
 
-    levels: list[LevelSummary] = []
+    scalar_loci: list[Locus] = []
+    pooled_fields: dict[str, list[Locus]] = {}
     for lc in loci_of(evaluated[0][0]):
         if not locus_domain(candidate_model, lc):
             continue
+        if pool_by_field and lc.index is not None:
+            pooled_fields.setdefault(lc.field, []).append(lc)
+        else:
+            scalar_loci.append(lc)
+
+    levels: list[LevelSummary] = []
+    for lc in scalar_loci:
         seen: dict[Any, list[int]] = {}
         for i, (cfg, _obj) in enumerate(evaluated):
             seen.setdefault(read_locus(cfg, lc), []).append(i)
         for value, idxs in seen.items():
             levels.append(LevelSummary(
                 locus=str(lc), value=value, n=len(idxs),
+                objective_means={
+                    n: sum(float(evaluated[i][1][n]) for i in idxs) / len(idxs)
+                    for n in names},
+                nondominated=sum(1 for i in idxs if nd[i]),
+            ))
+    for field_name, loci in pooled_fields.items():
+        seen = {}
+        for i, (cfg, _obj) in enumerate(evaluated):
+            for lc in loci:
+                seen.setdefault(read_locus(cfg, lc), []).append(i)
+        for value, idxs in seen.items():
+            levels.append(LevelSummary(
+                locus=field_name, value=value, n=len(idxs),
                 objective_means={
                     n: sum(float(evaluated[i][1][n]) for i in idxs) / len(idxs)
                     for n in names},

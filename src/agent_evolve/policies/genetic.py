@@ -190,6 +190,11 @@ def _declared_domain(candidate_model: Any, locus: Locus) -> tuple[Any, ...]:
     node = resolve(node)
     if locus.index is not None:
         node = resolve(node.get("items", {}) if isinstance(node, dict) else {})
+    elif isinstance(node, dict) and node.get("type") == "array":
+        # A bare Locus("field") naming a sequence field means the field's
+        # shared per-element vocabulary -- what pooled attribution and
+        # field-keyed priors reason over. Indexed loci resolve above.
+        node = resolve(node.get("items", {}))
     if not isinstance(node, dict):
         return ()
     if "enum" in node:

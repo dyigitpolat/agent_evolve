@@ -85,6 +85,11 @@ class GeneticConfig:
     #: statistical rule, so the phase is useful with no model at all -- and so a
     #: model-proposed prior always has a rule to beat.
     prior_proposer: Any = None
+    #: Pool sequence positions by field in the structure phase: the screen
+    #: becomes per-value pure/spiked designs and attribution counts every
+    #: (candidate, position) pair as one observation. The exchangeability
+    #: bet this makes is checked by the same unwind test as any prior.
+    structure_pooled: bool = False
     #: A prior over WHERE to sample: narrows the declared domain of any locus it
     #: names, for initialization and mutation alike. Left None, every sampler
     #: sees exactly the schema's own domains, so the loop is byte-identical to
@@ -267,12 +272,14 @@ def run_genetic_loop(
             attribute, crossed_screen, statistical_prior)
 
         screened = crossed_screen(seeds[0], candidate_model,
-                                  size=config.structure_budget, rng=rng)
+                                  size=config.structure_budget, rng=rng,
+                                  pool_by_field=config.structure_pooled)
         screen_valid = measure(screened, 0)
         if screen_valid:
             attr = attribute(
                 [(r.configuration, dict(r.objectives)) for r in screen_valid],
-                specs, candidate_model)
+                specs, candidate_model,
+                pool_by_field=config.structure_pooled)
             propose = config.prior_proposer or statistical_prior
             prior_proposer_used = propose
             try:
