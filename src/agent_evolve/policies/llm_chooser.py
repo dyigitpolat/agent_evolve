@@ -213,4 +213,6 @@ def llm_chooser(
         return choices
 
     choose.telemetry = stats          # type: ignore[attr-defined]
+    choose.mechanism = "chooser"      # type: ignore[attr-defined]
+    choose.authored_by = "llm"        # type: ignore[attr-defined]
     return choose

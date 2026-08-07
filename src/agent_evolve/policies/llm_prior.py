@@ -73,6 +73,18 @@ class PriorTelemetry:
     errors: int = 0
     proposals: list = field(default_factory=list)
 
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "calls": self.calls,
+            "unparseable": self.unparseable,
+            "wrote_candidate": self.wrote_candidate,
+            "out_of_domain": self.out_of_domain,
+            "empty": self.empty,
+            "restricted_loci": self.restricted_loci,
+            "errors": self.errors,
+            "proposals": len(self.proposals),
+        }
+
 
 def _domains(candidate_model: Any, attr: Attribution) -> dict[str, tuple]:
     names = list(dict.fromkeys(s.locus for s in attr.levels))
@@ -168,4 +180,6 @@ def llm_prior_proposer(
         return DomainRestriction(allowed)
 
     propose.telemetry = tel                  # type: ignore[attr-defined]
+    propose.mechanism = "prior"              # type: ignore[attr-defined]
+    propose.authored_by = "llm"              # type: ignore[attr-defined]
     return propose

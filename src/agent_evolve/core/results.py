@@ -8,6 +8,7 @@ from numbers import Real
 from typing import Any, Dict, Generic, List, Optional, Sequence, Tuple, TypeVar
 
 from agent_evolve.core.problem import ObjectiveSpec, ProblemContractError
+from agent_evolve.core.telemetry import RunTelemetry
 
 ConfigT = TypeVar("ConfigT")
 
@@ -91,6 +92,9 @@ class SearchResult(Generic[ConfigT]):
     evaluations : exact number of ``Problem.evaluate`` invocations, including
         calls that raise candidate-level ``ValueError``. Deterministic pre-check
         failures do not increment this evaluator-call budget.
+    telemetry : what each guidance mechanism did, plus the real/virtual
+        evaluation ledger. Populated by the genetic loop; ``None`` on paths
+        that have not adopted it yet.
     """
 
     objectives: Sequence[ObjectiveSpec]
@@ -101,6 +105,7 @@ class SearchResult(Generic[ConfigT]):
     best_per_generation: List[Candidate[ConfigT]] = field(default_factory=list)
     evaluations: int = 0
     provider_usage: "ProviderUsageSummary | None" = None
+    telemetry: Optional[RunTelemetry] = None
 
     def candidates_by_author(self) -> Dict[str, int]:
         """How many candidates each authoring call produced.

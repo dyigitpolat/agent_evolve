@@ -17,11 +17,12 @@ distinction is enforced by the type, not by convention.
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from agent_evolve.core.problem import ObjectiveSpec
 from agent_evolve.core.results import SearchResult, dominates
+from agent_evolve.core.telemetry import harvest_telemetry
 from agent_evolve.policies.genetic import (
     Locus,
     crossover,
@@ -246,6 +247,7 @@ def run_genetic_loop(
     restriction = config.restriction
     screen_front: List[Mapping[str, float]] = []
     structure_record: Dict[str, Any] = {}
+    prior_proposer_used: Any = None
     if config.structure_budget > 0 and restriction is None:
         from agent_evolve.policies.structure import (
             attribute, crossed_screen, statistical_prior)
@@ -258,6 +260,7 @@ def run_genetic_loop(
                 [(r.configuration, dict(r.objectives)) for r in screen_valid],
                 specs, candidate_model)
             propose = config.prior_proposer or statistical_prior
+            prior_proposer_used = propose
             try:
                 restriction = propose(attr, candidate_model)
             except Exception as exc:        # a proposer must not kill a run
@@ -395,7 +398,14 @@ def run_genetic_loop(
 
     if structure_record:
         history.append({"structure": dict(structure_record)})
-    return _build_search_result(
+    result = _build_search_result(
         all_valid, all_meta, specs, history,
         evaluations=spent(), candidate_key=_default_candidate_key,
     )
+    # Telemetry is attached even when every mechanism was counter-free: an
+    # empty mechanism list on a random run is a measured zero, and a guided
+    # run's counters are the difference between "guidance did not help" and
+    # "guidance never arrived".
+    return replace(result, telemetry=harvest_telemetry(
+        (pick, prior_proposer_used), real_evaluations=spent(),
+    ))

@@ -26,6 +26,18 @@ def _fresh_registry():
     bootstrap._loaded = False
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_credentials(monkeypatch):
+    """The default suite is hermetic: no test may reach a provider because the
+    developer's shell happens to hold a key. With the operator chooser wired to
+    the completion seam, an ambient credential would turn plain ``optimize()``
+    tests into live network calls. A test that needs a credential sets its own;
+    none inherits one from the environment.
+    """
+    for name in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+
 # ---------------------------------------------------------------------------
 # The research corpus is not part of the distribution.
 #

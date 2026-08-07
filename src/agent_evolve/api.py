@@ -17,12 +17,13 @@ evaluations they can afford. Everything else has a defensible default.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Callable, Literal, Optional
 
 from agent_evolve import bootstrap
 from agent_evolve.contract import as_problem
 from agent_evolve.core.formatting import format_search_space_description
-from agent_evolve.core.results import SearchResult
+from agent_evolve.core.results import ProviderUsageSummary, SearchResult
 from agent_evolve.harness.base import HarnessContext, LLMConfig
 from agent_evolve.harness.directives import DefaultDirectives
 from agent_evolve.harness.registry import harness_registry
@@ -190,10 +191,12 @@ def optimize(
         # Only the loop is imported locally. Importing EvaluationCache here too
         # would make that name function-local for the whole body and break the
         # authoring path below, which uses the module-level import.
-        from agent_evolve.policies.search_state import SearchState
         from agent_evolve.session.genetic_loop import GeneticConfig, run_genetic_loop
 
         chooser = None
+        # Provider usage is measured from the completion seam's own journal,
+        # never declared: a zero here means "counted and none occurred".
+        usage_ledger = {"calls": 0, "input": 0, "output": 0, "tokens_known": True}
         if kind == "llm":
             # Guided operator choice: the model picks parents and cut points,
             # reasoning over the accumulated search state. It cannot author a
@@ -201,7 +204,19 @@ def optimize(
             from agent_evolve.integrations.completion import completion_for
             from agent_evolve.policies.llm_chooser import llm_chooser
 
-            complete = completion_for(model or settings.model, settings)
+            def _record_usage(record: dict) -> None:
+                usage_ledger["calls"] += 1
+                usage = record.get("usage") or {}
+                prompt_tokens = usage.get("prompt_tokens")
+                completion_tokens = usage.get("completion_tokens")
+                if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+                    usage_ledger["input"] += prompt_tokens
+                    usage_ledger["output"] += completion_tokens
+                else:
+                    usage_ledger["tokens_known"] = False
+
+            complete = completion_for(model or settings.model, settings,
+                                      journal=_record_usage)
             if complete is not None:
                 chooser = llm_chooser(
                     complete, objectives=list(bound.objectives), budget=budget,
@@ -221,7 +236,7 @@ def optimize(
         # evaluation cache without spending budget, so a fixed generation count
         # would end the run with budget unspent; the loop's real stop condition
         # is the budget.
-        return run_genetic_loop(
+        result = run_genetic_loop(
             problem=bound,
             config=GeneticConfig(
                 population_size=pop,
@@ -232,8 +247,23 @@ def optimize(
                 evaluation_budget=budget,
                 evaluation_cache=cache,
             ),
+            chooser=chooser,
             log=announce,
         )
+        if usage_ledger["calls"] and usage_ledger["tokens_known"]:
+            usage = ProviderUsageSummary(
+                calls=usage_ledger["calls"],
+                input_tokens=usage_ledger["input"],
+                output_tokens=usage_ledger["output"],
+                model=model or settings.model,
+                reported_by="openrouter response usage",
+            )
+        else:
+            usage = ProviderUsageSummary(
+                calls=usage_ledger["calls"],
+                model=(model or settings.model) if usage_ledger["calls"] else None,
+            )
+        return dataclasses.replace(result, provider_usage=usage)
 
     harness = _build_harness(kind, seed, settings)
 
