@@ -220,8 +220,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
     from agent_evolve.api import optimize
 
     problem = _load_problem(args.problem)
-    if args.proposer != "random":
-        print(_model_line(args.model))
+    if args.json:
+        # One parseable document on stdout and nothing else: progress moves to
+        # stderr under --verbose and is dropped otherwise.
+        progress = (
+            (lambda m: print(m, file=sys.stderr, flush=True))
+            if args.verbose else (lambda _m: None)
+        )
+    else:
+        if args.proposer != "random":
+            print(_model_line(args.model))
+        progress = (lambda m: print(m, flush=True)) if args.verbose else print
     result = optimize(
         problem,
         budget=args.budget,
@@ -230,8 +239,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
         strategy=args.strategy,
         seed=args.seed,
         seal=args.seal,
-        on_progress=(lambda m: print(m, flush=True)) if args.verbose else print,
+        structure_budget=args.structure_budget,
+        prior=args.prior,
+        effort=args.effort,
+        journal=args.journal,
+        on_progress=progress,
     )
+    if args.json:
+        from agent_evolve.core.formatting import result_to_json
+
+        print(result_to_json(result))
+        return 0
     print(f"\nbest        {result.best.configuration}")
     print(f"objectives  {result.best.objectives}")
     print(f"pareto      {len(result.pareto_front)}")
@@ -329,6 +347,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "write the run's chained proposal journal here; requires the "
             "authoring strategy (the genetic loop refuses it by name)"
         ),
+    )
+    run.add_argument(
+        "--structure-budget", type=int, default=0, dest="structure_budget",
+        help=(
+            "evaluations to spend on a crossed screen before the population; "
+            "charged against --budget, not free"
+        ),
+    )
+    run.add_argument(
+        "--prior",
+        default="rule",
+        choices=("rule", "rule-weighted", "llm", "llm-weighted"),
+        help=(
+            "who turns the screen into a sampling prior; the llm forms fall "
+            "back to their rule comparator, out loud, without a credential"
+        ),
+    )
+    run.add_argument(
+        "--effort", default=None,
+        help="reasoning-effort pin for every model call (e.g. low, high)",
+    )
+    run.add_argument(
+        "--journal", default=None, metavar="PATH",
+        help="write one JSON line per completed model call (model, usage)",
+    )
+    run.add_argument(
+        "--json", action="store_true",
+        help="print one machine-readable JSON document instead of prose",
     )
     run.add_argument("--verbose", action="store_true")
     run.set_defaults(func=_cmd_run)

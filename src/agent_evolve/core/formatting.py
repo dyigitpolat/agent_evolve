@@ -253,3 +253,34 @@ def parse_candidates(
     if len(parsed) != expected_count:
         log_fn(f"Warning: Expected {expected_count} candidates, got {len(parsed)}")
     return parsed, raw_elements
+
+
+def result_to_json(result: Any) -> str:
+    """One machine-readable document for a ``SearchResult``.
+
+    Blocks that were never populated serialize as ``null`` rather than being
+    omitted, so a reader can tell "measured zero" (a present block with zero
+    counts) from "nobody looked" (null). Values outside JSON's vocabulary fall
+    back to ``str`` -- a printable document beats a crash on an exotic locus
+    type, and the exact values live in the caller's hands anyway.
+    """
+    import dataclasses
+
+    def _candidate(c: Any) -> Dict[str, Any]:
+        return {"configuration": c.configuration, "objectives": c.objectives}
+
+    payload = {
+        "best": _candidate(result.best),
+        "pareto_front": [_candidate(c) for c in result.pareto_front],
+        "evaluations": result.evaluations,
+        "history": result.history,
+        "provider_usage": (
+            dataclasses.asdict(result.provider_usage)
+            if result.provider_usage is not None else None
+        ),
+        "telemetry": (
+            dataclasses.asdict(result.telemetry)
+            if result.telemetry is not None else None
+        ),
+    }
+    return json.dumps(payload, sort_keys=True, default=str)

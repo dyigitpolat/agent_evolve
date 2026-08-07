@@ -35,6 +35,10 @@ __all__ = ["optimize"]
 
 Proposer = Literal["auto", "llm", "random"]
 
+#: Who turns a screen's evidence into a sampling prior. The llm forms fall
+#: back to their rule comparator -- out loud -- when no model call is possible.
+_PRIORS = ("rule", "rule-weighted", "llm", "llm-weighted")
+
 #: Candidates proposed per generation. The budget decides how many generations
 #: that buys, so the caller states the number they know and not this one.
 _BATCH = 8
@@ -146,6 +150,10 @@ def optimize(
     seed: Optional[int] = None,
     seal: Optional[str] = None,
     on_progress: Optional[Callable[[str], None]] = None,
+    structure_budget: int = 0,
+    prior: str = "rule",
+    effort: Optional[str] = None,
+    journal: Any = None,
 ) -> SearchResult:
     """Optimize *problem* within *budget* evaluations.
 
@@ -153,6 +161,18 @@ def optimize(
     only sizing number the caller supplies. The problem's seeds are evaluated
     before anything is proposed, so the result always answers "did this beat
     what I already had".
+
+    *structure_budget* spends that many evaluations -- charged against the same
+    *budget* -- on a crossed screen before the population is built; *prior*
+    names who turns the screen into a sampling prior: the credential-free
+    ``"rule"`` (default) or ``"rule-weighted"``, or their model-backed forms
+    ``"llm"`` / ``"llm-weighted"``, which fall back to the rule comparator, out
+    loud, when no model call is possible.
+
+    *effort* pins the model's reasoning effort on every completion call, and
+    *journal* (a callable, or a path to a JSONL file) receives one record per
+    completed model call -- model served plus token usage -- so a run's spend
+    is verifiable from its own artifacts. Both belong to the genetic strategy.
 
     *seal* names a file to write the run's proposal journal to: one chained,
     self-authenticating line per model call, holding the exact configuration
@@ -163,6 +183,24 @@ def optimize(
     """
     if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
         raise ValueError(f"budget must be a positive integer, got {budget!r}")
+    if (not isinstance(structure_budget, int) or isinstance(structure_budget, bool)
+            or structure_budget < 0):
+        raise ValueError(
+            f"structure_budget must be a non-negative integer, got "
+            f"{structure_budget!r}"
+        )
+    if structure_budget >= budget:
+        raise ValueError(
+            f"structure_budget ({structure_budget}) must leave room inside the "
+            f"budget ({budget}): the screen is charged against the same budget "
+            "as the search it informs"
+        )
+    if prior not in _PRIORS:
+        raise ValueError(f"prior must be one of {sorted(_PRIORS)}, got {prior!r}")
+    if effort is not None and not isinstance(effort, str):
+        raise ValueError(
+            f"effort must be a provider effort level as a string, got {effort!r}"
+        )
 
     bound = as_problem(problem)
     announce = on_progress or (lambda _message: None)
@@ -187,83 +225,160 @@ def optimize(
             "loop makes operator choices instead. Pass strategy='authoring' "
             "to seal a generative run, or drop seal=."
         )
+    if chosen != "genetic":
+        engaged = [name for name, on in (
+            ("structure_budget", structure_budget != 0),
+            ("prior", prior != "rule"),
+            ("effort", effort is not None),
+            ("journal", journal is not None),
+        ) if on]
+        if engaged:
+            # A knob the run would silently ignore is a silent no-op -- the
+            # same defect class the seal refusal above exists to prevent.
+            raise ValueError(
+                f"{', '.join(engaged)} belong(s) to the genetic strategy, and "
+                "this run resolved to 'authoring'. Give the problem a seed to "
+                "use the genetic loop, or drop the genetic-only arguments."
+            )
     if chosen == "genetic":
         # Only the loop is imported locally. Importing EvaluationCache here too
         # would make that name function-local for the whole body and break the
         # authoring path below, which uses the module-level import.
         from agent_evolve.session.genetic_loop import GeneticConfig, run_genetic_loop
 
-        chooser = None
-        # Provider usage is measured from the completion seam's own journal,
-        # never declared: a zero here means "counted and none occurred".
-        usage_ledger = {"calls": 0, "input": 0, "output": 0, "tokens_known": True}
-        if kind == "llm":
-            # Guided operator choice: the model picks parents and cut points,
-            # reasoning over the accumulated search state. It cannot author a
-            # candidate -- OperatorChoice has no field that could hold one.
-            from agent_evolve.integrations.completion import completion_for
-            from agent_evolve.policies.llm_chooser import llm_chooser
+        journal_handle = None
+        journal_sink: Optional[Callable[[dict], None]] = None
+        if callable(journal):
+            journal_sink = journal
+        elif journal is not None:
+            import json as _json
+            from pathlib import Path
 
-            def _record_usage(record: dict) -> None:
-                usage_ledger["calls"] += 1
-                usage = record.get("usage") or {}
-                prompt_tokens = usage.get("prompt_tokens")
-                completion_tokens = usage.get("completion_tokens")
-                if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
-                    usage_ledger["input"] += prompt_tokens
-                    usage_ledger["output"] += completion_tokens
-                else:
-                    usage_ledger["tokens_known"] = False
+            journal_path = Path(journal)
+            journal_path.parent.mkdir(parents=True, exist_ok=True)
+            # Opened eagerly even though the run may make no call: an empty
+            # journal is a measured zero, an absent file is "nobody looked".
+            journal_handle = journal_path.open("w", encoding="utf-8")
 
-            complete = completion_for(model or settings.model, settings,
-                                      journal=_record_usage)
-            if complete is not None:
-                chooser = llm_chooser(
-                    complete, objectives=list(bound.objectives), budget=budget,
-                    on_shortfall=lambda got, want: announce(
-                        f"the model supplied {got} of {want} operator choices; "
-                        "the rest were filled at random"),
+            def journal_sink(record: dict) -> None:
+                journal_handle.write(_json.dumps(record, sort_keys=True) + "\n")
+                journal_handle.flush()
+
+        try:
+            chooser = None
+            complete = None
+            # Provider usage is measured from the completion seam's own
+            # journal, never declared: zero means "counted and none occurred".
+            usage_ledger = {"calls": 0, "input": 0, "output": 0, "tokens_known": True}
+            if kind == "llm":
+                # Guided operator choice: the model picks parents and cut
+                # points, reasoning over the accumulated search state. It
+                # cannot author a candidate -- OperatorChoice has no field
+                # that could hold one.
+                from agent_evolve.integrations.completion import completion_for
+                from agent_evolve.policies.llm_chooser import llm_chooser
+
+                def _record_usage(record: dict) -> None:
+                    usage_ledger["calls"] += 1
+                    usage = record.get("usage") or {}
+                    prompt_tokens = usage.get("prompt_tokens")
+                    completion_tokens = usage.get("completion_tokens")
+                    if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+                        usage_ledger["input"] += prompt_tokens
+                        usage_ledger["output"] += completion_tokens
+                    else:
+                        usage_ledger["tokens_known"] = False
+                    if journal_sink is not None:
+                        journal_sink(record)
+
+                complete = completion_for(model or settings.model, settings,
+                                          journal=_record_usage, effort=effort)
+                if complete is not None:
+                    chooser = llm_chooser(
+                        complete, objectives=list(bound.objectives), budget=budget,
+                        on_shortfall=lambda got, want: announce(
+                            f"the model supplied {got} of {want} operator choices; "
+                            "the rest were filled at random"),
+                    )
+            if effort is not None and complete is None:
+                announce(
+                    "effort pins model reasoning, and this run makes no model "
+                    "calls, so it has no effect here."
                 )
 
-        cache = EvaluationCache()
-        cache.budget = budget
-        # Sized from the BUDGET, not from how many seeds the caller happened to
-        # supply: one seed would otherwise give a population of two, which
-        # cannot recombine into anything its parents do not already contain.
-        pop = max(4, min(budget // 4, 12))
-        offspring = max(2, pop - 2)
-        # `generations` is a cap, not a schedule. Duplicate offspring hit the
-        # evaluation cache without spending budget, so a fixed generation count
-        # would end the run with budget unspent; the loop's real stop condition
-        # is the budget.
-        result = run_genetic_loop(
-            problem=bound,
-            config=GeneticConfig(
-                population_size=pop,
-                offspring_per_generation=offspring,
-                generations=max(1, 4 * budget // max(1, offspring)),
-                seed=seed,
-                seeds=seeds,
-                evaluation_budget=budget,
-                evaluation_cache=cache,
-            ),
-            chooser=chooser,
-            log=announce,
-        )
-        if usage_ledger["calls"] and usage_ledger["tokens_known"]:
-            usage = ProviderUsageSummary(
-                calls=usage_ledger["calls"],
-                input_tokens=usage_ledger["input"],
-                output_tokens=usage_ledger["output"],
-                model=model or settings.model,
-                reported_by="openrouter response usage",
+            prior_proposer: Any = None
+            if prior == "rule-weighted":
+                from agent_evolve.policies.weighted_prior import (
+                    statistical_weighted_prior)
+                prior_proposer = statistical_weighted_prior
+            elif prior in ("llm", "llm-weighted"):
+                if complete is None:
+                    announce(
+                        f"prior={prior!r} needs a model call and none is "
+                        "available; using the credential-free rule comparator "
+                        "instead."
+                    )
+                    if prior == "llm-weighted":
+                        from agent_evolve.policies.weighted_prior import (
+                            statistical_weighted_prior)
+                        prior_proposer = statistical_weighted_prior
+                elif prior == "llm":
+                    from agent_evolve.policies.llm_prior import llm_prior_proposer
+                    prior_proposer = llm_prior_proposer(
+                        complete, objectives=list(bound.objectives))
+                else:
+                    from agent_evolve.policies.weighted_prior import (
+                        llm_weighted_prior_proposer)
+                    prior_proposer = llm_weighted_prior_proposer(
+                        complete, objectives=list(bound.objectives))
+
+            cache = EvaluationCache()
+            cache.budget = budget
+            # Sized from the BUDGET, not from how many seeds the caller
+            # happened to supply: one seed would otherwise give a population
+            # of two, which cannot recombine into anything its parents do not
+            # already contain.
+            pop = max(4, min(budget // 4, 12))
+            offspring = max(2, pop - 2)
+            # `generations` is a cap, not a schedule. Duplicate offspring hit
+            # the evaluation cache without spending budget, so a fixed
+            # generation count would end the run with budget unspent; the
+            # loop's real stop condition is the budget.
+            result = run_genetic_loop(
+                problem=bound,
+                config=GeneticConfig(
+                    population_size=pop,
+                    offspring_per_generation=offspring,
+                    generations=max(1, 4 * budget // max(1, offspring)),
+                    seed=seed,
+                    seeds=seeds,
+                    evaluation_budget=budget,
+                    evaluation_cache=cache,
+                    structure_budget=structure_budget,
+                    prior_proposer=prior_proposer,
+                ),
+                chooser=chooser,
+                log=announce,
             )
-        else:
-            usage = ProviderUsageSummary(
-                calls=usage_ledger["calls"],
-                model=(model or settings.model) if usage_ledger["calls"] else None,
-            )
-        return dataclasses.replace(result, provider_usage=usage)
+            if usage_ledger["calls"] and usage_ledger["tokens_known"]:
+                usage = ProviderUsageSummary(
+                    calls=usage_ledger["calls"],
+                    input_tokens=usage_ledger["input"],
+                    output_tokens=usage_ledger["output"],
+                    model=model or settings.model,
+                    reported_by="openrouter response usage",
+                )
+            else:
+                usage = ProviderUsageSummary(
+                    calls=usage_ledger["calls"],
+                    model=(model or settings.model) if usage_ledger["calls"] else None,
+                )
+            return dataclasses.replace(result, provider_usage=usage)
+        finally:
+            # Closed even when the run raises: a journal truncated by a crash
+            # still records every call that did happen.
+            if journal_handle is not None:
+                journal_handle.close()
 
     harness = _build_harness(kind, seed, settings)
 
