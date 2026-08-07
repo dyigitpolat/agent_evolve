@@ -347,7 +347,8 @@ def optimize(
             from agent_evolve.session.authorship import build_authorship
             screening = build_authorship(
                 authorship_config, complete=complete,
-                specs=list(bound.objectives), seed=seed)
+                objectives=list(bound.objectives),
+                schema_text=_describe(bound), seed=seed, announce=announce)
 
             cache = EvaluationCache()
             cache.budget = budget

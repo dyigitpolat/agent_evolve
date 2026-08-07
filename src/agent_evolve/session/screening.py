@@ -91,7 +91,8 @@ class ScreeningTelemetry:
     """What the screen did, counted. Reaches the result via harvest."""
 
     __slots__ = ("refreshes", "validated", "rejected_validation", "screens",
-                 "screen_failures", "virtual_evaluations")
+                 "screen_failures", "virtual_evaluations", "chosen_llm",
+                 "chosen_rule")
 
     def __init__(self) -> None:
         self.refreshes = 0
@@ -100,6 +101,8 @@ class ScreeningTelemetry:
         self.screens = 0
         self.screen_failures = 0
         self.virtual_evaluations = 0
+        self.chosen_llm = 0
+        self.chosen_rule = 0
 
     def as_dict(self) -> dict[str, int]:
         return {name: getattr(self, name) for name in self.__slots__}
@@ -144,25 +147,47 @@ class Screening:
         *,
         seed: int = 0,
     ) -> bool:
-        """Re-arbitrate: today's data decides whether anyone may screen."""
+        """Re-arbitrate: today's data decides WHO may screen, if anyone.
+
+        Every builder is validated on the same held-out split; among those
+        that pass the gate, the lowest mean mse/baseline ratio wins the
+        generation. An authored surrogate therefore screens exactly when it
+        out-predicts the rules on data it never fitted: listing it first
+        would be trust, best-passing is measurement.
+        """
 
         self.telemetry.refreshes += 1
         self._predict = None
+        best: Optional[Tuple[float, str, str, SurrogateBuilder]] = None
         for name, authored_by, builder in self.builders:
             verdict = validate_surrogate(builder, evaluated, specs, seed=seed)
             if not verdict.passed:
                 self.telemetry.rejected_validation += 1
                 continue
-            try:
-                self._predict = builder(list(evaluated), specs)
-            except Exception:
-                self.telemetry.screen_failures += 1
-                continue
-            self._name = name
-            self.authored_by = authored_by
-            self.telemetry.validated += 1
-            return True
-        return False
+            ratios = [
+                verdict.per_objective_mse[objective] / verdict.baseline_mse[objective]
+                for objective in verdict.per_objective_mse
+                if verdict.baseline_mse[objective] > 0.0
+            ]
+            ratio = sum(ratios) / len(ratios) if ratios else 1.0
+            if best is None or ratio < best[0]:
+                best = (ratio, name, authored_by, builder)
+        if best is None:
+            return False
+        _ratio, name, authored_by, builder = best
+        try:
+            self._predict = builder(list(evaluated), specs)
+        except Exception:
+            self.telemetry.screen_failures += 1
+            return False
+        self._name = name
+        self.authored_by = authored_by
+        self.telemetry.validated += 1
+        if authored_by == "llm":
+            self.telemetry.chosen_llm += 1
+        else:
+            self.telemetry.chosen_rule += 1
+        return True
 
     def screen(
         self,

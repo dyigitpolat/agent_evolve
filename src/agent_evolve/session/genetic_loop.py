@@ -463,6 +463,7 @@ def run_genetic_loop(
         virtual = int(getattr(
             config.screening.telemetry, "virtual_evaluations", 0))
     return replace(result, telemetry=harvest_telemetry(
-        (pick, prior_proposer_used, config.screening),
+        (pick, prior_proposer_used, config.screening,
+         getattr(config.screening, "author", None)),
         real_evaluations=spent(), virtual_evaluations=virtual,
     ))
