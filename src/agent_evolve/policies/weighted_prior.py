@@ -1,0 +1,343 @@
+"""Graded sampling priors: the generic form of domain restriction.
+
+A hard :class:`~agent_evolve.policies.genetic.DomainRestriction` is a 0/1 bet:
+sample these values, never those. The generic form carries per-value WEIGHTS,
+so a proposer can grade its confidence instead of gambling the support -- and
+the hard restriction is exactly the special case where every kept value weighs
+the same. That equivalence is enforced, not aspirational: ``weights_for``
+reports ``None`` whenever the mapped weights are uniform, the sampler then
+draws through the identical ``r.choice`` call, and a test pins the two streams
+draw-for-draw.
+
+Why grading exists at all: the sealed space-prior arm showed a ~20-line rule
+matching a model's hard restriction to the last digit on 15 of 15 seeds -- a
+hard subset is arithmetic over the screen table, which is rule territory. A
+graded prior is the form that can carry what the table does not say (named
+idioms, couplings, physics) while the evaluator still arbitrates: support can
+only narrow, misses are counted, seeds survive, and the unwind test applies
+wherever the prior actually excludes something. A prior that excludes nothing
+makes no refutable claim; it only biases draws, and its worst case is bounded
+by the declared domain.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import re
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Sequence
+
+from agent_evolve.core.problem import ObjectiveSpec
+from agent_evolve.policies.genetic import Locus
+# _domains is package-internal on purpose: both prior proposers must resolve
+# declared domains identically, or the same reply would be judged two ways.
+from agent_evolve.policies.llm_prior import _domains
+from agent_evolve.policies.structure import Attribution, render_attribution
+
+__all__ = [
+    "WeightedRestriction",
+    "statistical_weighted_prior",
+    "WeightedPriorTelemetry",
+    "llm_weighted_prior_proposer",
+    "PROMPT",
+]
+
+
+@dataclass(frozen=True)
+class WeightedRestriction:
+    """Per-field weights over declared values -- a graded prior over WHERE to sample.
+
+    ``weighted`` maps a field name to a ``(values, weights)`` pair of parallel
+    tuples. Weight zero excludes a value from the support exactly as a hard
+    restriction would; positive weights keep values in proportion.
+
+    The :class:`~agent_evolve.policies.genetic.DomainRestriction` invariants
+    hold unchanged: narrows only (undeclared values contribute nothing), never
+    empties (an empty intersection returns the declared domain and counts the
+    miss), misses accumulate on the frozen instance, and the key is
+    ``Locus.field`` so sequence elements share their field's entry.
+    """
+
+    weighted: Mapping[str, tuple[tuple[Any, ...], tuple[float, ...]]] = field(
+        default_factory=dict
+    )
+    misses: list[str] = field(default_factory=list, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        for name, entry in dict(self.weighted).items():
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                raise ValueError(
+                    f"weighted prior for {name!r} must be a (values, weights) "
+                    f"pair, got {entry!r}"
+                )
+            values, weights = entry
+            if len(values) != len(weights):
+                raise ValueError(
+                    f"weighted prior for {name!r}: {len(values)} values but "
+                    f"{len(weights)} weights"
+                )
+            bad = [
+                w for w in weights
+                if isinstance(w, bool) or not isinstance(w, (int, float))
+                or not math.isfinite(float(w)) or float(w) < 0.0
+            ]
+            if bad:
+                raise ValueError(
+                    f"weighted prior for {name!r}: weights must be finite and "
+                    f"non-negative, got {bad}"
+                )
+            if not any(float(w) > 0.0 for w in weights):
+                raise ValueError(
+                    f"weighted prior for {name!r} gives every value weight "
+                    "zero, which is a restriction that samples nothing"
+                )
+
+    @classmethod
+    def hard(cls, allowed: Mapping[str, Sequence[Any]]) -> "WeightedRestriction":
+        """The 0/1 special case, from a hard restriction's vocabulary."""
+
+        return cls({
+            name: (tuple(values), tuple(1.0 for _ in values))
+            for name, values in dict(allowed).items()
+        })
+
+    @property
+    def allowed(self) -> dict[str, tuple[Any, ...]]:
+        """Positive-weight support, in the hard restriction's vocabulary.
+
+        The loop's structure record and its unwind test read ``allowed``, so a
+        graded prior takes part in both through exactly the values it
+        excludes. A prior that excludes nothing is unwound by nothing: it made
+        no refutable claim, only a bias, and a bias's worst case is bounded.
+        """
+
+        return {
+            name: tuple(v for v, w in zip(values, weights) if float(w) > 0.0)
+            for name, (values, weights) in dict(self.weighted).items()
+        }
+
+    def narrow(self, locus: Locus, domain: tuple[Any, ...]) -> tuple[Any, ...]:
+        entry = self.weighted.get(locus.field)
+        if entry is None or not domain:
+            return domain
+        values, weights = entry
+        support = tuple(v for v, w in zip(values, weights) if float(w) > 0.0)
+        kept = tuple(v for v in domain if v in support)
+        if not kept:
+            self.misses.append(locus.field)
+            return domain
+        return kept
+
+    def weights_for(
+        self, locus: Locus, values: Sequence[Any]
+    ) -> "tuple[float, ...] | None":
+        """Weights parallel to *values*, or ``None`` when the draw is uniform.
+
+        ``None`` in exactly three situations, each deliberate: the prior has no
+        entry for this field; the mapped weights are all equal (the hard
+        special case -- the sampler must take the byte-identical ``r.choice``
+        path); or a zero-weight value is present in *values*, which can only
+        happen after ``narrow`` missed, and a prior that missed does not get to
+        bias the fallback domain it failed to narrow.
+        """
+
+        entry = self.weighted.get(locus.field)
+        if entry is None or not values:
+            return None
+        table = {v: float(w) for v, w in zip(*entry)}
+        mapped = [table.get(v, 0.0) for v in values]
+        if any(w <= 0.0 for w in mapped):
+            return None
+        if all(w == mapped[0] for w in mapped):
+            return None
+        return tuple(mapped)
+
+
+def statistical_weighted_prior(
+    attr: Attribution,
+    candidate_model: Any = None,
+    *,
+    min_levels: int = 2,
+) -> WeightedRestriction:
+    """The credential-free graded prior: weight levels by the screen's evidence.
+
+    Reads exactly what :func:`~agent_evolve.policies.structure.statistical_prior`
+    reads, but grades instead of gambling: each level's weight is its
+    Laplace-smoothed within-screen non-domination rate, ``(nd + 0.5)/(n + 1)``,
+    so a level a small screen never saw win keeps mass instead of being erased.
+    A locus whose rates all tie is left free -- the honest reading of a screen
+    that separated nothing. This ships as the rule any model-proposed weighted
+    prior has to beat.
+    """
+
+    weighted: dict[str, tuple[tuple[Any, ...], tuple[float, ...]]] = {}
+    for name in dict.fromkeys(s.locus for s in attr.levels):
+        summaries = attr.for_locus(name)
+        if len(summaries) < min_levels:
+            continue
+        rates = {
+            s.value: (s.nondominated + 0.5) / (s.n + 1.0) for s in summaries
+        }
+        if len(set(rates.values())) < 2:
+            continue
+        weighted[name.split("[")[0]] = (tuple(rates), tuple(rates.values()))
+    return WeightedRestriction(weighted)
+
+
+@dataclass
+class WeightedPriorTelemetry:
+    """What the proposer's replies did. Counted, never inferred."""
+
+    calls: int = 0
+    unparseable: int = 0
+    wrote_candidate: int = 0
+    out_of_domain: int = 0
+    empty: int = 0
+    restricted_loci: int = 0
+    errors: int = 0
+    proposals: list = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "calls": self.calls,
+            "unparseable": self.unparseable,
+            "wrote_candidate": self.wrote_candidate,
+            "out_of_domain": self.out_of_domain,
+            "empty": self.empty,
+            "restricted_loci": self.restricted_loci,
+            "errors": self.errors,
+            "proposals": len(self.proposals),
+        }
+
+
+PROMPT = """The search has spent {n} evaluations on a screening design.
+
+OBJECTIVES: {goals}
+
+SEARCH SPACE (declared domains):
+{schema}
+
+SCREEN EVIDENCE (per locus value, within-screen):
+{screen}
+
+Read the table as evidence about THIS evaluator. It may or may not match how
+such problems usually behave; where they disagree, the table wins.
+
+Propose a WEIGHTED sampling prior. For any locus the evidence (or the
+parameter's meaning) separates, list the values worth sampling and a
+non-negative weight for each: higher weight, more draws. A value you omit gets
+weight zero and is not sampled; a locus you omit stays free. You are not
+choosing a candidate and must not propose one. Over-restricting a
+frontier-spreading parameter destroys diversity: leave a locus free unless you
+have a reason.
+
+Reply with ONLY this JSON shape and no other text:
+{{"weights": {{"<param>": {{"values": [...], "weights": [...]}}}}, "free": ["<param>", ...]}}"""
+
+
+def llm_weighted_prior_proposer(
+    complete: Callable[[str], str],
+    *,
+    objectives: Sequence[ObjectiveSpec],
+    telemetry: WeightedPriorTelemetry | None = None,
+) -> Callable[[Attribution, Any], WeightedRestriction]:
+    """A prior proposer that elicits a GRADED prior and repairs nothing.
+
+    Whole-reply rejection, exactly as the hard proposer: a reply naming
+    undeclared values, negative or non-finite weights, mismatched lists, or an
+    all-zero field is rejected WHOLE and the run proceeds unguided -- a
+    repaired prior is the harness's prior wearing the model's name. A field
+    weighted evenly over its full declared domain is recorded as free, not as
+    a restriction; a field weighted UNevenly over the full domain is a real
+    graded prior and is kept.
+    """
+
+    tel = telemetry if telemetry is not None else WeightedPriorTelemetry()
+    goals = ", ".join(f"{s.name} ({s.goal})" for s in objectives)
+
+    def propose(attr: Attribution, candidate_model: Any) -> WeightedRestriction:
+        domains = _domains(candidate_model, attr)
+        if not domains:
+            return WeightedRestriction({})
+        prompt = PROMPT.format(
+            n=attr.n_evaluated,
+            goals=goals,
+            schema="\n".join(f"  {k}: one of {list(v)}" for k, v in domains.items()),
+            screen=render_attribution(attr),
+        )
+        tel.calls += 1
+        try:
+            text = complete(prompt)
+        except Exception:
+            tel.errors += 1
+            return WeightedRestriction({})
+        match = re.search(r"\{.*\}", text, re.S)
+        if match is None:
+            tel.unparseable += 1
+            return WeightedRestriction({})
+        try:
+            raw = json.loads(match.group(0))
+        except (ValueError, TypeError):
+            tel.unparseable += 1
+            return WeightedRestriction({})
+        if not isinstance(raw, dict) or not isinstance(raw.get("weights", {}), dict):
+            tel.unparseable += 1
+            return WeightedRestriction({})
+        entries = raw.get("weights", {}) or {}
+        # Every field mapped to a bare value is a configuration, not a prior --
+        # the failure mode that collapses this arm into artifact authoring.
+        if entries and all(not isinstance(v, dict) for v in entries.values()):
+            tel.wrote_candidate += 1
+            return WeightedRestriction({})
+
+        weighted: dict[str, tuple[tuple[Any, ...], tuple[float, ...]]] = {}
+        for name, entry in entries.items():
+            if not isinstance(entry, dict):
+                tel.unparseable += 1
+                return WeightedRestriction({})
+            values = entry.get("values")
+            weights = entry.get("weights")
+            if (
+                not isinstance(values, list) or not isinstance(weights, list)
+                or not values or len(values) != len(weights)
+            ):
+                tel.unparseable += 1
+                return WeightedRestriction({})
+            if name not in domains:
+                tel.out_of_domain += 1
+                return WeightedRestriction({})
+            domain = tuple(domains[name])
+            if any(v not in domain for v in values):
+                tel.out_of_domain += 1
+                return WeightedRestriction({})
+            clean: list[float] = []
+            for w in weights:
+                if (
+                    isinstance(w, bool) or not isinstance(w, (int, float))
+                    or not math.isfinite(float(w)) or float(w) < 0.0
+                ):
+                    tel.out_of_domain += 1
+                    return WeightedRestriction({})
+                clean.append(float(w))
+            if not any(w > 0.0 for w in clean):
+                tel.out_of_domain += 1
+                return WeightedRestriction({})
+            support = {v for v, w in zip(values, clean) if w > 0.0}
+            if len(set(clean)) == 1 and support == set(domain):
+                continue                      # the full domain, evenly: free
+            weighted[name] = (tuple(values), tuple(clean))
+
+        if not weighted:
+            tel.empty += 1
+            return WeightedRestriction({})
+        tel.restricted_loci += len(weighted)
+        tel.proposals.append(
+            {k: (list(v[0]), list(v[1])) for k, v in weighted.items()}
+        )
+        return WeightedRestriction(weighted)
+
+    propose.telemetry = tel                    # type: ignore[attr-defined]
+    propose.mechanism = "weighted_prior"       # type: ignore[attr-defined]
+    propose.authored_by = "llm"                # type: ignore[attr-defined]
+    return propose

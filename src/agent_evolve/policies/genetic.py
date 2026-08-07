@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Protocol, Sequence
 
 __all__ = [
     "Locus",
@@ -26,6 +26,7 @@ __all__ = [
     "read_locus",
     "write_locus",
     "locus_domain",
+    "SamplingPrior",
     "DomainRestriction",
     "crossover",
     "mutate",
@@ -85,6 +86,26 @@ def write_locus(config: Mapping[str, Any], locus: Locus, value: Any) -> dict[str
     return out
 
 
+class SamplingPrior(Protocol):
+    """What a sampler needs from a prior over WHERE to sample.
+
+    ``narrow`` confines a declared domain -- always to a subset, never to
+    nothing (see :class:`DomainRestriction` for the enforced invariants).
+    ``weights_for`` grades the values a draw is about to choose among;
+    returning ``None`` means "uniform", and the sampler then draws through
+    exactly the call it used before graded priors existed, so a prior with
+    nothing to say costs nothing and changes nothing.
+    """
+
+    def narrow(self, locus: "Locus", domain: tuple[Any, ...]) -> tuple[Any, ...]:
+        ...
+
+    def weights_for(
+        self, locus: "Locus", values: Sequence[Any]
+    ) -> "tuple[float, ...] | None":
+        ...
+
+
 @dataclass(frozen=True)
 class DomainRestriction:
     """A narrowing of declared locus domains -- a prior over where to sample.
@@ -116,12 +137,17 @@ class DomainRestriction:
             return domain
         return kept
 
+    def weights_for(self, locus: "Locus", values: Sequence[Any]) -> None:
+        """Uniform over the narrowed support: the hard 0/1 special case."""
+
+        return None
+
 
 def locus_domain(
     candidate_model: Any,
     locus: Locus,
     *,
-    restriction: "DomainRestriction | None" = None,
+    restriction: "SamplingPrior | None" = None,
 ) -> tuple[Any, ...]:
     """Allowed values for *locus*, read from the problem's own schema.
 
@@ -181,6 +207,29 @@ def _declared_domain(candidate_model: Any, locus: Locus) -> tuple[Any, ...]:
     return ()
 
 
+def _draw(
+    r: random.Random,
+    values: tuple[Any, ...],
+    locus: Locus,
+    restriction: "SamplingPrior | None",
+) -> Any:
+    """Draw one of *values*, honouring the prior's weights when it has any.
+
+    The unweighted path is literally ``r.choice`` -- same call, same RNG
+    stream -- which is what keeps every run without a graded prior
+    byte-identical to the pre-weights seam (the fossil test holds this).
+    """
+
+    weights = None
+    if restriction is not None:
+        weigher = getattr(restriction, "weights_for", None)
+        if callable(weigher):
+            weights = weigher(locus, values)
+    if weights is None:
+        return r.choice(values)
+    return r.choices(values, weights=weights, k=1)[0]
+
+
 def crossover(
     parent_a: Mapping[str, Any],
     parent_b: Mapping[str, Any],
@@ -218,7 +267,7 @@ def mutate(
     rate: float | None = None,
     loci: Iterable[Locus] | None = None,
     rng: random.Random | None = None,
-    restriction: DomainRestriction | None = None,
+    restriction: SamplingPrior | None = None,
 ) -> dict[str, Any]:
     """Resample loci from their declared domains.
 
@@ -241,7 +290,7 @@ def mutate(
             continue                        # undeclared domain: leave it alone
         current = read_locus(out, locus)
         choices = tuple(v for v in domain if v != current) or domain
-        out = write_locus(out, locus, r.choice(choices))
+        out = write_locus(out, locus, _draw(r, choices, locus, restriction))
     return out
 
 
@@ -250,7 +299,7 @@ def uniform_candidate(
     candidate_model: Any,
     *,
     rng: random.Random | None = None,
-    restriction: DomainRestriction | None = None,
+    restriction: SamplingPrior | None = None,
 ) -> dict[str, Any]:
     """A fresh draw over every locus with a declared domain.
 
@@ -272,7 +321,7 @@ def uniform_candidate(
     for locus in loci_of(template):
         domain = locus_domain(candidate_model, locus, restriction=restriction)
         if domain:
-            out = write_locus(out, locus, r.choice(domain))
+            out = write_locus(out, locus, _draw(r, domain, locus, restriction))
             drew = True
     if not drew:
         return mutate(template, candidate_model, rng=r, restriction=restriction)

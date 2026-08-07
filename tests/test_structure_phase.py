@@ -219,3 +219,43 @@ def test_a_raising_proposer_does_not_kill_the_run():
                              structure_budget=4, seed=5, prior_proposer=boom))
     record = next(h["structure"] for h in res.history if "structure" in h)
     assert "proposer_error" in record and res.evaluations >= 4
+
+
+def test_a_weighted_prior_runs_the_phase_and_the_seed_survives():
+    # The graded rule keeps every level with unequal mass, so its support is
+    # the whole domain: nothing to unwind, only a bias -- and the loop must
+    # carry it end to end without touching the caller's seed.
+    from agent_evolve.contract import as_problem
+    from agent_evolve.policies.weighted_prior import statistical_weighted_prior
+    from agent_evolve.session.genetic_loop import GeneticConfig, run_genetic_loop
+    p = _and_gate_problem()
+    res = run_genetic_loop(
+        problem=as_problem(p),
+        config=GeneticConfig(population_size=4, offspring_per_generation=3,
+                             generations=20, evaluation_budget=20,
+                             structure_budget=4, seed=6,
+                             prior_proposer=statistical_weighted_prior))
+    record = next(h["structure"] for h in res.history if "structure" in h)
+    assert set(record["allowed"].get("width", ())) == {8, 16}
+    assert dict(TEMPLATE) in p.seen, "a prior must not delete the caller's seed"
+    assert res.evaluations <= 20
+
+
+def test_a_wrong_weighted_prior_is_unwound():
+    # Zero weights are exclusions, so a graded prior that zeroes the good
+    # region makes exactly the refutable claim the unwind test checks.
+    from agent_evolve.contract import as_problem
+    from agent_evolve.policies.weighted_prior import WeightedRestriction
+    from agent_evolve.session.genetic_loop import GeneticConfig, run_genetic_loop
+    p = _and_gate_problem()
+    res = run_genetic_loop(
+        problem=as_problem(p),
+        config=GeneticConfig(population_size=4, offspring_per_generation=3,
+                             generations=20, evaluation_budget=24,
+                             structure_budget=4, seed=7,
+                             prior_proposer=lambda attr, model: WeightedRestriction({
+                                 "width": ((8, 16), (0.0, 1.0)),
+                                 "regs": ((False, True), (1.0, 0.0))})))
+    record = next(h["structure"] for h in res.history if "structure" in h)
+    assert "unwound" in record
+    assert any(c["width"] == 8 and c["regs"] is True for c in p.seen[5:])
