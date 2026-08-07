@@ -243,6 +243,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         prior=args.prior,
         effort=args.effort,
         journal=args.journal,
+        authorship=args.authorship,
         on_progress=progress,
     )
     if args.json:
@@ -371,6 +372,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run.add_argument(
         "--journal", default=None, metavar="PATH",
         help="write one JSON line per completed model call (model, usage)",
+    )
+    run.add_argument(
+        "--authorship",
+        default="off",
+        choices=("off", "surrogate"),
+        help=(
+            "authored machinery: 'surrogate' turns on virtual pre-screening "
+            "behind a per-generation validation gate"
+        ),
     )
     run.add_argument(
         "--json", action="store_true",

@@ -154,6 +154,7 @@ def optimize(
     prior: str = "rule",
     effort: Optional[str] = None,
     journal: Any = None,
+    authorship: Any = "off",
 ) -> SearchResult:
     """Optimize *problem* within *budget* evaluations.
 
@@ -201,6 +202,16 @@ def optimize(
         raise ValueError(
             f"effort must be a provider effort level as a string, got {effort!r}"
         )
+    from agent_evolve.session.authorship import AuthorshipConfig
+    if isinstance(authorship, AuthorshipConfig):
+        authorship_config = authorship
+    elif isinstance(authorship, str):
+        authorship_config = AuthorshipConfig.preset(authorship)
+    else:
+        raise ValueError(
+            "authorship must be an AuthorshipConfig or a preset name, got "
+            f"{authorship!r}"
+        )
 
     bound = as_problem(problem)
     announce = on_progress or (lambda _message: None)
@@ -231,6 +242,7 @@ def optimize(
             ("prior", prior != "rule"),
             ("effort", effort is not None),
             ("journal", journal is not None),
+            ("authorship", authorship_config.engaged),
         ) if on]
         if engaged:
             # A knob the run would silently ignore is a silent no-op -- the
@@ -332,6 +344,11 @@ def optimize(
                     prior_proposer = llm_weighted_prior_proposer(
                         complete, objectives=list(bound.objectives))
 
+            from agent_evolve.session.authorship import build_authorship
+            screening = build_authorship(
+                authorship_config, complete=complete,
+                specs=list(bound.objectives), seed=seed)
+
             cache = EvaluationCache()
             cache.budget = budget
             # Sized from the BUDGET, not from how many seeds the caller
@@ -356,6 +373,7 @@ def optimize(
                     evaluation_cache=cache,
                     structure_budget=structure_budget,
                     prior_proposer=prior_proposer,
+                    screening=screening,
                 ),
                 chooser=chooser,
                 log=announce,

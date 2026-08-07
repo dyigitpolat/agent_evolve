@@ -16,6 +16,7 @@ distinction is enforced by the type, not by convention.
 
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
@@ -90,6 +91,13 @@ class GeneticConfig:
     #: the pre-restriction seam. This is guidance over the sampling
     #: distribution rather than over operator choice within a fixed one.
     restriction: Any = None
+    #: Virtual pre-screening (a session.screening.Screening). Each generation
+    #: the loop builds pool_factor times the offspring it can afford, asks the
+    #: screen's validated surrogate to order the pool, and measures the
+    #: exploration floor plus the top of the order. None -- the default --
+    #: leaves the loop byte-identical to the pre-screening seam; the pool's
+    #: extra construction runs on its own RNG stream for the same reason.
+    screening: Any = None
 
 
 def domination_rank(
@@ -326,6 +334,10 @@ def run_genetic_loop(
     log(f"generation 0: {len(valid)} evaluated, population {len(population)}")
 
     pick = chooser or random_chooser(rng, n_loci)
+    # Pool extras draw from their own stream: the main stream must spend
+    # exactly the same draws whether or not screening is on, or "off" stops
+    # being byte-identical to the pre-screening seam.
+    rng_pool = random.Random(0 if config.seed is None else (config.seed ^ 0x5CEE11))
 
     for gen in range(1, config.generations + 1):
         if budget_left() <= 0:
@@ -347,20 +359,57 @@ def run_genetic_loop(
             choices = list(choices) + list(
                 random_chooser(rng, n_loci)(ranked, filled, None)
             )
-        kids: List[Config] = []
-        for choice in choices:
+        def build_kid(choice: OperatorChoice, r: random.Random) -> Config:
             a = population[choice.parent_a % len(population)][0]
             b = population[choice.parent_b % len(population)][0]
             mask = choice.mask
             if len(mask) != n_loci:              # a chooser may be wrong; the
                 mask = mask[:n_loci] + tuple(    # loop must not crash on it
-                    bool(rng.getrandbits(1)) for _ in range(n_loci - len(mask))
+                    bool(r.getrandbits(1)) for _ in range(n_loci - len(mask))
                 )
             kid = crossover(a, b, mask=mask)
-            kid = mutate(kid, candidate_model, rate=config.mutation_rate,
-                         restriction=restriction,
-                         loci=choice.mutate_loci, rng=rng)
-            kids.append(kid)
+            return mutate(kid, candidate_model, rate=config.mutation_rate,
+                          restriction=restriction,
+                          loci=choice.mutate_loci, rng=r)
+
+        kids: List[Config] = [build_kid(choice, rng) for choice in choices]
+
+        # --- virtual pre-screening: build more than we can afford, pay for
+        # the promising. The surrogate is re-validated on today's data before
+        # it may order anything (the gate is the arbitration), a floor of the
+        # chooser's own picks is always measured unscreened (the screen must
+        # never own the whole generation), and only measure() below touches
+        # the budget -- the screen has no route to it by construction.
+        screen_note: Optional[Dict[str, Any]] = None
+        if config.screening is not None and kids:
+            active = config.screening.refresh(
+                list(state.evaluated), specs,
+                seed=(config.seed or 0) + gen)
+            screen_note = {"pool": len(kids), "held_out": len(kids),
+                           "advanced": 0, "active": bool(active)}
+            if active:
+                extra_n = (config.screening.pool_factor - 1) * len(kids)
+                extra_choices = random_chooser(rng_pool, n_loci)(
+                    ranked, extra_n, None)
+                pool_kids = kids + [build_kid(c, rng_pool)
+                                    for c in extra_choices]
+                report = config.screening.screen(
+                    pool_kids, [obj for _c, obj in population], specs)
+                if report is not None:
+                    floor_n = min(len(kids), max(1, math.ceil(
+                        config.screening.exploration_floor * want)))
+                    keep = list(range(floor_n))
+                    for index in report.order:
+                        if len(keep) >= want:
+                            break
+                        if index >= floor_n:
+                            keep.append(index)
+                    kids = [pool_kids[index] for index in keep[:want]]
+                    screen_note = {
+                        "pool": len(pool_kids), "held_out": floor_n,
+                        "advanced": len(kids) - floor_n, "active": True,
+                        "surrogate": report.surrogate_name,
+                    }
 
         valid = measure(kids, gen)
         # Survivors compete against this generation's offspring on equal terms;
@@ -387,9 +436,12 @@ def run_genetic_loop(
                 log(f"generation {gen}: the prior stopped paying; restriction "
                     "dropped for the remainder")
 
-        history.append({"gen": gen, "valid_count": len(valid),
-                        "pop": len(population),
-                        "choices_filled_at_random": filled})
+        entry = {"gen": gen, "valid_count": len(valid),
+                 "pop": len(population),
+                 "choices_filled_at_random": filled}
+        if screen_note is not None:
+            entry["screen"] = screen_note
+        history.append(entry)
         if filled:
             log(f"generation {gen}: the chooser supplied {want - filled} of "
                 f"{want} choices; {filled} were filled at random")
@@ -406,6 +458,11 @@ def run_genetic_loop(
     # empty mechanism list on a random run is a measured zero, and a guided
     # run's counters are the difference between "guidance did not help" and
     # "guidance never arrived".
+    virtual = 0
+    if config.screening is not None:
+        virtual = int(getattr(
+            config.screening.telemetry, "virtual_evaluations", 0))
     return replace(result, telemetry=harvest_telemetry(
-        (pick, prior_proposer_used), real_evaluations=spent(),
+        (pick, prior_proposer_used, config.screening),
+        real_evaluations=spent(), virtual_evaluations=virtual,
     ))
