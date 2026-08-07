@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from agent_evolve.core.problem import ObjectiveSpec
-from agent_evolve.core.results import SearchResult
+from agent_evolve.core.results import SearchResult, dominates
 from agent_evolve.policies.genetic import (
     Locus,
     crossover,
@@ -74,6 +74,15 @@ class GeneticConfig:
     evaluation_cache: EvaluationCache = field(default_factory=EvaluationCache)
     #: What the chooser may reason over. Left None for the score-only baseline.
     state: Any = None
+    #: Evaluations to spend on a screening design before the population is
+    #: built. 0 leaves the loop byte-identical to the pre-structure seam. The
+    #: screen is charged against the same budget as everything else: a phase
+    #: that spent free evaluations would not be a real operating point.
+    structure_budget: int = 0
+    #: Turns the screen's evidence into a prior. Defaults to the credential-free
+    #: statistical rule, so the phase is useful with no model at all -- and so a
+    #: model-proposed prior always has a rule to beat.
+    prior_proposer: Any = None
     #: A prior over WHERE to sample: narrows the declared domain of any locus it
     #: names, for initialization and mutation alike. Left None, every sampler
     #: sees exactly the schema's own domains, so the loop is byte-identical to
@@ -227,11 +236,68 @@ def run_genetic_loop(
     # (loses badly to uniform) to +0.0066 (parity), and the standard seed on
     # log2 scores worse than a typical uniform draw.
     n_loci = len(loci_of(seeds[0]))
+
+    # --- optional structure phase: buy a model of the landscape first -------
+    # Operator choice cannot escape the distribution it samples from, so before
+    # building a population the loop can spend a few evaluations on a CROSSED
+    # screen, read which locus values the evidence refutes, and narrow the
+    # domains every later draw sees. The screen costs real budget and the prior
+    # can be wrong, so both are recorded and the bet is checked below.
+    restriction = config.restriction
+    screen_front: List[Mapping[str, float]] = []
+    structure_record: Dict[str, Any] = {}
+    if config.structure_budget > 0 and restriction is None:
+        from agent_evolve.policies.structure import (
+            attribute, crossed_screen, statistical_prior)
+
+        screened = crossed_screen(seeds[0], candidate_model,
+                                  size=config.structure_budget, rng=rng)
+        screen_valid = measure(screened, 0)
+        if screen_valid:
+            attr = attribute(
+                [(r.configuration, dict(r.objectives)) for r in screen_valid],
+                specs, candidate_model)
+            propose = config.prior_proposer or statistical_prior
+            try:
+                restriction = propose(attr, candidate_model)
+            except Exception as exc:        # a proposer must not kill a run
+                structure_record["proposer_error"] = f"{type(exc).__name__}: {exc}"
+                restriction = None
+            # Keep what the screen itself achieved, as objective vectors: the
+            # unwind test below asks whether the restricted search can still
+            # match it, and domination is the only comparison that means
+            # anything across several objectives.
+            # Keep the screen's non-dominated points that the prior EXCLUDES.
+            # Those are exactly the claims the prior makes: it asserts this
+            # region is not worth sampling. If the restricted search cannot
+            # beat even one of them, the assertion is unsupported and the bet
+            # comes off. Pooled rank-0 would be the weaker test and a useless
+            # one -- a restricted region always holds points that are
+            # non-dominated along some other objective, so it could never fire.
+            screen_ranks = domination_rank(
+                [dict(r.objectives) for r in screen_valid], specs)
+            allowed = dict(getattr(restriction, "allowed", {}) or {})
+
+            def _excluded(cfg: Mapping[str, Any]) -> bool:
+                return any(cfg.get(k) not in tuple(vals)
+                           for k, vals in allowed.items())
+
+            screen_front = [dict(r.objectives)
+                            for r, rank in zip(screen_valid, screen_ranks)
+                            if rank == 0 and _excluded(r.configuration)]
+            structure_record.update(
+                screened=len(screened), evaluated=len(screen_valid),
+                allowed=dict(getattr(restriction, "allowed", {}) or {}),
+                misses=list(getattr(restriction, "misses", []) or []),
+            )
+            log(f"structure: screened {len(screen_valid)}, prior "
+                f"{structure_record.get('allowed') or 'none'}")
+
     initial = list(seeds)
     while len(initial) < config.population_size:
         template = initial[rng.randrange(len(initial))]
         initial.append(uniform_candidate(template, candidate_model, rng=rng,
-                                         restriction=config.restriction))
+                                         restriction=restriction))
     valid = measure(initial, 0)
     if not valid:
         raise RuntimeError(
@@ -289,7 +355,7 @@ def run_genetic_loop(
                 )
             kid = crossover(a, b, mask=mask)
             kid = mutate(kid, candidate_model, rate=config.mutation_rate,
-                         restriction=config.restriction,
+                         restriction=restriction,
                          loci=choice.mutate_loci, rng=rng)
             kids.append(kid)
 
@@ -300,6 +366,24 @@ def run_genetic_loop(
         pool: List[tuple[Config, Mapping[str, float]]] = list(population)
         pool.extend((r.configuration, dict(r.objectives)) for r in valid)
         population = survive(pool)
+
+        # --- the prior is a bet, and a bet must be checkable -----------------
+        # A restriction that removed the good region cannot recover on its own,
+        # so once the restricted search has had a generation to show something,
+        # ask whether it can still match what the screen already found. If not,
+        # drop the restriction for the remainder and say so. Unwinding a prior
+        # that is merely unlucky costs less than holding one that is wrong.
+        if restriction is not None and screen_front and not structure_record.get("unwound"):
+            beat_something = any(
+                dominates(obj, excluded, specs)
+                for _c, obj in population
+                for excluded in screen_front)
+            if not beat_something:
+                restriction = None
+                structure_record["unwound"] = gen
+                log(f"generation {gen}: the prior stopped paying; restriction "
+                    "dropped for the remainder")
+
         history.append({"gen": gen, "valid_count": len(valid),
                         "pop": len(population),
                         "choices_filled_at_random": filled})
@@ -309,6 +393,8 @@ def run_genetic_loop(
         log(f"generation {gen}: {len(valid)} evaluated, {spent()} of "
             f"{config.evaluation_budget} budget used")
 
+    if structure_record:
+        history.append({"structure": dict(structure_record)})
     return _build_search_result(
         all_valid, all_meta, specs, history,
         evaluations=spent(), candidate_key=_default_candidate_key,
