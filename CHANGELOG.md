@@ -5,6 +5,44 @@
 The release that turns a research artifact into something a stranger can
 install and get value from.
 
+### Added — the authorship substrate (2026-08-07)
+
+The LLM's job moves from choosing among enumerated operations (measured
+rule-matchable) to AUTHORING machinery that real evaluations arbitrate:
+
+- **Wiring and telemetry honesty.** `proposer='llm'` on the genetic path now
+  actually consults the model (the chooser was built and dropped — a live
+  bug); every mechanism's counters reach `SearchResult.telemetry`; provider
+  usage is measured from the completion seam's own journal; a fossil test
+  pins the credential-free default stream byte-for-byte across all of this.
+- **Weighted sampling priors** (`policies/weighted_prior.py`): the generic
+  graded form of `DomainRestriction`, which is provably its 0/1 special case
+  (uniform weights take the identical `r.choice` path). Rule comparator
+  `statistical_weighted_prior` ships beside `llm_weighted_prior_proposer`.
+- **Pooled structure screens** (`structure_pooled=True`): pure + spiked
+  designs over a sequence field's shared vocabulary; attribution counts
+  every (candidate, position) pair, so short screens measure value effects
+  sequences could never cross.
+- **Authored-code runtime** (`infrastructure/authored_runtime.py`): model-
+  written source runs out of process under CPU/memory/wall limits with an
+  AST import allowlist; every failure is a typed, counted outcome.
+- **Virtual pre-screening** (`authorship='surrogate'`/`'surrogate-llm'`):
+  build `pool_factor`× the affordable offspring, order them with a surrogate
+  that must beat the train-mean baseline on EVERY objective on held-out data
+  (re-validated per generation, best-passing wins — model-authored
+  surrogates screen only when they out-validate the shipped additive/kNN
+  rules), measure the exploration floor plus the top of the order. Virtual
+  and real evaluations are ledgered separately.
+- **Operator portfolio** (`authorship='operators'`/`'operators-llm'`/
+  `'full'`): variation arms under UCB1 survival credit with the classical
+  arm always in the run, model-authored `vary()` operators whose children
+  pass a parental/declared-material check or fall back (counted), and a
+  preregistered retirement rule.
+- **Public knobs**: `optimize(structure_budget=, prior=, effort=, journal=,
+  authorship=)`, CLI `--structure-budget --prior --effort --journal
+  --authorship --json`. Genetic-only knobs refuse the authoring strategy by
+  name; llm forms fall back to their rule comparators out loud.
+
 ### Breaking
 
 **Python 3.11 is now the minimum, raised from 3.10.**
