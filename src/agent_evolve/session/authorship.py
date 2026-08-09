@@ -18,6 +18,7 @@ __all__ = ["AuthorshipConfig", "AuthorshipPolicies", "build_authorship"]
 
 _SURROGATE = ("off", "rule", "llm")
 _OPERATORS = ("off", "rule", "llm")
+_INITIALIZATION = ("off", "llm")
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,7 @@ class AuthorshipConfig:
 
     surrogate: str = "off"
     operators: str = "off"
+    initialization: str = "off"
     pool_factor: int = 4
     exploration_floor: float = 0.25
     authoring_attempts: int = 2
@@ -45,6 +47,11 @@ class AuthorshipConfig:
                 f"authorship.surrogate must be one of {_SURROGATE}, got "
                 f"{self.surrogate!r}"
             )
+        if self.initialization not in _INITIALIZATION:
+            raise ValueError(
+                f"authorship.initialization must be one of {_INITIALIZATION}, "
+                f"got {self.initialization!r}"
+            )
         if self.operators not in _OPERATORS:
             raise ValueError(
                 f"authorship.operators must be one of {_OPERATORS}, got "
@@ -53,7 +60,8 @@ class AuthorshipConfig:
 
     @property
     def engaged(self) -> bool:
-        return self.surrogate != "off" or self.operators != "off"
+        return (self.surrogate != "off" or self.operators != "off"
+                or self.initialization != "off")
 
     @classmethod
     def preset(cls, name: str) -> "AuthorshipConfig":
@@ -63,7 +71,9 @@ class AuthorshipConfig:
             "surrogate-llm": cls(surrogate="llm"),
             "operators": cls(operators="rule"),
             "operators-llm": cls(operators="llm"),
-            "full": cls(surrogate="llm", operators="llm"),
+            "init-llm": cls(initialization="llm"),
+            "full": cls(surrogate="llm", operators="llm",
+                        initialization="llm"),
         }
         if name not in presets:
             raise ValueError(
@@ -79,6 +89,8 @@ class AuthorshipPolicies:
 
     screening: Optional[Any] = None
     portfolio: Optional[Any] = None
+    initial_proposals: tuple = ()
+    init_author: Optional[Any] = None
 
 
 def build_authorship(
@@ -89,6 +101,9 @@ def build_authorship(
     schema_text: str = "",
     seed: Optional[int] = None,
     announce: Optional[Callable[[str], None]] = None,
+    candidate_model: Any = None,
+    init_template: Any = None,
+    init_k: int = 0,
 ) -> AuthorshipPolicies:
     """The policy objects for *config*; fields are ``None`` where nothing is on.
 
@@ -101,12 +116,43 @@ def build_authorship(
     """
 
     say = announce or (lambda _m: None)
+    proposals, init_note = _build_initialization(
+        config, complete, schema_text, say, candidate_model,
+        init_template, init_k)
     return AuthorshipPolicies(
         screening=_build_screening(config, complete, objectives,
                                    schema_text, say),
         portfolio=_build_portfolio(config, complete, objectives,
                                    schema_text, say),
+        initial_proposals=proposals,
+        init_author=init_note,
     )
+
+
+def _build_initialization(config, complete, schema_text, say,
+                          candidate_model, template, k):
+    if config.initialization == "off":
+        return (), None
+    from agent_evolve.policies.llm_init import (InitTelemetry,
+                                                author_initial_population)
+    telemetry = InitTelemetry()
+    note = SimpleNamespace(telemetry=telemetry, mechanism="init_author",
+                           authored_by="llm")
+    if complete is None:
+        say("authorship.initialization='llm' needs a model call and none is "
+            "available; initialization stays schema-uniform.")
+        return (), note
+    if template is None or not k:
+        say("authorship.initialization='llm' received no template/size; "
+            "initialization stays schema-uniform.")
+        return (), note
+    proposals = author_initial_population(
+        complete, candidate_model=candidate_model, template=dict(template),
+        k=int(k), domain_context=schema_text, telemetry=telemetry)
+    if not proposals:
+        say("the model proposed no usable initial members; initialization "
+            "stays schema-uniform.")
+    return tuple(proposals), note
 
 
 def _build_screening(

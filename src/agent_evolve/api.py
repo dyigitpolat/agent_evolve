@@ -350,21 +350,25 @@ def optimize(
                         complete, objectives=list(bound.objectives),
                         domain_context=domain_card(bound))
 
-            from agent_evolve.policies.semantics import domain_card
-            from agent_evolve.session.authorship import build_authorship
-            policies = build_authorship(
-                authorship_config, complete=complete,
-                objectives=list(bound.objectives),
-                schema_text=domain_card(bound), seed=seed, announce=announce)
-
-            cache = EvaluationCache()
-            cache.budget = budget
             # Sized from the BUDGET, not from how many seeds the caller
             # happened to supply: one seed would otherwise give a population
             # of two, which cannot recombine into anything its parents do not
             # already contain.
             pop = max(4, min(budget // 4, 12))
             offspring = max(2, pop - 2)
+
+            from agent_evolve.policies.semantics import domain_card
+            from agent_evolve.session.authorship import build_authorship
+            policies = build_authorship(
+                authorship_config, complete=complete,
+                objectives=list(bound.objectives),
+                schema_text=domain_card(bound), seed=seed, announce=announce,
+                candidate_model=getattr(bound, "candidate_model", None),
+                init_template=(dict(seeds[0]) if seeds else None),
+                init_k=max(0, pop - len(seeds)))
+
+            cache = EvaluationCache()
+            cache.budget = budget
             # `generations` is a cap, not a schedule. Duplicate offspring hit
             # the evaluation cache without spending budget, so a fixed
             # generation count would end the run with budget unspent; the
@@ -383,10 +387,19 @@ def optimize(
                     prior_proposer=prior_proposer,
                     screening=policies.screening,
                     portfolio=policies.portfolio,
+                    initial_proposals=policies.initial_proposals,
                 ),
                 chooser=chooser,
                 log=announce,
             )
+            if policies.init_author is not None and result.telemetry is not None:
+                from agent_evolve.core.telemetry import harvest_telemetry
+                extra = harvest_telemetry((policies.init_author,))
+                result = dataclasses.replace(
+                    result,
+                    telemetry=dataclasses.replace(
+                        result.telemetry,
+                        mechanisms=result.telemetry.mechanisms + extra.mechanisms))
             if usage_ledger["calls"] and usage_ledger["tokens_known"]:
                 usage = ProviderUsageSummary(
                     calls=usage_ledger["calls"],

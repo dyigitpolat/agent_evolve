@@ -103,6 +103,10 @@ class GeneticConfig:
     #: leaves the loop byte-identical to the pre-screening seam; the pool's
     #: extra construction runs on its own RNG stream for the same reason.
     screening: Any = None
+    #: Model-proposed initial population members, validated value-by-value
+    #: upstream. Inserted AFTER the caller's seeds and before schema-uniform
+    #: fill; () -- the default -- is byte-identical to the pre-init seam.
+    initial_proposals: tuple = ()
     #: Variation-arm portfolio (a policies.operator_portfolio
     #: .OperatorPortfolio). When present it constructs the generation's
     #: offspring -- classical, rule, and authored arms under survival credit
@@ -318,6 +322,9 @@ def run_genetic_loop(
                 f"{structure_record.get('allowed') or 'none'}")
 
     initial = list(seeds)
+    for proposal in config.initial_proposals:
+        if len(initial) < config.population_size:
+            initial.append(dict(proposal))
     while len(initial) < config.population_size:
         template = initial[rng.randrange(len(initial))]
         initial.append(uniform_candidate(template, candidate_model, rng=rng,
