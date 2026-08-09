@@ -126,6 +126,41 @@ def test_screening_refresh_arbitrates_per_generation():
     )
 
 
+def test_the_variance_guard_rejects_a_sometimes_lucky_builder():
+    # The ladder1 E2 failure mode: an artifact that predicts well on one
+    # split and garbage on another passed the old single-split gate half the
+    # time and then mis-screened mid-run. Under the all-splits gate it must
+    # be rejected -- surviving EVERY split of today's data is the bar.
+    calls = {"n": 0}
+
+    def lucky_sometimes(evaluated, specs):
+        calls["n"] += 1
+        good = additive_surrogate(evaluated, specs)
+        if calls["n"] % 2 == 1:
+            return good
+
+        def garbage(pool):
+            rows = good(pool)
+            if rows is None:
+                return None
+            return [{k: v + 50.0 for k, v in row.items()} for row in rows]
+
+        return garbage
+
+    screening = Screening(
+        builders=(("lucky", "llm", lucky_sometimes),), validation_splits=3)
+    assert not screening.refresh(LEARNABLE, SPECS, seed=6), (
+        "a builder that fails any split must not screen"
+    )
+    assert screening.telemetry.rejected_validation == 1
+    consistent = Screening(
+        builders=(("additive", "rule", additive_surrogate),),
+        validation_splits=3)
+    assert consistent.refresh(LEARNABLE, SPECS, seed=6), (
+        "a consistently predictive builder must still pass all splits"
+    )
+
+
 # --- end to end through optimize() ------------------------------------------
 
 class _Problem:

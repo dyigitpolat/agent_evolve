@@ -11,6 +11,7 @@ merely ordered.
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
@@ -124,6 +125,7 @@ class Screening:
         *,
         pool_factor: int = 4,
         exploration_floor: float = 0.25,
+        validation_splits: int = 3,
     ) -> None:
         if pool_factor < 2:
             raise ValueError(f"pool_factor must be at least 2, got {pool_factor}")
@@ -131,9 +133,14 @@ class Screening:
             raise ValueError(
                 f"exploration_floor must be in [0, 1), got {exploration_floor}"
             )
+        if validation_splits < 1:
+            raise ValueError(
+                f"validation_splits must be at least 1, got {validation_splits}"
+            )
         self.builders = tuple(builders)
         self.pool_factor = int(pool_factor)
         self.exploration_floor = float(exploration_floor)
+        self.validation_splits = int(validation_splits)
         self.telemetry = ScreeningTelemetry()
         self.mechanism = "surrogate_screen"
         self.authored_by = "none"
@@ -149,27 +156,43 @@ class Screening:
     ) -> bool:
         """Re-arbitrate: today's data decides WHO may screen, if anyone.
 
-        Every builder is validated on the same held-out split; among those
-        that pass the gate, the lowest mean mse/baseline ratio wins the
-        generation. An authored surrogate therefore screens exactly when it
-        out-predicts the rules on data it never fitted: listing it first
-        would be trust, best-passing is measurement.
+        Every builder is validated on ``validation_splits`` INDEPENDENT
+        held-out splits and must pass the gate on EVERY one; among the
+        survivors, the lowest median mse/baseline ratio wins the generation.
+        The all-splits requirement is the variance guard the ladder1 E2 row
+        demanded: a high-variance authored artifact can pass one small
+        holdout by luck and then mis-screen mid-run -- measured at the
+        cheapest scale, where authored screening HURT the endpoint under the
+        single-split gate. Surviving every split of today's data is the
+        in-loop generalization of "pass on both frozen datasets
+        independently". Best-passing across splits stays the arbitration:
+        listing the authored builder first would be trust, this is
+        measurement.
         """
 
         self.telemetry.refreshes += 1
         self._predict = None
         best: Optional[Tuple[float, str, str, SurrogateBuilder]] = None
         for name, authored_by, builder in self.builders:
-            verdict = validate_surrogate(builder, evaluated, specs, seed=seed)
-            if not verdict.passed:
+            ratios = []
+            failed = False
+            for split in range(self.validation_splits):
+                verdict = validate_surrogate(
+                    builder, evaluated, specs, seed=seed + split * 7919)
+                if not verdict.passed:
+                    failed = True
+                    break
+                per = [
+                    verdict.per_objective_mse[objective]
+                    / verdict.baseline_mse[objective]
+                    for objective in verdict.per_objective_mse
+                    if verdict.baseline_mse[objective] > 0.0
+                ]
+                ratios.append(sum(per) / len(per) if per else 1.0)
+            if failed:
                 self.telemetry.rejected_validation += 1
                 continue
-            ratios = [
-                verdict.per_objective_mse[objective] / verdict.baseline_mse[objective]
-                for objective in verdict.per_objective_mse
-                if verdict.baseline_mse[objective] > 0.0
-            ]
-            ratio = sum(ratios) / len(ratios) if ratios else 1.0
+            ratio = statistics.median(ratios) if ratios else 1.0
             if best is None or ratio < best[0]:
                 best = (ratio, name, authored_by, builder)
         if best is None:
