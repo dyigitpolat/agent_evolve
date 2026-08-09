@@ -208,9 +208,30 @@ class AnalogSizingProblem:
     @property
     def objectives(self) -> tuple[ObjectiveSpec, ...]:
         return (
-            ObjectiveSpec(OBJECTIVE_FOM_S, "max"),
-            ObjectiveSpec(OBJECTIVE_PHASE_MARGIN, "max"),
-            ObjectiveSpec(OBJECTIVE_REWARD9, "max"),
+            ObjectiveSpec(
+                OBJECTIVE_FOM_S, "max",
+                description=(
+                    "AnalogGym's efficiency figure of merit, GBW*CL/Power "
+                    "-- bandwidth delivered per unit supply power"
+                ),
+            ),
+            ObjectiveSpec(
+                OBJECTIVE_PHASE_MARGIN, "max",
+                description=(
+                    "closed-loop stability margin in degrees; raising "
+                    "bandwidth (e.g. by shrinking the compensation "
+                    "capacitor) typically spends this margin"
+                ),
+            ),
+            ObjectiveSpec(
+                OBJECTIVE_REWARD9, "max",
+                description=(
+                    "AnalogGym's spec-attainment reward: the sum of nine "
+                    "clipped per-spec terms, each 0 when its spec is met "
+                    "and negative below it -- maximised at 0 = every spec "
+                    "met simultaneously"
+                ),
+            ),
         )
 
     @property

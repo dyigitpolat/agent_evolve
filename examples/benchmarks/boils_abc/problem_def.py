@@ -57,8 +57,20 @@ class BoilsAbcProblem:
     @property
     def objectives(self):
         return [
-            ObjectiveSpec("total_lut_count", "min"),
-            ObjectiveSpec("total_levels", "min"),
+            ObjectiveSpec(
+                "total_lut_count", "min",
+                description=(
+                    "6-input LUT count after technology mapping, summed "
+                    "across the circuit panel -- the area proxy"
+                ),
+            ),
+            ObjectiveSpec(
+                "total_levels", "min",
+                description=(
+                    "mapped logic depth in LUT levels, summed across the "
+                    "panel -- the delay proxy"
+                ),
+            ),
         ]
 
     @property
@@ -108,6 +120,12 @@ class BoilsAbcProblem:
             "Actions execute after strash, followed by pinned LUT-6 mapping and "
             "CEC against the original circuit. Minimize the raw sum of LUT counts "
             "and the raw sum of mapped logic levels across the panel.\n"
+            "Action meanings: rewrite/refactor locally rewrite AIG subgraphs "
+            "(_z variants accept only zero-cost moves); balance restructures "
+            "for depth; resub/resub_z resubstitute nodes using existing "
+            "divisors; fraig SAT-sweeps functional equivalences; sopb/blut/"
+            "dsdb restructure toward LUT-oriented forms. Order matters: each "
+            "action transforms the network the previous one left behind.\n"
             f"Circuit panel: {circuits}."
         )
 

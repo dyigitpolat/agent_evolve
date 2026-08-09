@@ -241,6 +241,7 @@ def llm_weighted_prior_proposer(
     *,
     objectives: Sequence[ObjectiveSpec],
     telemetry: WeightedPriorTelemetry | None = None,
+    domain_context: str = "",
 ) -> Callable[[Attribution, Any], WeightedRestriction]:
     """A prior proposer that elicits a GRADED prior and repairs nothing.
 
@@ -253,17 +254,23 @@ def llm_weighted_prior_proposer(
     graded prior and is kept.
     """
 
+    from agent_evolve.policies.semantics import objective_lines, parameter_lines
+
     tel = telemetry if telemetry is not None else WeightedPriorTelemetry()
-    goals = ", ".join(f"{s.name} ({s.goal})" for s in objectives)
+    goals = ", ".join(objective_lines(objectives))
+    preamble = f"{domain_context.strip()}\n\n" if domain_context.strip() else ""
 
     def propose(attr: Attribution, candidate_model: Any) -> WeightedRestriction:
         domains = _domains(candidate_model, attr)
         if not domains:
             return WeightedRestriction({})
-        prompt = PROMPT.format(
+        described = parameter_lines(candidate_model, fields=list(domains))
+        prompt = preamble + PROMPT.format(
             n=attr.n_evaluated,
             goals=goals,
-            schema="\n".join(f"  {k}: one of {list(v)}" for k, v in domains.items()),
+            schema="\n".join(f"  {line}" for line in described)
+            if described else
+            "\n".join(f"  {k}: one of {list(v)}" for k, v in domains.items()),
             screen=render_attribution(attr),
         )
         tel.calls += 1

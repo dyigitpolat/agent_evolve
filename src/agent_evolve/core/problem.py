@@ -14,10 +14,21 @@ ConfigT = TypeVar("ConfigT")
 
 @dataclass(frozen=True)
 class ObjectiveSpec:
-    """Specification for a single optimisation objective."""
+    """Specification for a single optimisation objective.
+
+    ``description`` is the objective's MEANING -- what the number measures,
+    its units, what a good value looks like ("spec-attainment reward, sum of
+    nine clipped terms, maximised at 0 = every spec met"). It is rendered
+    into every model-facing prompt: an optimizer asked to trade objectives
+    it cannot interpret is reasoning blindfolded, and the resulting failure
+    is unattributable (channel defect vs capability). Optional so existing
+    problems keep working; a problem that leaves it empty is telling the
+    model "the name is all you get".
+    """
 
     name: str
     goal: Goal
+    description: str = ""
 
 
 class ProblemContractError(RuntimeError):

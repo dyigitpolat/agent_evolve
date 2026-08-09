@@ -55,7 +55,7 @@ class ChooserTelemetry:
 
 
 _PROMPT = """You are choosing recombination operations for a genetic optimizer.
-
+{context}
 OBJECTIVES (this is what the numbers mean):
 {objectives}
 {state}
@@ -159,6 +159,7 @@ def llm_chooser(
     budget: int,
     telemetry: ChooserTelemetry | None = None,
     on_shortfall: Callable[[int, int], None] | None = None,
+    domain_context: str = "",
 ):
     """Build an :class:`OperatorChooser` that asks *complete* for choices.
 
@@ -168,8 +169,14 @@ def llm_chooser(
     result cannot be attributed.
     """
 
+    from agent_evolve.policies.semantics import objective_lines
+
     stats = telemetry if telemetry is not None else ChooserTelemetry()
     spent = {"n": 0}
+    # Empty context renders to nothing at all, keeping the no-card prompt
+    # byte-identical (the state-block precedent).
+    context_block = (f"\n{domain_context.strip()}\n"
+                     if domain_context.strip() else "")
 
     def choose(population: Sequence[tuple[Config, float]], count: int,
                state: Any = None):
@@ -185,8 +192,9 @@ def llm_chooser(
             if rendered:
                 block = "\n" + rendered + "\n"
         prompt = _PROMPT.format(
+            context=context_block,
             objectives="\n".join(
-                f"  {spec.name}: {spec.goal}imise" for spec in objectives
+                f"  {line}" for line in objective_lines(objectives)
             ),
             state=block,
             population=render_population(population, objectives),

@@ -104,3 +104,43 @@ harness is the only swappable part; switching it changes zero loop lines.
 (objectives = energy/cycles/area, a 6-level Simba `MappingRecommendation` schema,
 Timeloop/Accelergy evaluation) and its own prompt directives. It depends on
 `agent_evolve` purely as a library—a template for any new problem.
+
+## Telling the model what things MEAN (the semantic channel)
+
+The optimizer always gives the model correct *structure* — parameter names,
+declared domains, objective directions. Structure is not meaning: a model
+asked to trade `reward9` against `phase_margin` without being told what
+either measures is reasoning blindfolded, and whatever happens next is
+unattributable (was it the model, or the starved channel?). The semantic
+channel fixes this, and everything it renders is harvested from things you
+can already write — no new machinery on your side.
+
+**The four sources, in the order the card renders them:**
+
+1. **The problem in prose** — implement `search_space_description()`
+   (preferred: it can be dynamic), or just write a class docstring on your
+   problem, or on your candidate model. Say what the artifact is, what the
+   evaluator does to it, and anything a domain expert would state before
+   touching a knob ("actions execute in order; each transforms the network
+   the previous one left").
+2. **The evaluation** — the docstring of your `evaluate()` method. One
+   paragraph: what simulator runs, at what fidelity, what a failure means.
+3. **Objective meanings** — `ObjectiveSpec(name, goal, description=...)`.
+   State what the number measures, its units, and what good looks like:
+   `ObjectiveSpec("reward9", "max", description="sum of nine clipped
+   per-spec terms, each 0 when its spec is met; maximised at 0 = every
+   spec met")`.
+4. **Parameter meanings** — pydantic `Field(description=...)` on your
+   candidate model: `width: Literal[8, 16] = Field(description="datapath
+   width in bits")`. These flow into the JSON schema and from there into
+   every prompt.
+
+All four are optional and degrade gracefully — an empty description adds
+nothing to the prompt rather than a hole. But treat them as obligations in
+spirit: every LLM mechanism in this package (priors, authored surrogates,
+authored operators, the chooser) receives the assembled card, and the
+measured history of this project says channel defects masquerade as
+capability failures. If you conclude "the model doesn't help on my
+problem", check the card first: `python -c "from agent_evolve.policies.semantics
+import domain_card; print(domain_card(my_problem))"` shows exactly what the
+model was told.

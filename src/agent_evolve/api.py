@@ -306,8 +306,10 @@ def optimize(
                 complete = completion_for(model or settings.model, settings,
                                           journal=_record_usage, effort=effort)
                 if complete is not None:
+                    from agent_evolve.policies.semantics import domain_card
                     chooser = llm_chooser(
                         complete, objectives=list(bound.objectives), budget=budget,
+                        domain_context=domain_card(bound),
                         on_shortfall=lambda got, want: announce(
                             f"the model supplied {got} of {want} operator choices; "
                             "the rest were filled at random"),
@@ -336,19 +338,24 @@ def optimize(
                         prior_proposer = statistical_weighted_prior
                 elif prior == "llm":
                     from agent_evolve.policies.llm_prior import llm_prior_proposer
+                    from agent_evolve.policies.semantics import domain_card
                     prior_proposer = llm_prior_proposer(
-                        complete, objectives=list(bound.objectives))
+                        complete, objectives=list(bound.objectives),
+                        domain_context=domain_card(bound))
                 else:
+                    from agent_evolve.policies.semantics import domain_card
                     from agent_evolve.policies.weighted_prior import (
                         llm_weighted_prior_proposer)
                     prior_proposer = llm_weighted_prior_proposer(
-                        complete, objectives=list(bound.objectives))
+                        complete, objectives=list(bound.objectives),
+                        domain_context=domain_card(bound))
 
+            from agent_evolve.policies.semantics import domain_card
             from agent_evolve.session.authorship import build_authorship
             policies = build_authorship(
                 authorship_config, complete=complete,
                 objectives=list(bound.objectives),
-                schema_text=_describe(bound), seed=seed, announce=announce)
+                schema_text=domain_card(bound), seed=seed, announce=announce)
 
             cache = EvaluationCache()
             cache.budget = budget
