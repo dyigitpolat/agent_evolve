@@ -375,9 +375,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     run.add_argument(
         "--authorship",
-        default="off",
-        choices=("off", "surrogate", "surrogate-llm", "operators",
-                 "operators-llm", "full"),
+        default="auto",
+        choices=("auto", "off", "surrogate", "surrogate-llm", "operators",
+                 "operators-llm", "init-llm", "full"),
         help=(
             "authored machinery: 'surrogate[-llm]' turns on virtual "
             "pre-screening (model-written surrogates screen only when they "

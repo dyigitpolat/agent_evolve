@@ -154,7 +154,7 @@ def optimize(
     prior: str = "rule",
     effort: Optional[str] = None,
     journal: Any = None,
-    authorship: Any = "off",
+    authorship: Any = "auto",
 ) -> SearchResult:
     """Optimize *problem* within *budget* evaluations.
 
@@ -205,6 +205,11 @@ def optimize(
     from agent_evolve.session.authorship import AuthorshipConfig
     if isinstance(authorship, AuthorshipConfig):
         authorship_config = authorship
+    elif authorship == "auto":
+        # Resolved on the genetic branch: the model-authored surrogate is ON
+        # when a model call is possible (the sealed S1 luna-clear row held),
+        # off otherwise. The evidence-backed default, not the hopeful one.
+        authorship_config = None
     elif isinstance(authorship, str):
         authorship_config = AuthorshipConfig.preset(authorship)
     else:
@@ -242,7 +247,8 @@ def optimize(
             ("prior", prior != "rule"),
             ("effort", effort is not None),
             ("journal", journal is not None),
-            ("authorship", authorship_config.engaged),
+            ("authorship", authorship_config is not None
+             and authorship_config.engaged),
         ) if on]
         if engaged:
             # A knob the run would silently ignore is a silent no-op -- the
@@ -350,6 +356,15 @@ def optimize(
                         complete, objectives=list(bound.objectives),
                         domain_context=domain_card(bound))
 
+            if authorship_config is None:
+                if complete is not None:
+                    authorship_config = AuthorshipConfig(surrogate="llm")
+                    announce(
+                        "authorship: model-authored surrogate screening is ON "
+                        "(the sealed luna-clear row held); pass "
+                        "authorship='off' to disable.")
+                else:
+                    authorship_config = AuthorshipConfig()
             # Sized from the BUDGET, not from how many seeds the caller
             # happened to supply: one seed would otherwise give a population
             # of two, which cannot recombine into anything its parents do not
