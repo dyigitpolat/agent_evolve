@@ -149,6 +149,136 @@ def author_surrogate(
     return None
 
 
+REVISION_PROMPT = """You previously wrote this surrogate model for a black-box \
+multi-objective optimizer:
+
+```python
+{source}
+```
+
+It was validated on REAL evaluation data it had never seen, and here is how
+it actually performed:
+
+{feedback}
+
+Revise the function. Keep what works, fix what the residuals show is wrong --
+a systematic bias on one objective means a missing term or interaction, not a
+scaling constant. Same rules as before: exactly this signature
+
+    {contract}
+
+fit whatever coefficients your structure needs from train_x/train_y inside
+the function; return one dict per test_x row with EVERY objective name;
+standard library only ({imports}); deterministic; no I/O.
+
+Reply with ONLY one fenced Python code block and no other text."""
+
+
+def render_validation_feedback(
+    verdict: Any,
+    evaluated: Sequence[Tuple[Config, Mapping[str, float]]],
+    predictions: Optional[Sequence[Mapping[str, float]]] = None,
+    *,
+    worst: int = 5,
+) -> str:
+    """The residual story a revision needs, as text.
+
+    Per-objective error against the trivial train-mean baseline, plus the
+    worst individual mispredictions when the caller has them -- the concrete
+    cases a systematic bias shows up in. Pure rendering; never raises.
+    """
+
+    lines = []
+    mse = getattr(verdict, "per_objective_mse", {}) or {}
+    baseline = getattr(verdict, "baseline_mse", {}) or {}
+    for name in mse:
+        base = baseline.get(name)
+        ratio = (f"{mse[name] / base:.2f}x the train-mean baseline"
+                 if base else "baseline unavailable")
+        lines.append(f"  {name}: holdout MSE {mse[name]:.6g} ({ratio}; "
+                     "below 1.00x is predictive)")
+    detail = getattr(verdict, "detail", "")
+    if detail:
+        lines.append(f"  gate detail: {detail}")
+    if predictions and evaluated:
+        residuals = []
+        for (config, actual), predicted in zip(evaluated, predictions):
+            if not isinstance(predicted, Mapping):
+                continue
+            for name, value in actual.items():
+                guess = predicted.get(name)
+                if isinstance(guess, (int, float)):
+                    residuals.append((abs(float(guess) - float(value)),
+                                      name, config, guess, value))
+        residuals.sort(reverse=True, key=lambda row: row[0])
+        for _size, name, config, guess, value in residuals[:worst]:
+            lines.append(f"  worst: {name} predicted {guess:.6g}, actual "
+                         f"{value:.6g} at {json_compact(config)}")
+    return "\n".join(lines) if lines else "  (no usable validation detail)"
+
+
+def json_compact(config: Config) -> str:
+    import json as _json
+
+    text = _json.dumps(config, sort_keys=True, default=str)
+    return text if len(text) <= 200 else text[:197] + "..."
+
+
+def revise_surrogate(
+    complete: Callable[[str], str],
+    *,
+    artifact: AuthoredArtifact,
+    feedback: str,
+    attempts: int = 1,
+    telemetry: Optional[AuthorTelemetry] = None,
+) -> Optional[AuthoredArtifact]:
+    """One revision round: the artifact, its measured failures, a rewrite.
+
+    The gate treats a revision exactly like a fresh authorship: fenced block
+    only, import allowlist, correct entry point, whole-reply rejection. A
+    revision that fails yields None and the caller keeps what it had.
+    """
+
+    tel = telemetry if telemetry is not None else AuthorTelemetry()
+    contract = CONTRACTS["surrogate"]
+    prompt = REVISION_PROMPT.format(
+        source=artifact.source,
+        feedback=feedback,
+        contract=contract.description,
+        imports=", ".join(sorted(ALLOWED_IMPORTS)),
+    )
+    for _attempt in range(max(1, attempts)):
+        tel.calls += 1
+        try:
+            text = complete(prompt)
+        except Exception:
+            tel.errors += 1
+            continue
+        match = _FENCE.search(text)
+        if match is None:
+            tel.no_code_block += 1
+            continue
+        source = match.group(1)
+        try:
+            forbidden = _forbidden_import(source)
+        except SyntaxError:
+            tel.unparseable += 1
+            continue
+        if forbidden is not None:
+            tel.forbidden_import += 1
+            continue
+        if not re.search(rf"^def {contract.entry_point}\(", source, re.M):
+            tel.wrong_entry_point += 1
+            continue
+        tel.accepted += 1
+        tel.sources.append(source)
+        return authored_artifact(
+            "surrogate", source,
+            name=f"{artifact.name}_rev", authored_by="llm",
+        )
+    return None
+
+
 def authored_surrogate_builder(
     artifact: AuthoredArtifact,
     runtime: AuthoredRuntime,

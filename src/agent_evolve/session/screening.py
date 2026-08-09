@@ -93,7 +93,7 @@ class ScreeningTelemetry:
 
     __slots__ = ("refreshes", "validated", "rejected_validation", "screens",
                  "screen_failures", "virtual_evaluations", "chosen_llm",
-                 "chosen_rule")
+                 "chosen_rule", "revisions", "revisions_accepted")
 
     def __init__(self) -> None:
         self.refreshes = 0
@@ -104,6 +104,8 @@ class ScreeningTelemetry:
         self.virtual_evaluations = 0
         self.chosen_llm = 0
         self.chosen_rule = 0
+        self.revisions = 0
+        self.revisions_accepted = 0
 
     def as_dict(self) -> dict[str, int]:
         return {name: getattr(self, name) for name in self.__slots__}
@@ -126,6 +128,8 @@ class Screening:
         pool_factor: int = 4,
         exploration_floor: float = 0.25,
         validation_splits: int = 3,
+        revise: Any = None,
+        max_revisions: int = 2,
     ) -> None:
         if pool_factor < 2:
             raise ValueError(f"pool_factor must be at least 2, got {pool_factor}")
@@ -141,6 +145,15 @@ class Screening:
         self.pool_factor = int(pool_factor)
         self.exploration_floor = float(exploration_floor)
         self.validation_splits = int(validation_splits)
+        #: The evolving-surrogate hook: called with (evaluated, specs) when
+        #: the llm builder exists and did not win this refresh, at most
+        #: max_revisions times per run. Returns a replacement
+        #: (name, authored_by, builder) entry -- authored from the current
+        #: artifact plus its measured validation residuals -- or None. The
+        #: revision competes from the NEXT refresh under the same gate; a
+        #: model that cannot fix its artifact keeps losing to the rules.
+        self.revise = revise
+        self.max_revisions = int(max_revisions)
         self.telemetry = ScreeningTelemetry()
         self.mechanism = "surrogate_screen"
         self.authored_by = "none"
@@ -195,6 +208,31 @@ class Screening:
             ratio = statistics.median(ratios) if ratios else 1.0
             if best is None or ratio < best[0]:
                 best = (ratio, name, authored_by, builder)
+        # Revise only when the rules measurably beat the artifact -- a refresh
+        # where nothing passes the gate carries no feedback a revision could
+        # use, and the revision budget is small.
+        llm_won = best is not None and best[2] == "llm"
+        if (best is not None and not llm_won and self.revise is not None
+                and self.telemetry.revisions < self.max_revisions
+                and any(authored_by == "llm"
+                        for _n, authored_by, _b in self.builders)):
+            self.telemetry.revisions += 1
+            try:
+                replacement = self.revise(list(evaluated), specs)
+            except Exception:
+                replacement = None
+            if replacement is not None:
+                self.telemetry.revisions_accepted += 1
+                rebuilt = []
+                swapped = False
+                for entry in self.builders:
+                    if not swapped and entry[1] == "llm":
+                        rebuilt.append(tuple(replacement))
+                        swapped = True
+                    else:
+                        rebuilt.append(entry)
+                self.builders = tuple(rebuilt)
+
         if best is None:
             return False
         _ratio, name, authored_by, builder = best

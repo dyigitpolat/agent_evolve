@@ -166,10 +166,46 @@ def _build_screening(
         ("additive", "rule", additive_surrogate),
         ("knn", "rule", knn_surrogate),
     ])
+
+    revise = None
+    if config.surrogate == "llm" and complete is not None and builders[0][1] == "llm":
+        # The evolving surrogate: when the authored artifact loses to the
+        # rules, the model sees its own source plus the measured residuals
+        # and revises it. Structure from meaning, correction from data.
+        # builders[0] being llm guarantees the authoring above succeeded.
+        state = {"artifact": artifact}
+
+        def revise(evaluated, specs):
+            from agent_evolve.policies.llm_surrogate import (
+                render_validation_feedback, revise_surrogate)
+            from agent_evolve.policies.surrogate import validate_surrogate
+
+            current = state["artifact"]
+            if current is None:
+                return None
+            builder = authored_surrogate_builder(current, runtime)
+            verdict = validate_surrogate(builder, evaluated, specs, seed=1)
+            try:
+                predictions = builder(list(evaluated), specs)(
+                    [candidate_config for candidate_config, _obj in evaluated])
+            except Exception:
+                predictions = None
+            feedback = render_validation_feedback(
+                verdict, evaluated, predictions)
+            revised = revise_surrogate(
+                complete, artifact=current, feedback=feedback,
+                telemetry=telemetry)
+            if revised is None:
+                return None
+            state["artifact"] = revised
+            return (f"llm:{revised.source_sha256[:8]}", "llm",
+                    authored_surrogate_builder(revised, runtime))
+
     screening = Screening(
         builders=tuple(builders),
         pool_factor=config.pool_factor,
         exploration_floor=config.exploration_floor,
+        revise=revise,
     )
     if author_note is not None:
         # Harvested beside the screen's own counters: how authoring went is

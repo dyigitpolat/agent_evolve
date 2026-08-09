@@ -188,11 +188,81 @@ def test_surrogate_llm_end_to_end_with_a_canned_author(monkeypatch):
     assert problem.calls <= 24 and result.evaluations <= 24
     mechanisms = {m.mechanism: m for m in result.telemetry.mechanisms}
     assert "surrogate_author" in mechanisms
-    assert mechanisms["surrogate_author"].counters["accepted"] == 1
+    # The canned model answers authoring AND any revision prompts the
+    # evolving-surrogate hook issues, so accepted is at least one.
+    assert mechanisms["surrogate_author"].counters["accepted"] >= 1
     screen = mechanisms.get("surrogate_screen")
     assert screen is not None and screen.counters["chosen_llm"] >= 1, (
         "an exact authored surrogate never won arbitration"
     )
+
+
+def test_revise_surrogate_carries_source_and_feedback_and_gates_the_reply():
+    from agent_evolve.policies.llm_surrogate import revise_surrogate
+
+    artifact = authored_artifact("surrogate", GOOD_SOURCE,
+                                 name="v1", authored_by="llm")
+    seen = {}
+
+    def capture(prompt):
+        seen["p"] = prompt
+        return "```python\n" + GOOD_SOURCE + "```"
+
+    tel = AuthorTelemetry()
+    revised = revise_surrogate(capture, artifact=artifact,
+                               feedback="  ones: holdout MSE 4.2 (2.10x)",
+                               telemetry=tel)
+    assert revised is not None and revised.name == "v1_rev"
+    assert GOOD_SOURCE.splitlines()[0] in seen["p"], "the model must see itself"
+    assert "2.10x" in seen["p"], "the model must see its measured residuals"
+    assert tel.accepted == 1
+
+    bad = revise_surrogate(lambda _p: "```python\nimport os\ndef fit_predict(a,b,c):\n    return []\n```",
+                           artifact=artifact, feedback="f", telemetry=tel)
+    assert bad is None and tel.forbidden_import == 1, (
+        "a revision faces the same gate as a fresh authorship"
+    )
+
+
+def test_the_evolving_surrogate_replaces_a_losing_artifact_and_wins_later():
+    # Refresh 1: the llm builder is garbage, the rules win, the revise hook
+    # fires and swaps in a revision. Refresh 2: the revision out-validates
+    # the rules and screens. The cap then stops further spend.
+    def garbage_builder(evaluated, specs):
+        def predict(pool):
+            return [{"ones": 99.0, "zeros": 99.0} for _ in pool]
+        return predict
+
+    def exact_builder(evaluated, specs):
+        def predict(pool):
+            return [{"ones": float(sum(c["genome"])),
+                     "zeros": float(len(c["genome"]) - sum(c["genome"]))}
+                    for c in pool]
+        return predict
+
+    calls = {"n": 0}
+
+    def revise(evaluated, specs):
+        calls["n"] += 1
+        return ("llm:rev", "llm", exact_builder)
+
+    screening = Screening(
+        builders=(("llm:v1", "llm", garbage_builder),
+                  ("additive", "rule",
+                   __import__("agent_evolve.policies.surrogate",
+                              fromlist=["additive_surrogate"]).additive_surrogate)),
+        revise=revise, max_revisions=2)
+
+    assert screening.refresh(LEARNABLE, SPECS, seed=8)
+    assert screening.authored_by == "rule", "refresh 1: the rules carry it"
+    assert calls["n"] == 1 and screening.telemetry.revisions_accepted == 1
+    assert screening.builders[0][0] == "llm:rev", "the artifact was replaced"
+
+    assert screening.refresh(LEARNABLE, SPECS, seed=8)
+    assert screening.authored_by == "llm", (
+        "refresh 2: the revision must out-validate the rules and screen"
+    )
+    assert calls["n"] == 1, "a winning artifact is not revised"
 
 
 def test_surrogate_llm_without_a_credential_falls_back_out_loud():
