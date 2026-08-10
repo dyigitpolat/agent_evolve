@@ -6,9 +6,9 @@ to order them, and pays the evaluator only for the promising ones. That is
 only honest if the surrogate is actually predictive, so every surrogate --
 rule or model-authored alike -- passes :func:`validate_surrogate` before it
 may order anything, and is re-validated as data accumulates. The gate is
-sharp and preregistered in code: strictly beat the trivial train-mean
-predictor on EVERY declared objective, on a held-out split, or sit out this
-generation.
+sharp and preregistered in code: on a held-out split, strictly beat the
+trivial train-mean predictor on EVERY declared objective AND rank-agree
+with the measured outcomes on every objective, or sit out this generation.
 
 The two shipped surrogates are dependency-free rules. They are the
 comparators any model-authored surrogate has to beat: an authored form that
@@ -20,8 +20,8 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from agent_evolve.core.problem import ObjectiveSpec
 from agent_evolve.policies.genetic import loci_of, read_locus
@@ -134,13 +134,58 @@ def additive_surrogate(
 
 @dataclass(frozen=True)
 class SurrogateValidation:
-    """The gate's verdict, with the numbers that produced it."""
+    """The gate's verdict, with the numbers that produced it.
+
+    ``per_objective_spearman`` records the rank agreement between predicted
+    and actual holdout values (average-rank ties; 0.0 when either side is
+    entirely tied, i.e. no measurable ordering). It is empty on verdicts
+    that never reached scoring (too little data, builder failure, unusable
+    predictions).
+    """
 
     passed: bool
     per_objective_mse: Mapping[str, float]
     baseline_mse: Mapping[str, float]
     holdout: int
     detail: str = ""
+    per_objective_spearman: Mapping[str, float] = field(default_factory=dict)
+
+
+def _average_ranks(values: Sequence[float]) -> List[float]:
+    """Ranks 1..n with tied values sharing the average of their positions."""
+
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        average = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = average
+        i = j + 1
+    return ranks
+
+
+def _spearman(predicted: Sequence[float], actual: Sequence[float]) -> float:
+    """Spearman rank correlation: Pearson correlation of average ranks.
+
+    Hand-rolled and dependency-free. When either side is entirely tied
+    there is no ordering to agree with (or none offered), so the
+    correlation is reported as 0.0 -- no measurable agreement.
+    """
+
+    predicted_ranks = _average_ranks(predicted)
+    actual_ranks = _average_ranks(actual)
+    mean = (len(predicted_ranks) + 1) / 2.0  # both sides rank 1..n
+    dp = [rank - mean for rank in predicted_ranks]
+    da = [rank - mean for rank in actual_ranks]
+    vp = sum(d * d for d in dp)
+    va = sum(d * d for d in da)
+    if vp <= 0.0 or va <= 0.0:
+        return 0.0
+    return sum(p * a for p, a in zip(dp, da)) / math.sqrt(vp * va)
 
 
 def validate_surrogate(
@@ -150,13 +195,33 @@ def validate_surrogate(
     *,
     holdout_fraction: float = 0.3,
     seed: int = 0,
+    min_rank_correlation: float = 0.0,
 ) -> SurrogateValidation:
     """May this surrogate order candidates, on today's evidence?
 
-    Strictly beat the train-mean predictor on EVERY declared objective, on a
-    held-out split it never fitted. Failing one objective fails the gate: a
-    surrogate that predicts latency and guesses energy would order the pool
-    by half the problem while claiming to order it by all of it.
+    Two conditions, both required on EVERY declared objective, on a held-out
+    split the surrogate never fitted:
+
+    - **Error**: strictly beat the train-mean predictor's MSE. Failing one
+      objective fails the gate: a surrogate that predicts latency and
+      guesses energy would order the pool by half the problem while
+      claiming to order it by all of it.
+    - **Rank agreement**: Spearman correlation between predicted and actual
+      holdout values must reach ``min_rank_correlation``. MSE fidelity is
+      not rank fidelity -- the study-2 analog trace read measured authored
+      surrogates that passed the MSE split on half their losing seeds while
+      still hurting the endpoint, i.e. they misordered the candidate pool,
+      and ordering is the only thing a screen does with a surrogate. The
+      default (0.0) is deliberately gentle: predictions must at least
+      rank-agree no worse than chance. Ladder and venue campaigns may raise
+      it; ``-1.0`` disables the term.
+
+    Rank fidelity GATES; the MSE ratio ARBITRATES. Screening's variance
+    guard re-runs this gate on every split, so the rank term applies there
+    automatically, but the choice AMONG gate-passers stays the median
+    mse/baseline ratio (:mod:`agent_evolve.session.screening`): the
+    measured failure was rank-unfaithful passers, not mis-ranking among
+    passers, so the rank term adds no second arbitration axis.
     """
 
     names = [s.name for s in specs]
@@ -190,12 +255,16 @@ def validate_surrogate(
         name: sum(float(obj[name]) for _c, obj in train) / len(train)
         for name in names
     }
-    return _score(holdout, predictions, names, train_mean)
+    return _score(holdout, predictions, names, train_mean,
+                  min_rank_correlation)
 
 
-def _score(holdout, predictions, names, train_mean) -> SurrogateValidation:
+def _score(holdout, predictions, names, train_mean,
+           min_rank_correlation) -> SurrogateValidation:
     mse = {name: 0.0 for name in names}
     baseline = {name: 0.0 for name in names}
+    predicted_values: Dict[str, List[float]] = {name: [] for name in names}
+    actual_values: Dict[str, List[float]] = {name: [] for name in names}
     for (_cfg, actual), predicted in zip(holdout, predictions):
         for name in names:
             value = predicted.get(name) if isinstance(predicted, Mapping) else None
@@ -208,8 +277,25 @@ def _score(holdout, predictions, names, train_mean) -> SurrogateValidation:
                 )
             mse[name] += (float(value) - float(actual[name])) ** 2
             baseline[name] += (train_mean[name] - float(actual[name])) ** 2
+            predicted_values[name].append(float(value))
+            actual_values[name].append(float(actual[name]))
     count = len(holdout)
     mse = {k: v / count for k, v in mse.items()}
     baseline = {k: v / count for k, v in baseline.items()}
-    passed = all(mse[name] < baseline[name] for name in names)
-    return SurrogateValidation(passed, mse, baseline, count)
+    spearman = {
+        name: _spearman(predicted_values[name], actual_values[name])
+        for name in names
+    }
+    mse_ok = all(mse[name] < baseline[name] for name in names)
+    rank_ok = all(spearman[name] >= min_rank_correlation for name in names)
+    detail = ""
+    if mse_ok and not rank_ok:
+        worst = min(names, key=lambda name: spearman[name])
+        detail = (
+            f"rank agreement {spearman[worst]:.3f} on {worst!r} is below "
+            f"{min_rank_correlation:.3f}: MSE fidelity is not rank fidelity"
+        )
+    return SurrogateValidation(
+        mse_ok and rank_ok, mse, baseline, count,
+        detail=detail, per_objective_spearman=spearman,
+    )

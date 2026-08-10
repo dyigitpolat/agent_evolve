@@ -180,7 +180,10 @@ class Screening:
         in-loop generalization of "pass on both frozen datasets
         independently". Best-passing across splits stays the arbitration:
         listing the authored builder first would be trust, this is
-        measurement.
+        measurement. The gate's rank-agreement term applies on every split
+        too, but it only GATES -- the ratio arbitrating among passers stays
+        pure mse/baseline (rank-unfaithful passers were the measured
+        failure, not mis-ranking among passers).
         """
 
         self.telemetry.refreshes += 1

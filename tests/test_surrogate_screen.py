@@ -98,6 +98,76 @@ def test_validation_fails_a_surrogate_that_is_wrong_on_one_objective():
     )
 
 
+def test_a_monotone_but_mse_poor_surrogate_still_passes_the_rank_term():
+    # Rank fidelity and MSE fidelity are different axes. A surrogate that
+    # predicts 3*truth - 5 orders every pool perfectly (Spearman 1.0) while
+    # its MSE is far worse than the train-mean baseline: the rank term must
+    # not be the reason it fails.
+    def monotone_but_scaled(evaluated, specs):
+        def predict(pool):
+            return [{"ones": 3.0 * sum(cfg["genome"]) - 5.0,
+                     "zeros": 3.0 * (6.0 - sum(cfg["genome"])) - 5.0}
+                    for cfg in pool]
+
+        return predict
+
+    verdict = validate_surrogate(monotone_but_scaled, LEARNABLE, SPECS, seed=1)
+    assert verdict.per_objective_spearman["ones"] == pytest.approx(1.0)
+    assert verdict.per_objective_spearman["zeros"] == pytest.approx(1.0)
+    assert not verdict.passed, "MSE-poor by construction: the error gate holds"
+    assert any(verdict.per_objective_mse[k] >= verdict.baseline_mse[k]
+               for k in ("ones", "zeros")), (
+        "the test problem drifted: 3x-5 should lose to the baseline on MSE"
+    )
+    assert "rank" not in verdict.detail, (
+        "a perfectly-ranking surrogate must never be blamed on rank agreement"
+    )
+
+
+def test_an_anti_ranking_surrogate_with_decent_mse_is_rejected():
+    # The terra failure mode (study-2 trace read): on 8/14 losing seeds the
+    # authored artifact PASSED the MSE-split gate and still hurt the
+    # endpoint, because low error is not faithful ordering. Here the train
+    # rows cluster high (mean 5 ones) while the holdout rows sit low (0-2
+    # ones), so a range-compressed predictor centered on the holdout beats
+    # the train-mean baseline on every objective -- while ordering the
+    # candidates exactly backwards. The old gate admitted this; the rank
+    # term must reject it.
+    def ones_row(count):
+        return [1] * count + [0] * (6 - count)
+
+    # seed=0 puts indices {1, 8, 9} in the holdout split of 12 rows.
+    rows = [ones_row(c) for c in (4, 0, 5, 6, 4, 5, 6, 4, 1, 2, 5, 6)]
+    skewed = _data(rows)
+
+    def anti_ranker(evaluated, specs):
+        def predict(pool):
+            return [{"ones": 2.0 - 0.2 * sum(cfg["genome"]),
+                     "zeros": 4.0 + 0.2 * sum(cfg["genome"])}
+                    for cfg in pool]
+
+        return predict
+
+    verdict = validate_surrogate(anti_ranker, skewed, SPECS, seed=0)
+    assert all(verdict.per_objective_mse[k] < verdict.baseline_mse[k]
+               for k in ("ones", "zeros")), (
+        "the test problem drifted: the MSE gate alone must admit this artifact"
+    )
+    assert verdict.per_objective_spearman["ones"] == pytest.approx(-1.0)
+    assert verdict.per_objective_spearman["zeros"] == pytest.approx(-1.0)
+    assert not verdict.passed, (
+        "an artifact that inverts the candidate ordering must not screen, "
+        "however small its MSE"
+    )
+    assert "rank" in verdict.detail
+    disabled = validate_surrogate(anti_ranker, skewed, SPECS, seed=0,
+                                  min_rank_correlation=-1.0)
+    assert disabled.passed, (
+        "with the rank term disabled the MSE gate admits it: the rejection "
+        "above is the rank term's doing, nothing else's"
+    )
+
+
 # --- the screen --------------------------------------------------------------
 
 def test_screen_orders_by_predicted_domination():
