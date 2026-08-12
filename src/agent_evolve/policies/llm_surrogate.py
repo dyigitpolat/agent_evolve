@@ -35,8 +35,10 @@ from agent_evolve.policies.surrogate import Predict, SurrogateBuilder
 
 __all__ = [
     "AuthorTelemetry",
+    "accept_block",
     "author_surrogate",
     "authored_surrogate_builder",
+    "gate_source",
     "PROMPT",
 ]
 
@@ -100,6 +102,44 @@ Reply with ONLY one fenced Python code block and no other text."""
 _FENCE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.S)
 
 
+def gate_source(
+    source: str, *, contract: Any, telemetry: AuthorTelemetry
+) -> Optional[str]:
+    """The authoring gate over one block of source: pass it, or count why not.
+
+    Import allowlist (shared with the worker, so "rejected at authoring time"
+    and "rejected at run time" stay one rule), then the entry point the
+    contract names. Every rejection is a counted, ordinary event; nothing
+    raises. Shared by every authored kind -- surrogate, operator, generator --
+    because a per-kind copy of a security gate is how the copies drift.
+    """
+
+    try:
+        forbidden = _forbidden_import(source)
+    except SyntaxError:
+        telemetry.unparseable += 1
+        return None
+    if forbidden is not None:
+        telemetry.forbidden_import += 1
+        return None
+    if not re.search(rf"^def {contract.entry_point}\(", source, re.M):
+        telemetry.wrong_entry_point += 1
+        return None
+    return source
+
+
+def accept_block(
+    text: str, *, contract: Any, telemetry: AuthorTelemetry
+) -> Optional[str]:
+    """The first fenced block of *text*, if it passes :func:`gate_source`."""
+
+    match = _FENCE.search(text)
+    if match is None:
+        telemetry.no_code_block += 1
+        return None
+    return gate_source(match.group(1), contract=contract, telemetry=telemetry)
+
+
 def author_surrogate(
     complete: Callable[[str], str],
     *,
@@ -125,21 +165,8 @@ def author_surrogate(
         except Exception:
             tel.errors += 1
             continue
-        match = _FENCE.search(text)
-        if match is None:
-            tel.no_code_block += 1
-            continue
-        source = match.group(1)
-        try:
-            forbidden = _forbidden_import(source)
-        except SyntaxError:
-            tel.unparseable += 1
-            continue
-        if forbidden is not None:
-            tel.forbidden_import += 1
-            continue
-        if not re.search(rf"^def {contract.entry_point}\(", source, re.M):
-            tel.wrong_entry_point += 1
+        source = accept_block(text, contract=contract, telemetry=tel)
+        if source is None:
             continue
         tel.accepted += 1
         tel.sources.append(source)
@@ -254,21 +281,8 @@ def revise_surrogate(
         except Exception:
             tel.errors += 1
             continue
-        match = _FENCE.search(text)
-        if match is None:
-            tel.no_code_block += 1
-            continue
-        source = match.group(1)
-        try:
-            forbidden = _forbidden_import(source)
-        except SyntaxError:
-            tel.unparseable += 1
-            continue
-        if forbidden is not None:
-            tel.forbidden_import += 1
-            continue
-        if not re.search(rf"^def {contract.entry_point}\(", source, re.M):
-            tel.wrong_entry_point += 1
+        source = accept_block(text, contract=contract, telemetry=tel)
+        if source is None:
             continue
         tel.accepted += 1
         tel.sources.append(source)

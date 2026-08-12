@@ -21,11 +21,8 @@ from typing import Callable, List, Optional, Sequence
 
 from agent_evolve.core.authored import CONTRACTS, AuthoredArtifact, authored_artifact
 from agent_evolve.core.problem import ObjectiveSpec
-from agent_evolve.infrastructure.authored_worker import (
-    ALLOWED_IMPORTS,
-    _forbidden_import,
-)
-from agent_evolve.policies.llm_surrogate import AuthorTelemetry
+from agent_evolve.infrastructure.authored_worker import ALLOWED_IMPORTS
+from agent_evolve.policies.llm_surrogate import AuthorTelemetry, gate_source
 
 __all__ = ["author_operators", "OPERATOR_PROMPT"]
 
@@ -97,17 +94,9 @@ def author_operators(
             tel.no_code_block += 1
             continue
         artifacts: List[AuthoredArtifact] = []
-        for index, source in enumerate(blocks[:max_operators]):
-            try:
-                forbidden = _forbidden_import(source)
-            except SyntaxError:
-                tel.unparseable += 1
-                continue
-            if forbidden is not None:
-                tel.forbidden_import += 1
-                continue
-            if not re.search(rf"^def {contract.entry_point}\(", source, re.M):
-                tel.wrong_entry_point += 1
+        for index, block in enumerate(blocks[:max_operators]):
+            source = gate_source(block, contract=contract, telemetry=tel)
+            if source is None:
                 continue
             tel.accepted += 1
             tel.sources.append(source)

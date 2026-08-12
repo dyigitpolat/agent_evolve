@@ -113,6 +113,17 @@ class GeneticConfig:
     #: -- and the loop reports each measured child's fate back to it. None
     #: leaves offspring construction byte-identical to the classical path.
     portfolio: Any = None
+    #: A model-authored SAMPLER (a policies.llm_generator.AuthoredGenerator).
+    #: When present it draws the whole generation's candidate POOL -- many
+    #: times the offspring the budget can afford -- and the pool then goes
+    #: through the same screening path as any other pool, or is taken from
+    #: the top when there is no screen. Mass generation charges nothing:
+    #: the generator never sees the problem or the cache, and only the
+    #: `want` candidates handed to measure() can reach the budget. None --
+    #: the default -- leaves the loop byte-identical to the pre-generator
+    #: seam. It replaces offspring construction, so it does not compose with
+    #: `portfolio`; asking for both is refused rather than silently ignored.
+    generator: Any = None
 
 
 def domination_rank(
@@ -181,6 +192,13 @@ def run_genetic_loop(
     """Evolve a population under *problem*, spending at most the budget."""
 
     from agent_evolve.session.loop import _build_search_result, _default_candidate_key
+
+    if config.generator is not None and config.portfolio is not None:
+        raise ValueError(
+            "generator and portfolio both construct the generation's "
+            "candidates: the generator draws the pool, the portfolio "
+            "recombines parents into it. Run one or the other."
+        )
 
     specs = list(problem.objectives)
     candidate_model = getattr(problem, "candidate_model", None)
@@ -352,6 +370,10 @@ def run_genetic_loop(
     population = survive([(r.configuration, dict(r.objectives)) for r in valid])
     history.append({"gen": 0, "valid_count": len(valid), "pop": len(population)})
     log(f"generation 0: {len(valid)} evaluated, population {len(population)}")
+    if config.generator is not None:
+        # What the run has already measured, so the novelty guard can tell a
+        # candidate that is new from one the generator is re-proposing.
+        config.generator.note_archive([r.configuration for r in valid])
 
     pick = chooser or random_chooser(rng, n_loci)
     # Pool extras draw from their own stream: the main stream must spend
@@ -368,17 +390,22 @@ def run_genetic_loop(
         # combine, and a rank is the comparable form of "how good is this one".
         ranks = domination_rank([obj for _c, obj in population], specs)
         ranked = [(c, r) for (c, _o), r in zip(population, ranks)]
-        choices = list(pick(ranked, want, state))[:want]
-        # A chooser that returns too few must not silently shrink the
-        # generation: the arm would then spend less budget than the control it
-        # is compared against. Top up at random and record how many, so the
-        # shortfall shows up in the result instead of in the conclusion.
         filled = 0
-        if len(choices) < want:
-            filled = want - len(choices)
-            choices = list(choices) + list(
-                random_chooser(rng, n_loci)(ranked, filled, None)
-            )
+        choices: Sequence[OperatorChoice] = ()
+        # An authored generator draws the whole generation, so there is no
+        # parent choice to make and the chooser is not consulted -- calling it
+        # and discarding the answer would spend a model call on nothing.
+        if config.generator is None:
+            choices = list(pick(ranked, want, state))[:want]
+            # A chooser that returns too few must not silently shrink the
+            # generation: the arm would then spend less budget than the control
+            # it is compared against. Top up at random and record how many, so
+            # the shortfall shows up in the result instead of in the conclusion.
+            if len(choices) < want:
+                filled = want - len(choices)
+                choices = list(choices) + list(
+                    random_chooser(rng, n_loci)(ranked, filled, None)
+                )
         def build_kid(choice: OperatorChoice, r: random.Random) -> Config:
             a = population[choice.parent_a % len(population)][0]
             b = population[choice.parent_b % len(population)][0]
@@ -393,7 +420,21 @@ def run_genetic_loop(
                           loci=choice.mutate_loci, rng=r)
 
         kid_origins: Optional[List[str]] = None
-        if config.portfolio is not None:
+        # --- mass generation: the model wrote the sampler, not the samples --
+        # The pool is many times what the budget can afford, and costs the
+        # budget nothing: the generator is handed a template, the domains, and
+        # the archive -- never the problem and never the cache -- so the only
+        # candidates that can become evaluations are the `want` below.
+        pool_kids: Optional[List[Config]] = None
+        if config.generator is not None:
+            pool_kids = config.generator.propose(
+                template=seeds[0], candidate_model=candidate_model,
+                restriction=restriction,
+                archive=[c for c, _o in population],
+                want=want, rng=rng_pool,
+                seed=(config.seed or 0) * 1000 + gen)
+            kids = [dict(kid) for kid in pool_kids[:want]]
+        elif config.portfolio is not None:
             pairs = [
                 (population[choice.parent_a % len(population)][0],
                  population[choice.parent_b % len(population)][0])
@@ -418,11 +459,12 @@ def run_genetic_loop(
             screen_note = {"pool": len(kids), "held_out": len(kids),
                            "advanced": 0, "active": bool(active)}
             if active:
-                extra_n = (config.screening.pool_factor - 1) * len(kids)
-                extra_choices = random_chooser(rng_pool, n_loci)(
-                    ranked, extra_n, None)
-                pool_kids = kids + [build_kid(c, rng_pool)
-                                    for c in extra_choices]
+                if pool_kids is None:
+                    extra_n = (config.screening.pool_factor - 1) * len(kids)
+                    extra_choices = random_chooser(rng_pool, n_loci)(
+                        ranked, extra_n, None)
+                    pool_kids = kids + [build_kid(c, rng_pool)
+                                        for c in extra_choices]
                 pool_origins = (None if kid_origins is None else
                                 list(kid_origins)
                                 + ["pool"] * (len(pool_kids) - len(kids)))
@@ -455,7 +497,16 @@ def run_genetic_loop(
         pool.extend((r.configuration, dict(r.objectives)) for r in valid)
         population = survive(pool)
 
-        # --- survival credit: an arm is what its measured children survive --
+        # --- survival credit: a mechanism is what its children survive ------
+        if config.generator is not None and valid:
+            surviving = {_default_candidate_key(c) for c, _o in population}
+            for result in valid:
+                config.generator.record_measured(
+                    result.configuration,
+                    survived=(_default_candidate_key(result.configuration)
+                              in surviving),
+                    objectives=dict(result.objectives))
+
         if config.portfolio is not None and kid_origins is not None and valid:
             surviving = {_default_candidate_key(c) for c, _o in population}
             origin_by_key: Dict[str, str] = {}
@@ -494,6 +545,8 @@ def run_genetic_loop(
                  "choices_filled_at_random": filled}
         if screen_note is not None:
             entry["screen"] = screen_note
+        if config.generator is not None:
+            entry["generate"] = config.generator.note()
         if config.portfolio is not None:
             entry["portfolio"] = config.portfolio.summary()
         history.append(entry)
@@ -520,6 +573,7 @@ def run_genetic_loop(
     return replace(result, telemetry=harvest_telemetry(
         (pick, prior_proposer_used, config.screening,
          getattr(config.screening, "author", None),
-         config.portfolio, getattr(config.portfolio, "author", None)),
+         config.portfolio, getattr(config.portfolio, "author", None),
+         config.generator, getattr(config.generator, "author", None)),
         real_evaluations=spent(), virtual_evaluations=virtual,
     ))

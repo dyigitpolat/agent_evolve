@@ -138,7 +138,8 @@ can already write — no new machinery on your side.
 All four are optional and degrade gracefully — an empty description adds
 nothing to the prompt rather than a hole. But treat them as obligations in
 spirit: every LLM mechanism in this package (priors, authored surrogates,
-authored operators, the chooser) receives the assembled card, and the
+authored operators, authored generators, the chooser) receives the
+assembled card, and the
 measured history of this project says channel defects masquerade as
 capability failures. If you conclude "the model doesn't help on my
 problem", check the card first: `python -c "from agent_evolve.policies.semantics

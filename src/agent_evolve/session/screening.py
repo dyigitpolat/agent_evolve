@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from agent_evolve.core.problem import ObjectiveSpec
-from agent_evolve.core.results import dominates
 from agent_evolve.policies.surrogate import (
     Predict,
     SurrogateBuilder,
@@ -36,6 +35,81 @@ class ScreenReport:
     predicted: Tuple[Mapping[str, float], ...]
     virtual_evaluations: int
     surrogate_name: str
+
+
+def _oriented(
+    rows: Sequence[Mapping[str, float]], specs: Sequence[ObjectiveSpec]
+) -> Optional[list[tuple]]:
+    """Objective vectors as "smaller is better" float tuples, or ``None``.
+
+    ``None`` means a row was missing an objective or carried something that
+    is not a finite number -- the same "screen nothing" answer this module
+    already gives for malformed predictions, rather than an exception from
+    the middle of a ranking loop.
+    """
+
+    signs = [1.0 if spec.goal == "min" else -1.0 for spec in specs]
+    names = [spec.name for spec in specs]
+    out: list[tuple] = []
+    for row in rows:
+        vector = []
+        for sign, name in zip(signs, names):
+            value = row.get(name)
+            if (value is None or isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))):
+                return None
+            vector.append(sign * float(value))
+        out.append(tuple(vector))
+    return out
+
+
+def _dominator_counts(
+    rows: Sequence[Mapping[str, float]],
+    against: Sequence[Mapping[str, float]],
+    specs: Sequence[ObjectiveSpec],
+) -> Optional[list[int]]:
+    """How many of ``rows + against`` dominate each of *rows*. Lower is better.
+
+    Exactly what ``sum(1 for other in field if dominates(other, row))`` says,
+    computed over DISTINCT objective vectors weighted by how many rows carry
+    each. Dominance is a property of the vector alone, so this returns the
+    same integers -- but a pool of n candidates whose predictions take k
+    distinct values costs O(k^2) instead of O(n^2), and a surrogate over a
+    discrete space collapses thousands of candidates onto tens of vectors.
+    The comparison itself works on pre-oriented float tuples: the general
+    ``core.results.dominates`` re-validates every objective on every call
+    (a ``numbers.Real`` ABC check per number), which is right for a contract
+    boundary and ruinous inside a quadratic loop -- measured at 21.7s of a
+    25.6s run before this, on one screened pool of 2,000.
+    """
+
+    keys = _oriented(rows, specs)
+    other_keys = _oriented(against, specs)
+    if keys is None or other_keys is None:
+        return None
+
+    multiplicity: Dict[tuple, int] = {}
+    for key in keys:
+        multiplicity[key] = multiplicity.get(key, 0) + 1
+    for key in other_keys:
+        multiplicity[key] = multiplicity.get(key, 0) + 1
+    distinct = list(multiplicity.items())
+
+    def _beats(a: tuple, b: tuple) -> bool:
+        better = False
+        for x, y in zip(a, b):
+            if x > y:
+                return False
+            if x < y:
+                better = True
+        return better
+
+    counted = {
+        key: sum(weight for other, weight in distinct if _beats(other, key))
+        for key, _weight in distinct
+    }
+    return [counted[key] for key in keys]
 
 
 def screen_offspring(
@@ -74,11 +148,10 @@ def screen_offspring(
             row[name] = float(value)
         clean.append(row)
 
-    field = clean + [dict(objectives) for objectives in population_objectives]
-    ranks = [
-        sum(1 for other in field if dominates(other, row, specs))
-        for row in clean
-    ]
+    ranks = _dominator_counts(
+        clean, [dict(objectives) for objectives in population_objectives], specs)
+    if ranks is None:
+        return None
     order = tuple(sorted(range(len(pool)), key=lambda i: (ranks[i], i)))
     return ScreenReport(
         order=order,
@@ -130,9 +203,14 @@ class Screening:
         validation_splits: int = 3,
         revise: Any = None,
         max_revisions: int = 2,
+        max_training_rows: int = 1024,
     ) -> None:
         if pool_factor < 2:
             raise ValueError(f"pool_factor must be at least 2, got {pool_factor}")
+        if max_training_rows < 1:
+            raise ValueError(
+                f"max_training_rows must be at least 1, got {max_training_rows}"
+            )
         if not 0.0 <= exploration_floor < 1.0:
             raise ValueError(
                 f"exploration_floor must be in [0, 1), got {exploration_floor}"
@@ -154,6 +232,15 @@ class Screening:
         #: model that cannot fix its artifact keeps losing to the rules.
         self.revise = revise
         self.max_revisions = int(max_revisions)
+        #: How many of the most recent measurements a refresh fits and
+        #: validates on. Refitting every builder on EVERYTHING measured so
+        #: far makes one refresh O(n) and a run O(n^2): at B=10,000 the screen
+        #: alone runs for over a quarter of an hour and never finishes a run,
+        #: which is precisely the regime an authored generator exists for.
+        #: The recent window is also the better statistics for a distribution
+        #: the search keeps moving. The default is far above any campaign run
+        #: to date (all at B <= 150), so every measured run is unaffected.
+        self.max_training_rows = int(max_training_rows)
         self.telemetry = ScreeningTelemetry()
         self.mechanism = "surrogate_screen"
         self.authored_by = "none"
@@ -184,17 +271,23 @@ class Screening:
         too, but it only GATES -- the ratio arbitrating among passers stays
         pure mse/baseline (rank-unfaithful passers were the measured
         failure, not mis-ranking among passers).
+
+        Only the most recent ``max_training_rows`` measurements take part:
+        see that field for why a refresh must not grow with the run.
         """
 
         self.telemetry.refreshes += 1
         self._predict = None
+        data = list(evaluated)
+        if len(data) > self.max_training_rows:
+            data = data[-self.max_training_rows:]
         best: Optional[Tuple[float, str, str, SurrogateBuilder]] = None
         for name, authored_by, builder in self.builders:
             ratios = []
             failed = False
             for split in range(self.validation_splits):
                 verdict = validate_surrogate(
-                    builder, evaluated, specs, seed=seed + split * 7919)
+                    builder, data, specs, seed=seed + split * 7919)
                 if not verdict.passed:
                     failed = True
                     break
@@ -221,7 +314,7 @@ class Screening:
                         for _n, authored_by, _b in self.builders)):
             self.telemetry.revisions += 1
             try:
-                replacement = self.revise(list(evaluated), specs)
+                replacement = self.revise(data, specs)
             except Exception:
                 replacement = None
             if replacement is not None:
@@ -240,7 +333,7 @@ class Screening:
             return False
         _ratio, name, authored_by, builder = best
         try:
-            self._predict = builder(list(evaluated), specs)
+            self._predict = builder(data, specs)
         except Exception:
             self.telemetry.screen_failures += 1
             return False

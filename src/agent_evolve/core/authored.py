@@ -2,17 +2,21 @@
 
 An authored artifact is SOURCE CODE written -- by a model, or by a shipped
 rule standing in for one -- against a narrow typed contract: a surrogate's
-``fit_predict``, a variation operator's ``vary``. Here it is only data;
-nothing in ``core/`` can execute it. Execution lives behind
-``infrastructure/authored_runtime.py``: out of process, under resource
+``fit_predict``, a variation operator's ``vary``, a generator's ``propose``.
+Here it is only data; nothing in ``core/`` can execute it. Execution lives
+behind ``infrastructure/authored_runtime.py``: out of process, under resource
 limits, imports allowlisted, every outcome typed and counted.
 
-The candidate-authoring line survives this widening, restated rather than
-relaxed: an artifact never emits a candidate into the run directly. A
-surrogate only orders candidates the loop already constructed; an operator's
-output is validated value-by-value against the declared domains and the
-parents' own material, and it earns real evaluations only through the
-governed, credit-assigned portfolio.
+The line the widening preserves is not "an artifact never emits a candidate"
+-- a generator plainly does -- but that an artifact never decides what gets
+MEASURED. A surrogate only orders candidates the loop already constructed. An
+operator's output is validated value-by-value against the declared domains
+and the parents' own material, and earns real evaluations only through the
+governed, credit-assigned portfolio. A generator emits into a POOL, validated
+the same way value by value, from a seam that never sees the problem or the
+evaluation cache -- so mass generation is free and the loop still measures
+only what its budget already allowed. Authorship is the model's; arbitration
+is never.
 """
 
 from __future__ import annotations
@@ -54,6 +58,16 @@ CONTRACTS: Mapping[str, AuthoredContract] = {
             "vary(parent_a: dict, parent_b: dict, loci: list[str], "
             "domains: dict[str, list], seed: int) -> dict  # pure and "
             "deterministic given seed; every value from domains or a parent"
+        ),
+    ),
+    "generator": AuthoredContract(
+        kind="generator",
+        entry_point="propose",
+        positional_arity=4,
+        description=(
+            "propose(archive: list[dict], n: int, domains: dict[str, list], "
+            "seed: int) -> list[dict]  # pure and deterministic given seed; "
+            "exactly n configurations, every value from domains at that locus"
         ),
     ),
 }

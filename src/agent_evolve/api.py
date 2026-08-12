@@ -403,13 +403,20 @@ def optimize(
                     screening=policies.screening,
                     portfolio=policies.portfolio,
                     initial_proposals=policies.initial_proposals,
+                    generator=policies.generator,
                 ),
                 chooser=chooser,
                 log=announce,
             )
-            if policies.init_author is not None and result.telemetry is not None:
+            # Authoring that produced no policy object still produced
+            # counters, and the loop can only harvest what it was handed.
+            # These are the seams whose failure leaves nothing behind.
+            orphaned = tuple(note for note in (policies.init_author,
+                                               policies.generator_author)
+                             if note is not None)
+            if orphaned and result.telemetry is not None:
                 from agent_evolve.core.telemetry import harvest_telemetry
-                extra = harvest_telemetry((policies.init_author,))
+                extra = harvest_telemetry(orphaned)
                 result = dataclasses.replace(
                     result,
                     telemetry=dataclasses.replace(

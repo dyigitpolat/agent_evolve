@@ -43,6 +43,75 @@ rule-matchable) to AUTHORING machinery that real evaluations arbitrate:
   --authorship --json`. Genetic-only knobs refuse the authoring strategy by
   name; llm forms fall back to their rule comparators out loud.
 
+### Added — the authored generator (2026-08-12)
+
+The model writes the SAMPLER, not the samples
+(`authorship='generation-llm'` / `'generative'`,
+`policies/llm_generator.py`). One authoring call before any evaluation
+produces `propose(archive, n, domains, seed)`, and that one fixed cost then
+shapes every candidate the run draws — the amortization per-decision
+guidance cannot have, whose leverage falls as 1/budget.
+
+- **Mass generation is free by construction.** The generator is handed a
+  template, the declared domains and the archive — never the problem, never
+  the evaluation cache — so a pool of 5,000 costs zero evaluations and the
+  budget cap still binds. The pool then goes through the existing screening
+  path when a screen is on (its exploration floor now holds the generator's
+  own first picks), or is taken from the top when it is not.
+- **Every emitted candidate is validated value-by-value** against the
+  declared domains and the template's shape, exactly as authored initial
+  members are; rejects are counted and their slots fall back to
+  schema-uniform draws, so a broken generator degrades to the
+  credential-free sampler rather than to nothing.
+- **A diversity/novelty guard** measures the batch as a set: duplicates
+  within it and candidates already measured in this run are dropped and
+  counted, so a collapsed sampler reads as `duplicates == emitted - 1` in
+  the telemetry and in the per-generation history instead of hiding behind a
+  flat curve.
+- **It evolves from measured feedback.** The revision hook shows the
+  generator its own source plus what the harness measured — acceptance,
+  duplicate and archive-overlap rates, and how many of its candidates
+  survived selection — under the identical authoring gate, fired only on a
+  measured defect and capped (`generation_revisions=0` ablates it, which is
+  what one-shot ladder cells need).
+- `generation` and `operators` both construct a generation's candidates, so
+  asking for both is refused by name rather than silently running one.
+
+### Fixed — authored code was paying for the whole package on every batch
+
+`AuthoredRuntime` launched its worker as `python -m
+agent_evolve.infrastructure.authored_worker`, which imported all of
+`agent_evolve` (pydantic included) in the child — for a worker that imports
+nothing but `ast`, `json`, `sys` and `traceback`. Measured at **922 ms per
+spawn against 21 ms** when launched by path: 45× on every screen refresh,
+every authored operator generation and every generated pool. A B=1,000
+generator run went from 78 s to 2.35 s.
+
+`screen_offspring` counted dominators in O(n²) through the contract-level
+`core.results.dominates`, which re-validates every objective on every call.
+It now counts over DISTINCT objective vectors weighted by multiplicity
+(same integers, O(k²)) on pre-oriented float tuples: a B=300 run screening
+pools of 2,000 went from 25.6 s to 2.55 s.
+
+`Screening.refresh` refitted and re-validated every builder on EVERY
+measurement so far, which makes one refresh O(n) and a run O(n²) — unusable
+exactly at the budgets an authored generator is for. It now reads the most
+recent `max_training_rows` (default 1,024, public as
+`AuthorshipConfig(screen_training_rows=)`), which is also the better
+statistics for a distribution the search keeps moving. Every campaign run to
+date (B ≤ 150) sees every row it always did. The screen re-arbitrates once
+per generation, so at high budgets this window — not the pool — is what
+decides whether the screen's cost is constant or grows with the run.
+
+Measured together, B=10,000 on a trivial lookup problem (12 loci, 2
+objectives), all charging exactly 10,000 evaluations: default loop 5.3 s;
+authored generator at the default pool 21.5 s (39,952 candidates generated);
+authored generator at 2,000 candidates per generation 52.9 s (1,998,000
+generated); generator plus the rule screen 31.1 s at
+`screen_training_rows=128`, against over 15 minutes unfinished at the 1,024
+default — the screen's per-generation re-arbitration is what sizes a
+high-budget run, and the window is the dial.
+
 ### Breaking
 
 **Python 3.11 is now the minimum, raised from 3.10.**

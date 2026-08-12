@@ -10,15 +10,36 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from agent_evolve.infrastructure.authored_runtime import RuntimeLimits
 
-__all__ = ["AuthorshipConfig", "AuthorshipPolicies", "build_authorship"]
+__all__ = ["AuthorshipConfig", "AuthorshipPolicies", "PRESETS",
+           "build_authorship"]
 
 _SURROGATE = ("off", "rule", "llm")
 _OPERATORS = ("off", "rule", "llm")
 _INITIALIZATION = ("off", "llm")
+_GENERATION = ("off", "llm")
+
+#: The named compositions, as field settings. A table rather than a method
+#: body so that everything downstream -- the CLI's ``--authorship`` choices,
+#: any campaign script -- ENUMERATES what exists instead of repeating a list
+#: that then drifts.
+PRESETS: Mapping[str, Mapping[str, str]] = {
+    "off": {},
+    "surrogate": {"surrogate": "rule"},
+    "surrogate-llm": {"surrogate": "llm"},
+    "operators": {"operators": "rule"},
+    "operators-llm": {"operators": "llm"},
+    "init-llm": {"initialization": "llm"},
+    "generation-llm": {"generation": "llm"},
+    # The authored sampler under the frozen screen stack: the model writes
+    # where candidates come from, and the variance-guarded authored surrogate
+    # decides which of them are worth measuring.
+    "generative": {"generation": "llm", "surrogate": "llm"},
+    "full": {"surrogate": "llm", "operators": "llm", "initialization": "llm"},
+}
 
 
 @dataclass(frozen=True)
@@ -27,18 +48,35 @@ class AuthorshipConfig:
 
     ``surrogate="rule"`` turns on virtual pre-screening with the shipped,
     credential-free surrogates behind the validation gate. The ``"llm"``
-    values and the operator portfolio land behind the same fields as the
-    substrate grows; naming one that has not landed is an error today rather
-    than a silent no-op forever.
+    values put the model in the authoring seat for that piece of machinery --
+    the surrogate, the variation operators, the initial population, or
+    ``generation``, where it writes the sampler every candidate is drawn
+    from. Naming a value that has not landed is an error today rather than a
+    silent no-op forever.
     """
 
     surrogate: str = "off"
     operators: str = "off"
     initialization: str = "off"
+    generation: str = "off"
     pool_factor: int = 4
     exploration_floor: float = 0.25
     authoring_attempts: int = 2
     max_authored_fraction: float = 0.5
+    #: How many of the most recent measurements a screen refresh fits and
+    #: validates on (see session.screening.Screening.max_training_rows). The
+    #: screen re-arbitrates every generation, so this is what decides whether
+    #: a high-budget run's screening cost is constant or grows with the run.
+    screen_training_rows: int = 1024
+    #: Mass generation's pool: ``generation_pool_factor`` times the offspring
+    #: a generation can afford, or exactly ``generation_pool_size`` when that
+    #: is set. The pool costs no evaluations, so it is sized by what the
+    #: sampler and the screen can chew through, not by the budget.
+    generation_pool_factor: int = 4
+    generation_pool_size: int = 0
+    #: One-shot authoring is what the ladder cells measure; revision LEVELS
+    #: the rungs (W3), so it is capped here and ablatable to 0.
+    generation_revisions: int = 1
     limits: RuntimeLimits = field(default_factory=RuntimeLimits)
 
     def __post_init__(self) -> None:
@@ -57,30 +95,34 @@ class AuthorshipConfig:
                 f"authorship.operators must be one of {_OPERATORS}, got "
                 f"{self.operators!r}"
             )
+        if self.generation not in _GENERATION:
+            raise ValueError(
+                f"authorship.generation must be one of {_GENERATION}, got "
+                f"{self.generation!r}"
+            )
+        if self.generation != "off" and self.operators != "off":
+            # Both construct the generation's candidates. Accepting the pair
+            # would silently run one of them and bill the caller for two.
+            raise ValueError(
+                "authorship.generation and authorship.operators both "
+                "construct the generation's candidates -- the generator draws "
+                "the pool, the operator arms recombine parents into it. Ask "
+                "for one."
+            )
 
     @property
     def engaged(self) -> bool:
         return (self.surrogate != "off" or self.operators != "off"
-                or self.initialization != "off")
+                or self.initialization != "off" or self.generation != "off")
 
     @classmethod
     def preset(cls, name: str) -> "AuthorshipConfig":
-        presets = {
-            "off": cls(),
-            "surrogate": cls(surrogate="rule"),
-            "surrogate-llm": cls(surrogate="llm"),
-            "operators": cls(operators="rule"),
-            "operators-llm": cls(operators="llm"),
-            "init-llm": cls(initialization="llm"),
-            "full": cls(surrogate="llm", operators="llm",
-                        initialization="llm"),
-        }
-        if name not in presets:
+        if name not in PRESETS:
             raise ValueError(
-                f"authorship preset must be one of {sorted(presets)}, got "
+                f"authorship preset must be one of {sorted(PRESETS)}, got "
                 f"{name!r}"
             )
-        return presets[name]
+        return cls(**PRESETS[name])
 
 
 @dataclass(frozen=True)
@@ -91,6 +133,12 @@ class AuthorshipPolicies:
     portfolio: Optional[Any] = None
     initial_proposals: tuple = ()
     init_author: Optional[Any] = None
+    generator: Optional[Any] = None
+    #: Set only when generation was asked for and produced no generator: the
+    #: authoring counters would otherwise have nowhere to live, and "the
+    #: model failed to author a sampler" would be indistinguishable from
+    #: "nobody asked". When a generator exists it carries its own note.
+    generator_author: Optional[Any] = None
 
 
 def build_authorship(
@@ -119,6 +167,8 @@ def build_authorship(
     proposals, init_note = _build_initialization(
         config, complete, schema_text, say, candidate_model,
         init_template, init_k)
+    generator, generator_note = _build_generator(
+        config, complete, objectives, schema_text, say)
     return AuthorshipPolicies(
         screening=_build_screening(config, complete, objectives,
                                    schema_text, say),
@@ -126,6 +176,8 @@ def build_authorship(
                                    schema_text, say),
         initial_proposals=proposals,
         init_author=init_note,
+        generator=generator,
+        generator_author=generator_note,
     )
 
 
@@ -153,6 +205,67 @@ def _build_initialization(config, complete, schema_text, say,
         say("the model proposed no usable initial members; initialization "
             "stays schema-uniform.")
     return tuple(proposals), note
+
+
+def _build_generator(
+    config: AuthorshipConfig,
+    complete: Any,
+    objectives: Sequence[Any],
+    schema_text: str,
+    say: Callable[[str], None],
+) -> tuple:
+    """``(generator, author_note)``; both ``None`` when generation is off.
+
+    One authoring call before any evaluation buys a distribution that shapes
+    every candidate the run draws -- the amortization that makes this the
+    mechanism for cheap-evaluation venues, where per-decision guidance has
+    leverage 1/budget. No usable authorship degrades to the shipped
+    schema-uniform sampler, out loud: the loop simply keeps drawing the way
+    it always did, and the note carries the counters that say why.
+    """
+
+    if config.generation == "off":
+        return None, None
+    from agent_evolve.policies.llm_generator import AuthoredGenerator
+    from agent_evolve.policies.llm_surrogate import AuthorTelemetry
+
+    telemetry = AuthorTelemetry()
+    author_note = SimpleNamespace(
+        telemetry=telemetry, mechanism="generator_author", authored_by="llm"
+    )
+    if complete is None:
+        say("authorship.generation='llm' needs a model call and none is "
+            "available; candidates stay schema-uniform.")
+        return None, author_note
+    from agent_evolve.infrastructure.authored_runtime import AuthoredRuntime
+    from agent_evolve.policies.llm_generator import (author_generator,
+                                                     revise_generator)
+
+    artifact = author_generator(
+        complete, objectives=list(objectives), schema_text=schema_text,
+        attempts=config.authoring_attempts, telemetry=telemetry)
+    if artifact is None:
+        say(f"the model authored no usable generator in "
+            f"{config.authoring_attempts} attempt(s); candidates stay "
+            "schema-uniform.")
+        return None, author_note
+
+    def revise(current: Any, feedback: str) -> Any:
+        # The evolving generator: its own source plus what the harness
+        # measured about the candidates it emitted. Same gate as authoring.
+        return revise_generator(complete, artifact=current, feedback=feedback,
+                                telemetry=telemetry)
+
+    generator = AuthoredGenerator(
+        artifact,
+        AuthoredRuntime(limits=config.limits),
+        pool_factor=config.generation_pool_factor,
+        pool_size=config.generation_pool_size,
+        revise=revise if config.generation_revisions > 0 else None,
+        max_revisions=config.generation_revisions,
+    )
+    generator.author = author_note
+    return generator, None
 
 
 def _build_screening(
@@ -252,6 +365,7 @@ def _build_screening(
         pool_factor=config.pool_factor,
         exploration_floor=config.exploration_floor,
         revise=revise,
+        max_training_rows=config.screen_training_rows,
     )
     if author_note is not None:
         # Harvested beside the screen's own counters: how authoring went is

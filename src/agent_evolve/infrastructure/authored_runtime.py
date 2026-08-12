@@ -65,13 +65,20 @@ class AuthoredRuntime:
     ) -> None:
         self._limits = limits or RuntimeLimits()
         self._python = python_executable or sys.executable
-        # The worker resolves `agent_evolve` through this path whether the
-        # package is installed or running from a source tree; pointing at the
-        # installed location is harmless, pointing at src/ is load-bearing.
+        # The worker is launched BY PATH rather than as `-m agent_evolve...`.
+        # It imports nothing from this package (ast, json, sys, traceback and
+        # the interpreter), so the module form spent the whole of
+        # `agent_evolve.__init__` -- pydantic included -- on every batch:
+        # measured at 922ms per spawn against 21ms by path, which is 45x on
+        # every screen, every operator generation and every generated pool.
+        # The module form stays as a fallback for exotic installs (zipimport)
+        # where the source file is not on disk.
+        worker = Path(__file__).resolve().with_name("authored_worker.py")
+        self._worker = str(worker) if worker.is_file() else None
         package_root = str(Path(__file__).resolve().parents[2])
         self._policy = ChildProcessPolicy(
             policy_id="authored_artifact_runtime",
-            policy_version=1,
+            policy_version=2,
             inherited_environment_allowlist=(),
             fixed_environment=(("PYTHONPATH", package_root),),
         )
@@ -110,11 +117,10 @@ class AuthoredRuntime:
             boundary = ExplicitEnvironmentSubprocessBoundary(
                 policy=self._policy, working_directory=Path(scratch)
             )
-            argv = (
-                self._python, "-m",
-                "agent_evolve.infrastructure.authored_worker",
-                str(request_path), str(response_path),
-            )
+            launch = ((self._worker,) if self._worker is not None
+                      else ("-m", "agent_evolve.infrastructure.authored_worker"))
+            argv = (self._python, *launch,
+                    str(request_path), str(response_path))
             try:
                 result = boundary.run(argv, timeout_s=self._limits.wall_time_s)
             except subprocess.TimeoutExpired:

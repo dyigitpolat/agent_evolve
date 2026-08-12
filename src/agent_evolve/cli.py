@@ -31,6 +31,14 @@ from agent_evolve.core.results import compute_pareto_front
 __all__ = ["main"]
 
 
+def _authorship_presets() -> tuple:
+    """The preset names, read from the table that defines them."""
+
+    from agent_evolve.session.authorship import PRESETS
+
+    return tuple(PRESETS)
+
+
 def _load_problem(spec: str) -> Any:
     """Import ``module:attribute`` and return the problem object."""
     if ":" not in spec:
@@ -376,13 +384,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run.add_argument(
         "--authorship",
         default="auto",
-        choices=("auto", "off", "surrogate", "surrogate-llm", "operators",
-                 "operators-llm", "init-llm", "full"),
+        # Enumerated from the preset table, never repeated: a mechanism that
+        # is reachable from the library but not the CLI is half-shipped.
+        choices=("auto",) + tuple(_authorship_presets()),
         help=(
             "authored machinery: 'surrogate[-llm]' turns on virtual "
             "pre-screening (model-written surrogates screen only when they "
             "out-validate the rules); 'operators[-llm]' runs variation arms "
-            "under survival credit; 'full' is both, model-authored"
+            "under survival credit; 'generation-llm' lets the model write the "
+            "sampler every candidate is drawn from, 'generative' puts that "
+            "sampler under the authored screen; 'full' is surrogate + "
+            "operators + init, model-authored"
         ),
     )
     run.add_argument(

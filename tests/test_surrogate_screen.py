@@ -292,6 +292,63 @@ def test_bogus_authorship_is_rejected_by_name():
         AuthorshipConfig(operators="bogus")
 
 
+def test_a_refresh_reads_a_bounded_window_of_the_most_recent_data():
+    """A screen that refits on everything makes the whole run quadratic.
+
+    At B=10,000 that is not slow, it is unusable -- which is exactly the
+    budget scale an authored generator exists for. The window is the fix;
+    what it must never do is silently change a run small enough to fit
+    inside it.
+    """
+
+    widths: list[int] = []
+    rows: list = []
+
+    def counting(evaluated, specs):
+        widths.append(len(evaluated))
+        rows.append([cfg["genome"] for cfg, _obj in evaluated])
+        return additive_surrogate(evaluated, specs)
+
+    import random as _random
+
+    order = _random.Random(0).sample(range(64), 60)
+    data = _data([[(i >> j) & 1 for j in range(6)] for i in order])
+    screening = Screening([("counting", "rule", counting)],
+                          max_training_rows=16)
+    assert screening.refresh(data, SPECS, seed=1)
+    assert widths and max(widths) <= 16, widths
+    assert all(row in [cfg["genome"] for cfg, _o in data[-16:]]
+               for fitted in rows for row in fitted), (
+        "the window must be the most recent measurements, not any 16"
+    )
+
+    untouched = Screening([("counting", "rule", counting)])
+    widths.clear()
+    assert untouched.refresh(LEARNABLE, SPECS, seed=1)
+    assert max(widths) == len(LEARNABLE), (
+        "a run smaller than the window must see every row it always did"
+    )
+
+
+def test_every_authorship_preset_is_offered_by_the_cli():
+    """A mechanism reachable from the library but not the CLI is half-shipped.
+
+    The parser enumerates the preset table rather than repeating it, so this
+    pins the property that made that worth doing -- and that every name in
+    the table actually builds.
+    """
+
+    from agent_evolve.cli import _authorship_presets
+    from agent_evolve.session.authorship import PRESETS, AuthorshipConfig
+
+    assert set(_authorship_presets()) == set(PRESETS)
+    for name in PRESETS:
+        assert isinstance(AuthorshipConfig.preset(name), AuthorshipConfig)
+    assert {"generation-llm", "generative"} <= set(PRESETS), (
+        "the authored-generator presets must be reachable by name"
+    )
+
+
 def test_authorship_refuses_the_authoring_strategy_by_name():
     with pytest.raises(ValueError, match="genetic"):
         optimize(_Problem(), budget=8, strategy="authoring",
