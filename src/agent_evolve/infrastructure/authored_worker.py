@@ -92,6 +92,22 @@ def main(argv: list[str]) -> int:
         return 0
 
     namespace: dict = {"__name__": "authored_artifact"}
+    # A HARNESS-WRITTEN prelude, executed into the same namespace before the
+    # artifact and never gated: it is ours, not the model's, and it is how the
+    # caller hands authored code machinery it should not have to re-derive
+    # (see policies/emit_scaffold.py). Absent, nothing changes.
+    prelude = request.get("prelude")
+    if prelude:
+        try:
+            exec(compile(prelude, "<harness_prelude>", "exec"), namespace)  # noqa: S102
+        except Exception:
+            _respond(response_path, {
+                "status": "crash",
+                "detail": "harness prelude: "
+                          + traceback.format_exc()[-_DETAIL_LIMIT:],
+            })
+            return 0
+
     try:
         exec(compile(source, "<authored>", "exec"), namespace)  # noqa: S102
     except SyntaxError as error:
@@ -128,6 +144,19 @@ def main(argv: list[str]) -> int:
         return 0
 
     payload = {"status": "ok", "results": results}
+    notes = request.get("notes_global")
+    if notes:
+        # The prelude's own counters, returned alongside the results. Only a
+        # JSON-serializable mapping crosses back, and a prelude that wrote
+        # something else costs the caller its diagnostics, never the batch.
+        value = namespace.get(notes)
+        if isinstance(value, dict):
+            try:
+                json.dumps(value)
+            except (TypeError, ValueError):
+                value = None
+            if value is not None:
+                payload["notes"] = value
     try:
         _respond(response_path, payload)
     except (TypeError, ValueError):

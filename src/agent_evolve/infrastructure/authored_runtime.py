@@ -16,9 +16,9 @@ import json
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from agent_evolve.core.authored import AuthoredArtifact
 from agent_evolve.infrastructure.subprocess_boundary import (
@@ -48,6 +48,10 @@ class RuntimeOutcome:
     status: str
     results: tuple = ()
     detail: str = ""
+    #: Counters a harness-written prelude published inside the sandbox (see
+    #: ``policies/emit_scaffold.py``). Empty whenever no prelude ran or the
+    #: prelude wrote nothing serializable -- diagnostics, never results.
+    notes: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -88,13 +92,26 @@ class AuthoredRuntime:
         return self._limits
 
     def call(
-        self, artifact: AuthoredArtifact, calls: Sequence[Sequence[Any]]
+        self,
+        artifact: AuthoredArtifact,
+        calls: Sequence[Sequence[Any]],
+        *,
+        prelude: Optional[str] = None,
+        notes_global: Optional[str] = None,
     ) -> RuntimeOutcome:
         """Run *artifact* against every argument list in *calls*, bounded.
 
         One process for the whole batch: a per-call process would pay the
         interpreter startup once per candidate, and the batch is the unit the
         loop actually needs (screen a pool, vary a generation's offspring).
+
+        *prelude* is HARNESS-written source executed into the artifact's
+        namespace before it -- machinery the caller would otherwise be asking
+        the model to re-derive, such as the emit scaffold that makes a
+        shape error impossible to construct. It is not import-gated, because
+        it is not the model's code; the artifact still is. *notes_global*
+        names a variable the prelude may leave counters in, returned as
+        :attr:`RuntimeOutcome.notes`.
         """
 
         if not calls:
@@ -112,6 +129,9 @@ class AuthoredRuntime:
                 },
                 "calls": [list(call) for call in calls],
             }
+            if prelude:
+                request["prelude"] = prelude
+                request["notes_global"] = notes_global or ""
             request_path.write_text(json.dumps(request), encoding="utf-8")
 
             boundary = ExplicitEnvironmentSubprocessBoundary(
@@ -162,4 +182,7 @@ class AuthoredRuntime:
                 detail=(f"{len(results) if isinstance(results, list) else 'no'}"
                         f" results for {len(calls)} calls"),
             )
-        return RuntimeOutcome(status="ok", results=tuple(results))
+        notes = payload.get("notes")
+        return RuntimeOutcome(
+            status="ok", results=tuple(results),
+            notes=dict(notes) if isinstance(notes, dict) else {})

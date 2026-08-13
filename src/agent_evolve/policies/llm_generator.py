@@ -34,6 +34,29 @@ is worth stating precisely because a generator emits candidates:
   source plus what the harness measured about its output -- acceptance rate,
   duplicate and archive-overlap rates, and how many of its candidates
   survived selection -- and asks for a rewrite under the identical gate.
+
+What the seam does NOT ask the model to do, since Wave D measured what
+happens when it does. On an assignment-structured genome (`upms_j14_m3`,
+fourteen scalar loci with per-locus eligibility) the sealed generator emitted
+7,104 candidates against 39,993 uniformly-filled pool slots and 23
+acceptances; `upms_j13_m3` reproduced it. The failure decomposes into three
+things the HARNESS already knows and the model was left to re-derive:
+
+- the SHAPE. ``policies.emit_scaffold`` ships a ``build(picks)`` helper into
+  the sandbox, so authored code names loci and values and the harness
+  assembles the configuration -- and assembles a partially-correct emission
+  rather than dropping it whole, a per-LOCUS fallback in place of a
+  per-CANDIDATE one.
+- the DOMAINS. Every locus's admissible set is echoed into the authoring
+  prompt (``render_domain_echo``), because a field-level card cannot say
+  what a per-position domain is.
+- the RESOURCE BUDGET. A batch that overruns the sandbox returns nothing, so
+  its whole pool falls back to uniform -- invisible in a per-candidate
+  counter. The wall/CPU/memory contract is echoed too, and one overrun buys
+  a retry at ``n // 4`` rather than the loss of the pool.
+
+Each is counted separately, ablatable separately, and off restores the
+sealed behaviour exactly.
 """
 
 from __future__ import annotations
@@ -46,6 +69,13 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from agent_evolve.core.authored import CONTRACTS, AuthoredArtifact, authored_artifact
 from agent_evolve.core.problem import ObjectiveSpec
 from agent_evolve.infrastructure.authored_worker import ALLOWED_IMPORTS
+from agent_evolve.policies.emit_scaffold import (
+    NOTES_GLOBAL,
+    SCAFFOLD_RULES,
+    coerce_candidate,
+    render_domain_echo,
+    scaffold_prelude,
+)
 from agent_evolve.policies.genetic import (
     loci_of,
     locus_domain,
@@ -61,6 +91,7 @@ from agent_evolve.policies.llm_surrogate import (
 __all__ = [
     "GeneratorTelemetry",
     "PoolReport",
+    "RejectionCensus",
     "AuthoredGenerator",
     "author_generator",
     "revise_generator",
@@ -116,9 +147,120 @@ class GeneratorTelemetry:
     survived: int = 0
     revisions: int = 0
     revisions_accepted: int = 0
+    #: Candidates the harness ASSEMBLED rather than rejected: the emitted
+    #: member addressed at least one locus with an admissible value, and the
+    #: rest of the configuration was filled from the template and the
+    #: domains. Counted apart from ``accepted`` because a repaired candidate
+    #: carries less of the model's guidance than a clean one, and a mechanism
+    #: that only works after repair must not read as one that works.
+    repaired: int = 0
+    #: Individual loci the harness had to decide inside those candidates.
+    repaired_loci: int = 0
+    #: What the in-sandbox emit scaffold reported about its own work: loci
+    #: the authored code left unset, and values it asked for that were not in
+    #: that locus's domain. Both are counted at the point of construction, so
+    #: they are visible even when nothing is rejected at all.
+    scaffold_filled: int = 0
+    scaffold_out_of_domain: int = 0
+    #: Locus names the authored code used that the schema does not declare.
+    scaffold_unknown_locus: int = 0
+    #: Revisions that were authored, ran, and did NOT improve the measured
+    #: defect -- the population the rejected-edit memory is built from.
+    revisions_rejected: int = 0
+    #: Batches that blew the sandbox's wall/CPU/memory budget and were retried
+    #: at a smaller ``n``, and how many of those retries came back usable.
+    runtime_retries: int = 0
+    runtime_recovered: int = 0
 
     def as_dict(self) -> dict[str, int]:
         return {f.name: int(getattr(self, f.name)) for f in fields(self)}
+
+
+@dataclass
+class RejectionCensus:
+    """WHICH loci rejected, WHY, and one concrete offending sample of each.
+
+    Wave D's counters said 6,021 shape and 1,060 out-of-domain and could say
+    nothing more, so the revision prompt could only tell the model that
+    something was wrong -- which is why revision fired on 77 of 80 cells and
+    repaired none of them. A revision is a repair instruction, and a repair
+    instruction needs the address of the fault: the locus, the reason, and a
+    value the model can recognise as its own.
+
+    The routing is the point (program section 9-B5, the SHE borrowing):
+    a defect is diagnosed against the artifact responsible for it, not
+    aggregated into a rate that names nobody.
+    """
+
+    shape_reasons: Dict[str, int] = None            # type: ignore[assignment]
+    out_of_domain_by_locus: Dict[str, int] = None   # type: ignore[assignment]
+    repaired_by_locus: Dict[str, int] = None        # type: ignore[assignment]
+    samples: Dict[str, Any] = None                  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        for name in ("shape_reasons", "out_of_domain_by_locus",
+                     "repaired_by_locus", "samples"):
+            if getattr(self, name) is None:
+                setattr(self, name, {})
+
+    def shape(self, reason: str, sample: Any = None) -> None:
+        self.shape_reasons[reason] = self.shape_reasons.get(reason, 0) + 1
+        self.samples.setdefault(f"shape:{reason}", _sample_of(sample))
+
+    def out_of_domain(self, locus: str, value: Any) -> None:
+        self.out_of_domain_by_locus[locus] = (
+            self.out_of_domain_by_locus.get(locus, 0) + 1)
+        self.sample(locus, value)
+
+    def sample(self, locus: str, value: Any) -> None:
+        """One concrete offending value at *locus*; the first one sticks."""
+
+        self.samples.setdefault(f"domain:{locus}", _sample_of(value))
+
+    def repaired(self, locus: str) -> None:
+        self.repaired_by_locus[locus] = self.repaired_by_locus.get(locus, 0) + 1
+
+    def merge(self, other: "RejectionCensus") -> None:
+        for reason, count in other.shape_reasons.items():
+            self.shape_reasons[reason] = self.shape_reasons.get(reason, 0) + count
+        for locus, count in other.out_of_domain_by_locus.items():
+            self.out_of_domain_by_locus[locus] = (
+                self.out_of_domain_by_locus.get(locus, 0) + count)
+        for locus, count in other.repaired_by_locus.items():
+            self.repaired_by_locus[locus] = (
+                self.repaired_by_locus.get(locus, 0) + count)
+        for key, value in other.samples.items():
+            self.samples.setdefault(key, value)
+
+    @property
+    def empty(self) -> bool:
+        return not (self.shape_reasons or self.out_of_domain_by_locus
+                    or self.repaired_by_locus)
+
+    def signature(self) -> str:
+        """A stable name for THIS defect, so a repeat is recognisable.
+
+        Two revisions that leave the same loci failing for the same reasons
+        have not changed anything the harness can measure, whatever else they
+        changed -- and that is exactly what the rejected-edit memory must be
+        able to say back to the next revision.
+        """
+
+        parts = ([f"shape:{k}" for k in sorted(self.shape_reasons)]
+                 + [f"domain:{k}" for k in sorted(self.out_of_domain_by_locus)])
+        return "|".join(parts) or "clean"
+
+
+def _sample_of(value: Any) -> Any:
+    """A JSON-safe, bounded rendering of one offending value."""
+
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError):
+        return repr(value)[:120]
+    if isinstance(value, str) and len(value) > 120:
+        return value[:120]
+    return value
 
 
 @dataclass(frozen=True)
@@ -131,6 +273,14 @@ class PoolReport:
     rejected_out_of_domain: int = 0
     duplicates: int = 0
     archive_overlap: int = 0
+    #: Accepted by ASSEMBLY rather than as emitted (see ``repair`` below).
+    repaired: int = 0
+    repaired_loci: int = 0
+    census: RejectionCensus = None                  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.census is None:
+            object.__setattr__(self, "census", RejectionCensus())
 
     def _rate(self, count: int) -> float:
         return (count / self.emitted) if self.emitted else 0.0
@@ -165,6 +315,20 @@ class PoolReport:
 
         return self._rate(len(self.accepted))
 
+    @property
+    def defect_rate(self) -> float:
+        """Fraction of the batch the harness had to reject OR assemble.
+
+        The one number a revision must move. Repairs are counted as defects
+        here even though they were accepted: a candidate the harness had to
+        finish is a candidate the model did not write, and a revision that
+        turns rejections into repairs has moved the failure rather than
+        fixed it.
+        """
+
+        return self._rate(self.rejected_shape + self.rejected_out_of_domain
+                          + self.repaired)
+
     def as_note(self) -> Dict[str, Any]:
         """The per-generation history record: counts plus the guard's rates."""
 
@@ -175,10 +339,13 @@ class PoolReport:
             "rejected_out_of_domain": self.rejected_out_of_domain,
             "duplicates": self.duplicates,
             "archive_overlap": self.archive_overlap,
+            "repaired": self.repaired,
+            "repaired_loci": self.repaired_loci,
             "acceptance_rate": round(self.acceptance_rate, 4),
             "duplicate_rate": round(self.duplicate_rate, 4),
             "archive_overlap_rate": round(self.archive_overlap_rate, 4),
             "novelty_rate": round(self.novelty_rate, 4),
+            "defect_rate": round(self.defect_rate, 4),
         }
 
 
@@ -189,6 +356,8 @@ def validate_pool(
     domains: Mapping[str, Sequence[Any]],
     seen: Optional[Any] = None,
     limit: Optional[int] = None,
+    repair: bool = False,
+    rng: Optional[random.Random] = None,
 ) -> PoolReport:
     """Accept the candidates a generator may actually emit into the run.
 
@@ -211,6 +380,22 @@ def validate_pool(
     answers "give me 2,000" with 200,000 costs the harness the 2,000 it
     asked for. ``PoolReport.emitted`` counts what was considered, which is
     the denominator every rate here is against.
+
+    Every reject is also ADDRESSED, into :class:`RejectionCensus`: which
+    locus, which reason, and one concrete offending sample. A counter that
+    says "6,021 shape" cannot instruct a revision; "job_13 is missing from
+    every candidate you emitted, sample {...}" can.
+
+    *repair* turns the per-candidate fallback into a per-LOCUS one. Off (the
+    default, and what every sealed row was measured under) a candidate with
+    one bad locus is dropped whole and its pool slot is filled by a
+    schema-uniform draw, so thirteen good choices are discarded with the
+    fourteenth. On, the harness assembles the candidate out of whatever the
+    member did address -- flat locus keys, the template's own nesting, or a
+    bare sequence aligned with the loci -- and decides only the loci the
+    member got wrong or left out. Repairs are accepted, but counted apart in
+    ``repaired``/``repaired_loci`` and censused per locus, because a
+    candidate the harness finished is not a candidate the model wrote.
     """
 
     if not isinstance(emitted, list):
@@ -219,40 +404,42 @@ def validate_pool(
     template_fields = set(template)
     known = set(seen) if seen is not None else set()
     batch: set[str] = set()
+    draw = rng if rng is not None else random.Random(0)
 
     accepted: List[Config] = []
-    counts = {"shape": 0, "domain": 0, "duplicate": 0, "overlap": 0}
+    census = RejectionCensus()
+    counts = {"shape": 0, "domain": 0, "duplicate": 0, "overlap": 0,
+              "repaired": 0, "repaired_loci": 0}
     considered = 0
     for member in emitted:
         if limit is not None and considered >= limit:
             break
         considered += 1
-        if not isinstance(member, dict) or set(member) != template_fields:
-            counts["shape"] += 1
+        candidate, reason, locus, value = _read_candidate(
+            member, template=template, template_loci=template_loci,
+            template_fields=template_fields, domains=domains)
+        if candidate is None and repair:
+            fixed, repairs = coerce_candidate(
+                member, template=template, domains=domains, rng=draw,
+                loci=template_loci)
+            if fixed is not None:
+                for kind, loci_list in repairs.items():
+                    for name in loci_list:
+                        census.repaired(name)
+                        if kind == "out_of_domain":
+                            census.out_of_domain(name, _picked(member, name))
+                counts["repaired"] += 1
+                counts["repaired_loci"] += sum(len(v) for v in repairs.values())
+                candidate, reason = fixed, ""
+        if candidate is None:
+            if reason == "domain":
+                counts["domain"] += 1
+                census.out_of_domain(str(locus), value)
+            else:
+                counts["shape"] += 1
+                census.shape(reason, member)
             continue
-        try:
-            member_loci = loci_of(member)
-        except Exception:
-            counts["shape"] += 1
-            continue
-        if member_loci != template_loci:
-            counts["shape"] += 1
-            continue
-        ok = True
-        for locus in member_loci:
-            value = read_locus(member, locus)
-            domain = domains.get(str(locus)) or ()
-            if domain:
-                if value not in domain:
-                    ok = False
-                    break
-            elif value != read_locus(template, locus):
-                ok = False
-                break
-        if not ok:
-            counts["domain"] += 1
-            continue
-        key = candidate_key(member)
+        key = candidate_key(candidate)
         if key in batch:
             counts["duplicate"] += 1
             continue
@@ -263,7 +450,7 @@ def validate_pool(
         if key in known:
             counts["overlap"] += 1
             continue
-        accepted.append(dict(member))
+        accepted.append(dict(candidate))
 
     return PoolReport(
         accepted=tuple(accepted),
@@ -272,7 +459,68 @@ def validate_pool(
         rejected_out_of_domain=counts["domain"],
         duplicates=counts["duplicate"],
         archive_overlap=counts["overlap"],
+        repaired=counts["repaired"],
+        repaired_loci=counts["repaired_loci"],
+        census=census,
     )
+
+
+def _read_candidate(member, *, template, template_loci, template_fields,
+                    domains):
+    """``(config, reason, locus, value)`` -- the value-by-value gate itself.
+
+    ``config`` is the member unchanged when it passes. Otherwise ``reason``
+    names WHICH gate it failed, in the vocabulary a revision can act on:
+    ``not a mapping``, ``missing loci``, ``unexpected fields``, ``wrong
+    length``, or ``domain`` with the offending locus and value.
+    """
+
+    if not isinstance(member, dict):
+        return None, "not a mapping", None, None
+    fields_seen = set(member)
+    if fields_seen != template_fields:
+        missing = sorted(template_fields - fields_seen)
+        extra = sorted(fields_seen - template_fields)
+        if missing and extra:
+            reason = (f"missing fields {missing[:4]} and unexpected fields "
+                      f"{extra[:4]}")
+        elif missing:
+            reason = f"missing fields {missing[:6]}"
+        else:
+            reason = f"unexpected fields {extra[:6]}"
+        return None, reason, None, None
+    try:
+        member_loci = loci_of(member)
+    except Exception:
+        return None, "not a mapping", None, None
+    if member_loci != template_loci:
+        want, got = len(template_loci), len(member_loci)
+        return None, (f"wrong sequence length ({got} loci, the archive's "
+                      f"members have {want})"), None, None
+    for locus in member_loci:
+        value = read_locus(member, locus)
+        domain = domains.get(str(locus)) or ()
+        if domain:
+            if value not in domain:
+                return None, "domain", locus, value
+        elif value != read_locus(template, locus):
+            return None, "domain", locus, value
+    return member, "", None, None
+
+
+def _picked(member: Any, locus: str) -> Any:
+    """The value *member* carried at *locus*, for the census's sample."""
+
+    try:
+        if isinstance(member, dict):
+            if locus in member:
+                return member[locus]
+            if locus.endswith("]") and "[" in locus:
+                field, index = locus[:-1].split("[", 1)
+                return member[field][int(index)]
+    except Exception:
+        return None
+    return None
 
 
 GENERATOR_PROMPT = """You are writing the CANDIDATE GENERATOR for a black-box \
@@ -285,7 +533,7 @@ OBJECTIVES (name and direction):
 
 SEARCH SPACE:
 {schema}
-
+{loci}
 Write ONE Python function with EXACTLY this signature:
 
     {contract}
@@ -296,7 +544,7 @@ Rules:
   you return must have the SAME SHAPE as the archive members and take every
   value from `domains` at that locus -- anything else is validated out and
   its slot falls back to a uniform random draw.
-- `archive` holds configurations already measured in this run (it may be
+{scaffold}- `archive` holds configurations already measured in this run (it may be
   short early on). Use it for context; do NOT return copies of it, and do not
   return the same configuration twice. A batch that collapses is measured and
   reported back to you.
@@ -312,8 +560,26 @@ Rules:
   is reproducible.
 - Standard library only; imports limited to: {imports}.
 - No I/O, no globals, deterministic.
-
+{limits}
 Reply with ONLY one fenced Python code block and no other text."""
+
+
+#: The resource contract, echoed for the same reason the domains are: a
+#: function that exceeds its sandbox budget returns NOTHING, so the whole pool
+#: falls back to schema-uniform draws and the mechanism contributes zero. Wave
+#: D's `upms_j14_m3` telemetry is the evidence -- 7,104 candidates emitted
+#: against 39,993 pool slots filled uniformly means most BATCHES emitted
+#: nothing at all, which is what a timeout looks like when the counter is
+#: per-candidate. An unstated budget is a budget the author cannot honour.
+LIMITS_RULES = """\
+- HARD RESOURCE LIMITS, enforced by the sandbox: {wall} s wall-clock, {cpu} s
+  CPU and {memory} MB of memory for ONE call, at up to n={max_n}. Exceeding
+  any of them returns NOTHING -- not a partial pool, nothing -- and the run
+  falls back to drawing every candidate uniformly, which is exactly the
+  baseline you are being measured against. Budget for the WORST case, not the
+  typical one: prefer O(n) construction from `domains` to any search, sort or
+  simulation over candidates, and if you want a local improvement step, cap
+  its total work by a constant you choose rather than by convergence."""
 
 
 GENERATOR_REVISION_PROMPT = """You previously wrote this candidate generator \
@@ -327,21 +593,55 @@ The harness ran it, validated everything it emitted, and measured what
 survived. Here is what actually happened:
 
 {feedback}
-
-Revise the function. Read the numbers literally: rejected candidates mean
-values outside `domains` or a shape that does not match the archive;
-duplicates mean the sampler is collapsing; archive overlap means it keeps
-re-proposing configurations already measured; no survivors means the region
-it concentrates on is not competitive and the mass should move. Same rules as
-before: exactly this signature
+{loci}
+Revise the function. Read the numbers literally: a rejected or repaired
+candidate names the LOCUS it failed at and the value it tried, so fix that
+locus rather than the sampler in general; duplicates mean the sampler is
+collapsing; archive overlap means it keeps re-proposing configurations
+already measured; no survivors means the region it concentrates on is not
+competitive and the mass should move. Same rules as before: exactly this
+signature
 
     {contract}
 
 exactly `n` configurations, every value from `domains` at that locus, the same
 shape as the archive members, randomness derived from `seed`, standard library
 only ({imports}), deterministic, no I/O.
-
+{scaffold}{limits}
 Reply with ONLY one fenced Python code block and no other text."""
+
+
+def _locus_block(domains: Optional[Mapping[str, Sequence[Any]]]) -> str:
+    """The per-locus domain echo, as a prompt section (empty when unknown)."""
+
+    if not domains:
+        return ""
+    echo = render_domain_echo(domains)
+    if not echo:
+        return ""
+    return ("\nLOCI AND THEIR ADMISSIBLE VALUES (the exact `domains` mapping "
+            "you will be passed;\nthese key names ARE the shape -- a "
+            "configuration has exactly these loci and no others):\n"
+            f"{echo}\n")
+
+
+def _scaffold_block(scaffold: bool) -> str:
+    return (SCAFFOLD_RULES + "\n") if scaffold else ""
+
+
+def _limits_block(limits: Any, max_n: Optional[int]) -> str:
+    """The sandbox's own budget, echoed (empty when the caller knows none)."""
+
+    if limits is None or not max_n:
+        return ""
+    try:
+        return LIMITS_RULES.format(
+            wall=f"{float(limits.wall_time_s):g}",
+            cpu=f"{float(limits.cpu_seconds):g}",
+            memory=int(int(limits.memory_bytes) / (1024 * 1024)),
+            max_n=int(max_n)) + "\n"
+    except (AttributeError, TypeError, ValueError):
+        return ""
 
 
 def author_generator(
@@ -351,14 +651,29 @@ def author_generator(
     schema_text: str,
     attempts: int = 2,
     telemetry: Optional[AuthorTelemetry] = None,
+    domains: Optional[Mapping[str, Sequence[Any]]] = None,
+    scaffold: bool = True,
+    limits: Any = None,
+    max_n: Optional[int] = None,
 ) -> Optional[AuthoredArtifact]:
-    """Ask the model to write ``propose``; accept whole or not at all."""
+    """Ask the model to write ``propose``; accept whole or not at all.
+
+    *domains* is the per-locus admissible set the run will actually pass, so
+    the prompt can ECHO it rather than leave the model to infer per-position
+    domains from a field-level card -- the difference that turns an
+    out-of-domain value from a guess into a prompt failure. *scaffold*
+    advertises the in-sandbox emit harness (``build``), which is what makes a
+    shape error impossible to construct rather than caught after the fact.
+    """
 
     tel = telemetry if telemetry is not None else AuthorTelemetry()
     contract = CONTRACTS["generator"]
     prompt = GENERATOR_PROMPT.format(
         goals="\n".join(f"  {s.name}: {s.goal}imise" for s in objectives),
         schema=schema_text,
+        loci=_locus_block(domains),
+        scaffold=_scaffold_block(scaffold),
+        limits=_limits_block(limits, max_n),
         contract=contract.description,
         imports=", ".join(sorted(ALLOWED_IMPORTS)),
     )
@@ -373,6 +688,10 @@ def revise_generator(
     feedback: str,
     attempts: int = 1,
     telemetry: Optional[AuthorTelemetry] = None,
+    domains: Optional[Mapping[str, Sequence[Any]]] = None,
+    scaffold: bool = True,
+    limits: Any = None,
+    max_n: Optional[int] = None,
 ) -> Optional[AuthoredArtifact]:
     """One revision round: the artifact, its measured behaviour, a rewrite.
 
@@ -387,6 +706,9 @@ def revise_generator(
     prompt = GENERATOR_REVISION_PROMPT.format(
         source=artifact.source,
         feedback=feedback,
+        loci=_locus_block(domains),
+        scaffold=_scaffold_block(scaffold),
+        limits=_limits_block(limits, max_n),
         contract=contract.description,
         imports=", ".join(sorted(ALLOWED_IMPORTS)),
     )
@@ -412,10 +734,82 @@ def _author(complete, prompt, *, contract, attempts, telemetry, name):
     return None
 
 
+#: How many offending loci one feedback block names before it stops. A
+#: revision cannot act on four hundred addresses; it can act on the worst few.
+FEEDBACK_LOCI = 6
+
+
+def _defect_lines(
+    census: Optional[RejectionCensus],
+    domains: Optional[Mapping[str, Sequence[Any]]] = None,
+) -> List[str]:
+    """WHICH loci failed and WHY, worst first, each with a real sample."""
+
+    if census is None or census.empty:
+        return []
+    lines: List[str] = ["  WHERE IT FAILED (the harness's own addresses):"]
+    for reason, count in sorted(census.shape_reasons.items(),
+                                key=lambda kv: -kv[1])[:FEEDBACK_LOCI]:
+        sample = census.samples.get(f"shape:{reason}")
+        lines.append(f"    shape -- {reason}: {count} candidate(s); "
+                     f"you emitted {json_compact(sample)}")
+    ranked = sorted(census.out_of_domain_by_locus.items(),
+                    key=lambda kv: -kv[1])
+    for locus, count in ranked[:FEEDBACK_LOCI]:
+        sample = census.samples.get(f"domain:{locus}")
+        allowed = list((domains or {}).get(locus) or ())
+        rendered = (f"; its domain is {allowed[:8]}"
+                    + (f" ({len(allowed)} values)" if len(allowed) > 8 else "")
+                    ) if allowed else ""
+        lines.append(f"    locus {locus} -- out of domain {count} time(s); "
+                     f"you used {json_compact(sample)}{rendered}")
+    if len(ranked) > FEEDBACK_LOCI:
+        lines.append(f"    ... and {len(ranked) - FEEDBACK_LOCI} further loci "
+                     f"out of domain")
+    repaired = sorted(census.repaired_by_locus.items(), key=lambda kv: -kv[1])
+    if repaired:
+        worst = ", ".join(f"{locus} ({count})"
+                          for locus, count in repaired[:FEEDBACK_LOCI])
+        lines.append(f"    the harness had to DECIDE these loci for you: "
+                     f"{worst}")
+    return lines
+
+
+def _edit_lines(rejected_edits: Sequence[Mapping[str, Any]]) -> List[str]:
+    """The rejected-edit memory: fixes already tried that did not fix it.
+
+    Wave D measured revision firing on 77 of 80 cells on the broken
+    instances and repairing none of them. A revision loop with no memory of
+    its own failures can only re-propose them; naming the edit, the defect it
+    was supposed to fix, and the fact that the defect survived it is the
+    cheapest thing that makes the next attempt different.
+    """
+
+    if not rejected_edits:
+        return []
+    lines = ["  EDITS ALREADY TRIED THAT DID NOT FIX THIS -- do not repeat "
+             "them or anything equivalent:"]
+    for edit in rejected_edits[-3:]:
+        lines.append(
+            f"    revision {edit.get('revision')} (source {edit.get('sha')}): "
+            f"defect rate {float(edit.get('before', 0.0)):.0%} -> "
+            f"{float(edit.get('after', 0.0)):.0%}, and the same loci still "
+            f"fail ({edit.get('signature')}).")
+        excerpt = str(edit.get("excerpt") or "").strip()
+        if excerpt:
+            lines.append("      it looked like: "
+                         + " ".join(excerpt.split())[:240])
+    return lines
+
+
 def render_generation_feedback(
     telemetry: GeneratorTelemetry,
     last: Optional[PoolReport] = None,
     survivors: Sequence[Tuple[Config, Mapping[str, float]]] = (),
+    *,
+    census: Optional[RejectionCensus] = None,
+    domains: Optional[Mapping[str, Sequence[Any]]] = None,
+    rejected_edits: Sequence[Mapping[str, Any]] = (),
 ) -> str:
     """The measured story a generator revision needs, as text.
 
@@ -424,6 +818,12 @@ def render_generation_feedback(
     were measured. Survivors are shown rather than "the best" -- ranking
     candidates across objectives would need weights nobody declared, while
     surviving truncation is the run's own weight-free verdict.
+
+    Then the two things Wave D's counters could not say, and without which
+    revision repaired nothing: WHICH locus rejected and WHY, with a value the
+    model will recognise as its own (*census*, *domains*), and which edits
+    have already been tried against this same defect and failed
+    (*rejected_edits*).
     """
 
     lines = [
@@ -441,11 +841,28 @@ def render_generation_feedback(
         f"  of yours that were measured: {telemetry.measured}; "
         f"survived selection into the next population: {telemetry.survived}",
     ]
+    if telemetry.repaired or telemetry.repaired_loci:
+        lines.append(
+            f"  candidates the harness had to ASSEMBLE for you rather than "
+            f"reject: {telemetry.repaired} "
+            f"({telemetry.repaired_loci} individual loci decided for you)")
+    if (telemetry.scaffold_filled or telemetry.scaffold_out_of_domain
+            or telemetry.scaffold_unknown_locus):
+        lines.append(
+            f"  inside your own code, `build` filled "
+            f"{telemetry.scaffold_filled} locus/loci you left unset, "
+            f"overrode {telemetry.scaffold_out_of_domain} out-of-domain "
+            f"value(s) and ignored {telemetry.scaffold_unknown_locus} locus "
+            f"name(s) the schema does not declare")
     if last is not None and last.emitted:
         lines.append(
             f"  most recent batch: {last.duplicate_rate:.0%} duplicates, "
             f"{last.archive_overlap_rate:.0%} already measured, "
             f"{last.novelty_rate:.0%} usable and new")
+    lines.extend(_defect_lines(
+        census if census is not None
+        else (last.census if last is not None else None), domains))
+    lines.extend(_edit_lines(rejected_edits))
     for config, objectives in survivors:
         rendered = ", ".join(f"{k}={float(v):.6g}"
                              for k, v in sorted(objectives.items()))
@@ -478,6 +895,10 @@ class AuthoredGenerator:
         max_revisions: int = 1,
         min_measured_for_revision: int = 4,
         min_novelty: float = 0.5,
+        scaffold: bool = True,
+        repair: bool = True,
+        revision_guard: bool = False,
+        shrink_on_overrun: int = 4,
     ) -> None:
         if pool_factor < 1:
             raise ValueError(f"pool_factor must be at least 1, got {pool_factor}")
@@ -493,12 +914,34 @@ class AuthoredGenerator:
         self.max_revisions = int(max_revisions)
         self.min_measured_for_revision = int(min_measured_for_revision)
         self.min_novelty = float(min_novelty)
+        #: Ship the emit harness into the sandbox, so the authored code
+        #: constructs candidates locus by locus instead of transcribing a
+        #: shape. Shape was 6,021 of 7,104 emissions on `upms_j14_m3`.
+        self.scaffold = bool(scaffold)
+        #: Assemble a candidate out of whatever the emission got right rather
+        #: than dropping it whole -- a per-LOCUS fallback in place of a
+        #: per-CANDIDATE one. Off restores the sealed-row semantics exactly.
+        self.repair = bool(repair)
+        #: Keep a revision only if a frozen replay says it MEASURABLY helped
+        #: (see :meth:`_guard_admits`). Off by default: the one-shot and
+        #: capped-revision arms are what every sealed row is defined on.
+        self.revision_guard = bool(revision_guard)
+        #: Divisor for the one retry a resource overrun gets. 0 or 1 disables
+        #: it and a timeout costs the whole pool, as it did when Wave D
+        #: measured 39,993 uniformly-filled slots against 7,104 emissions.
+        self.shrink_on_overrun = int(shrink_on_overrun)
         self.telemetry = GeneratorTelemetry()
         self.mechanism = "authored_generator"
         self.authored_by = artifact.authored_by
         self.last_report: Optional[PoolReport] = None
+        self.census = RejectionCensus()
         self._seen: set[str] = set()
         self._survivors: List[Tuple[Config, Mapping[str, float]]] = []
+        self._domains: Dict[str, List[Any]] = {}
+        self._last_call: Optional[Tuple[List[Config], int, Dict[str, List[Any]],
+                                        int, Config]] = None
+        self._rejected_edits: List[Dict[str, Any]] = []
+        self._pending_edit: Optional[Dict[str, Any]] = None
 
     # -- sizing -------------------------------------------------------------
 
@@ -553,27 +996,31 @@ class AuthoredGenerator:
         generator's OWN first picks rather than over an unrelated draw.
         """
 
-        self._maybe_revise()
         n = self.pool_for(want)
         domains = {
             str(locus): list(locus_domain(candidate_model, locus,
                                           restriction=restriction))
             for locus in loci_of(template)
         }
+        self._domains = domains
         shown = [dict(config) for config in list(archive)[:self.archive_shown]]
+        self._maybe_revise()
+        self._last_call = (shown, n, domains, int(seed), dict(template))
 
         self.telemetry.batches += 1
-        report = validate_pool(
-            self._emit(shown, n, domains, seed),
-            template=template, domains=domains, seen=self._seen, limit=n,
-        )
+        report = self._run(self.artifact, shown, n, domains, seed,
+                           template=template, rng=rng, count=True)
         self.last_report = report
+        self.census.merge(report.census)
+        self._score_pending_edit(report)
         self.telemetry.emitted += report.emitted
         self.telemetry.accepted += len(report.accepted)
         self.telemetry.rejected_shape += report.rejected_shape
         self.telemetry.rejected_out_of_domain += report.rejected_out_of_domain
         self.telemetry.duplicates += report.duplicates
         self.telemetry.archive_overlap += report.archive_overlap
+        self.telemetry.repaired += report.repaired
+        self.telemetry.repaired_loci += report.repaired_loci
 
         pool = [dict(config) for config in report.accepted[:n]]
         while len(pool) < n:
@@ -582,21 +1029,108 @@ class AuthoredGenerator:
             self.telemetry.filled_uniform += 1
         return pool
 
-    def _emit(self, archive, n, domains, seed) -> Any:
+    def _run(self, artifact, archive, n, domains, seed, *, template, rng,
+             count: bool) -> PoolReport:
+        """One emission through the scaffold, validated. Optionally counted.
+
+        *count* is false for the revision guard's frozen replay, which must
+        measure a challenger without the run's telemetry recording an
+        emission the loop never saw.
+        """
+
+        rows = self._emit(artifact, archive, n, domains, seed,
+                          template=template, count=count)
+        return validate_pool(
+            rows, template=template, domains=domains, seen=self._seen,
+            limit=n, repair=self.repair,
+            rng=rng if rng is not None else random.Random(seed))
+
+    def _emit(self, artifact, archive, n, domains, seed, *, template,
+              count: bool = True) -> Any:
+        prelude = (scaffold_prelude(template, domains, nonce=int(seed))
+                   if self.scaffold else None)
         try:
             outcome = self.runtime.call(
-                self.artifact, [[archive, int(n), domains, int(seed)]])
+                artifact, [[archive, int(n), domains, int(seed)]],
+                prelude=prelude, notes_global=NOTES_GLOBAL)
+        except TypeError:
+            # A runtime that predates the prelude channel: the artifact still
+            # runs, the scaffold simply is not there, and the harness-side
+            # repair remains the only guard. Degrade, never fail.
+            try:
+                outcome = self.runtime.call(
+                    artifact, [[archive, int(n), domains, int(seed)]])
+            except Exception:
+                if count:
+                    self.telemetry.runtime_failures += 1
+                return []
         except Exception:                    # a runtime that cannot even ship
-            self.telemetry.runtime_failures += 1     # the call is a countable
-            return []                                # event, not an emergency
+            if count:                                # the call is a countable
+                self.telemetry.runtime_failures += 1  # event, not an emergency
+            return []
+        if count:
+            self._absorb_notes(getattr(outcome, "notes", None))
+        if (not outcome.ok and self.shrink_on_overrun > 1
+                and outcome.status in ("timeout", "memory")
+                and int(n) > self.shrink_on_overrun):
+            # A resource overrun is the one failure whose CAUSE the harness
+            # can act on: `propose` is a distribution, so asking it for fewer
+            # draws is the same request at a fraction of the work. A quarter
+            # of a guided pool beats none of one, the shortfall still falls
+            # back to schema-uniform, and both events stay counted.
+            if count:
+                self.telemetry.runtime_failures += 1
+                self.telemetry.runtime_retries += 1
+            smaller = max(1, int(n) // self.shrink_on_overrun)
+            try:
+                outcome = self.runtime.call(
+                    artifact, [[archive, smaller, domains, int(seed)]],
+                    prelude=prelude, notes_global=NOTES_GLOBAL)
+            except Exception:
+                return []
+            if count and outcome.ok:
+                self.telemetry.runtime_recovered += 1
+                self._absorb_notes(getattr(outcome, "notes", None))
+            if not outcome.ok:
+                return []
+            [rows] = outcome.results
+            return rows if isinstance(rows, list) else []
         if not outcome.ok:
-            self.telemetry.runtime_failures += 1
+            if count:
+                self.telemetry.runtime_failures += 1
             return []
         [rows] = outcome.results
         if not isinstance(rows, list):
-            self.telemetry.runtime_failures += 1
+            if count:
+                self.telemetry.runtime_failures += 1
             return []
         return rows
+
+    def _absorb_notes(self, notes: Any) -> None:
+        """The scaffold's own counters, from inside the sandbox."""
+
+        if not isinstance(notes, Mapping):
+            return
+        self.telemetry.scaffold_filled += int(notes.get("filled") or 0)
+        self.telemetry.scaffold_out_of_domain += int(
+            notes.get("out_of_domain") or 0)
+        self.telemetry.scaffold_unknown_locus += int(
+            notes.get("unknown_locus") or 0)
+        by_locus = notes.get("by_locus")
+        if isinstance(by_locus, Mapping):
+            for locus, row in by_locus.items():
+                if not isinstance(row, Mapping):
+                    continue
+                name = str(locus)
+                for _ in range(int(row.get("filled") or 0)):
+                    self.census.repaired(name)
+                count = int(row.get("out_of_domain") or 0)
+                if count:
+                    self.census.out_of_domain_by_locus[name] = (
+                        self.census.out_of_domain_by_locus.get(name, 0) + count)
+        for sample in (notes.get("samples") or ()):
+            if isinstance(sample, Mapping) and "locus" in sample:
+                self.census.sample(str(sample["locus"]), sample.get("value"))
 
     # -- revision from measured feedback ------------------------------------
 
@@ -620,7 +1154,8 @@ class AuthoredGenerator:
         if tel.batches == 0:
             return False
         if (tel.rejected_shape or tel.rejected_out_of_domain
-                or tel.runtime_failures):
+                or tel.runtime_failures or tel.repaired
+                or tel.scaffold_out_of_domain or tel.scaffold_unknown_locus):
             return True
         last = self.last_report
         if (last is not None and last.emitted
@@ -635,16 +1170,102 @@ class AuthoredGenerator:
         if not self.deficient():
             return
         self.telemetry.revisions += 1
-        feedback = render_generation_feedback(
-            self.telemetry, self.last_report, self._survivors)
+        feedback = self.feedback()
         try:
             replacement = self.revise(self.artifact, feedback)
         except Exception:                    # a revision must not kill a run
             replacement = None
         if replacement is None:
             return
+        if self.revision_guard and not self._guard_admits(replacement):
+            self.telemetry.revisions_rejected += 1
+            self._remember_rejected_edit(replacement, guarded=True)
+            return
+        self._pending_edit = {
+            "revision": self.telemetry.revisions,
+            "sha": replacement.source_sha256[:8],
+            "excerpt": replacement.source[:400],
+            "before": (self.last_report.defect_rate
+                       if self.last_report is not None else 0.0),
+            "signature": self.census.signature(),
+        }
         self.telemetry.revisions_accepted += 1
         self.artifact = replacement
+
+    def feedback(self) -> str:
+        """The measured story this generator would hand a revision."""
+
+        return render_generation_feedback(
+            self.telemetry, self.last_report, self._survivors,
+            census=self.census, domains=self._domains,
+            rejected_edits=self._rejected_edits)
+
+    # -- the guard, and the memory of what it (or measurement) rejected -----
+
+    def _guard_admits(self, replacement: AuthoredArtifact) -> bool:
+        """Does a FROZEN replay say the revision measurably helped?
+
+        The generator seam never sees the problem or the evaluation cache, so
+        the only honest validation available to it is its own emission,
+        replayed against the identical inputs the incumbent was last measured
+        on: same archive, same ``n``, same domains, same seed. Admission takes
+        a conjunction, so a revision cannot buy defect reduction with
+        collapse: the defect rate must strictly fall AND the novelty rate --
+        the frozen-validation score, the fraction of the batch that was
+        usable and new -- must not fall.
+
+        No model call and no evaluation is spent here; the incumbent's side of
+        the comparison is the batch already measured.
+        """
+
+        incumbent = self.last_report
+        if self._last_call is None or incumbent is None:
+            return True                      # nothing to compare against yet
+        archive, n, domains, seed, template = self._last_call
+        try:
+            trial = self._run(replacement, archive, n, domains, seed,
+                              template=template, rng=random.Random(seed),
+                              count=False)
+        except Exception:
+            return False
+        if not trial.emitted:
+            return False
+        return (trial.defect_rate < incumbent.defect_rate
+                and trial.novelty_rate >= incumbent.novelty_rate)
+
+    def _remember_rejected_edit(self, artifact: AuthoredArtifact, *,
+                                guarded: bool, after: float = -1.0) -> None:
+        before = (self.last_report.defect_rate
+                  if self.last_report is not None else 0.0)
+        self._rejected_edits.append({
+            "revision": self.telemetry.revisions,
+            "sha": artifact.source_sha256[:8],
+            "excerpt": artifact.source[:400],
+            "before": before,
+            "after": before if after < 0 else after,
+            "signature": self.census.signature(),
+            "guarded": bool(guarded),
+        })
+        del self._rejected_edits[:-3]
+
+    def _score_pending_edit(self, report: PoolReport) -> None:
+        """Did the revision we accepted last time actually fix anything?
+
+        Measured on the first batch the replacement emitted. If the defect
+        rate did not fall, the edit joins the rejected-edit memory and every
+        later revision is told, by name, that it was tried and failed.
+        """
+
+        pending, self._pending_edit = self._pending_edit, None
+        if pending is None:
+            return
+        if report.defect_rate < float(pending["before"]):
+            return
+        self.telemetry.revisions_rejected += 1
+        pending["after"] = report.defect_rate
+        pending["guarded"] = False
+        self._rejected_edits.append(pending)
+        del self._rejected_edits[:-3]
 
     def note(self) -> Dict[str, Any]:
         """The per-generation history record for the last batch."""
