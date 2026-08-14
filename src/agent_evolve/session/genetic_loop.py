@@ -507,8 +507,12 @@ def run_genetic_loop(
                 report = config.screening.screen(
                     pool_kids, [obj for _c, obj in population], specs)
                 if report is not None:
+                    # The floor is the screen's own, not a constant: a screen
+                    # certified on some of the objectives is biased against
+                    # the ones it cannot see, so it reserves more of the
+                    # generation for the chooser's unscreened picks.
                     floor_n = min(len(kids), max(1, math.ceil(
-                        config.screening.exploration_floor * want)))
+                        config.screening.exploration_floor_for(report) * want)))
                     keep = list(range(floor_n))
                     for index in report.order:
                         if len(keep) >= want:
@@ -523,6 +527,14 @@ def run_genetic_loop(
                         "pool": len(pool_kids), "held_out": floor_n,
                         "advanced": len(kids) - floor_n, "active": True,
                         "surrogate": report.surrogate_name,
+                        # Which objectives this order was actually computed
+                        # over. A generation that screened on a subset must
+                        # not be readable as one that screened on the whole
+                        # problem, so the scope travels in the record beside
+                        # the count of what it advanced.
+                        "objectives": list(report.screened_objectives),
+                        "objectives_declared": list(report.declared_objectives),
+                        "partial": bool(report.partial),
                     }
 
         valid = measure(kids, gen)

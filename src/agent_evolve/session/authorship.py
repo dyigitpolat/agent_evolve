@@ -61,6 +61,15 @@ class AuthorshipConfig:
     generation: str = "off"
     pool_factor: int = 4
     exploration_floor: float = 0.25
+    #: How many objectives the screen's gate must certify before the screen
+    #: may order anything: ``0`` = every declared objective (the conjunction),
+    #: a positive value = that many, with the screen ordering on exactly the
+    #: certified ones. See policies.surrogate.GatePolicy.min_passing_objectives.
+    screen_min_passing_objectives: int = 0
+    #: The share of a generation reserved from a PARTIAL screen, as a multiple
+    #: of the share of objectives it could not see. See
+    #: session.screening.Screening.unscreened_objective_floor.
+    screen_unscreened_objective_floor: float = 1.0
     authoring_attempts: int = 2
     max_authored_fraction: float = 0.5
     #: How many of the most recent measurements a screen refresh fits and
@@ -290,6 +299,12 @@ def _build_screening(
     # feedback the model receives describes a different bar from the one it
     # is actually held to.
     screening_gate = ORDERING_GATE
+    if config.screen_min_passing_objectives:
+        # A partial verdict certifies the artifact for the objectives it can
+        # order and leaves the rest unknown; the screen then orders on those
+        # and reserves more of the generation for unscreened picks.
+        screening_gate = ORDERING_GATE.replace(
+            min_passing_objectives=config.screen_min_passing_objectives)
     builders: list = []
     author_note: Optional[SimpleNamespace] = None
     if config.surrogate == "llm":
@@ -377,6 +392,7 @@ def _build_screening(
         builders=tuple(builders),
         pool_factor=config.pool_factor,
         exploration_floor=config.exploration_floor,
+        unscreened_objective_floor=config.screen_unscreened_objective_floor,
         revise=revise,
         max_training_rows=config.screen_training_rows,
         gate=screening_gate,

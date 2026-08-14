@@ -39,12 +39,28 @@ Config = Dict[str, Any]
 
 @dataclass(frozen=True)
 class ScreenReport:
-    """The pool, ordered by predicted worth. Indices address the caller's pool."""
+    """The pool, ordered by predicted worth. Indices address the caller's pool.
+
+    ``screened_objectives`` names the objectives the order was actually
+    computed over, and ``declared_objectives`` names the problem's. They
+    differ when the gate certified the surrogate on only some of them. A
+    consumer that reads ``order`` without reading these two is free to
+    believe the pool was ranked on the whole problem when it was ranked on
+    part of it, so both travel with the order rather than beside it.
+    """
 
     order: Tuple[int, ...]
     predicted: Tuple[Mapping[str, float], ...]
     virtual_evaluations: int
     surrogate_name: str
+    screened_objectives: Tuple[str, ...] = ()
+    declared_objectives: Tuple[str, ...] = ()
+
+    @property
+    def partial(self) -> bool:
+        """Was this order computed over a STRICT SUBSET of the objectives?"""
+
+        return len(self.screened_objectives) < len(self.declared_objectives)
 
 
 def _oriented(
@@ -129,6 +145,7 @@ def screen_offspring(
     predict: Predict,
     *,
     surrogate_name: str = "surrogate",
+    objectives: Optional[Sequence[str]] = None,
 ) -> Optional[ScreenReport]:
     """Order *pool* by predicted domination against the measured population.
 
@@ -146,18 +163,48 @@ def screen_offspring(
     is what the output can be wrong about, and a calibration test on
     magnitudes nobody reads can only reject artifacts that would have
     ordered correctly.
+
+    ``objectives`` restricts the domination test to the objectives the gate
+    certified this surrogate for; ``None`` means all of them. **The excluded
+    objectives are treated as UNKNOWN, not as satisfied**: they are neither
+    read from the prediction nor compared, so a surrogate that emits nonsense
+    on an objective it was not certified for cannot influence the order
+    through it. That is a deliberate asymmetry with a cost, stated here
+    because a caller must weigh it: domination over a subset is a STRICTER
+    relation than domination over the whole (more pairs compare, fewer are
+    incomparable), so a candidate that is excellent only on an excluded
+    objective is dominated on the subset and sinks. The screen is therefore
+    biased against exactly the trade-off it cannot see, and the caller's
+    exploration floor -- not this function -- is what keeps unscreened picks
+    in the generation (see :meth:`Screening.exploration_floor_for`).
     """
 
     if not pool:
         return None
+    names = [s.name for s in specs]
+    if objectives is None:
+        screened = list(names)
+    else:
+        wanted = set(objectives)
+        unknown = wanted - set(names)
+        if unknown:
+            raise ValueError(
+                "objectives to screen on must be declared objectives; "
+                f"{sorted(unknown)} are not among {names}")
+        screened = [name for name in names if name in wanted]
+    # Ordering on nothing is not ordering. A caller that reaches here with an
+    # empty subset has a gate bug, and screening the pool by index would hide
+    # it behind a plausible-looking order.
+    if not screened:
+        return None
+    specs = [spec for spec in specs if spec.name in set(screened)]
     predictions = predict(list(pool))
     if predictions is None or len(predictions) != len(pool):
         return None
-    names = [s.name for s in specs]
     clean: list[dict[str, float]] = []
     for predicted in predictions:
         row = {}
-        for name in names:
+        for name in screened:
             value = predicted.get(name) if isinstance(predicted, Mapping) else None
             if (value is None or isinstance(value, bool)
                     or not isinstance(value, (int, float))
@@ -167,7 +214,7 @@ def screen_offspring(
         clean.append(row)
 
     ranks = _dominator_counts(
-        clean, [dict(objectives) for objectives in population_objectives], specs)
+        clean, [dict(measured) for measured in population_objectives], specs)
     if ranks is None:
         return None
     order = tuple(sorted(range(len(pool)), key=lambda i: (ranks[i], i)))
@@ -176,6 +223,8 @@ def screen_offspring(
         predicted=tuple(clean),
         virtual_evaluations=len(pool),
         surrogate_name=surrogate_name,
+        screened_objectives=tuple(screened),
+        declared_objectives=tuple(names),
     )
 
 
@@ -197,15 +246,31 @@ class ScreeningTelemetry:
     #: generations the cheap fidelity itself won the gate and did the
     #: ordering.
     PROXY = ("proxy_rows_used", "chosen_proxy")
+    #: ``rejected_unstable_subset`` is counted separately and is NOT a gate
+    #: reason: every split passed, but they certified different objectives,
+    #: so the artifact is not stably predictive on enough of them. It exists
+    #: because a partial verdict makes that failure possible for the first
+    #: time, and a campaign must be able to see it rather than read it as
+    #: "the gate never had data".
+
+    #: The prefix under which ``as_dict`` reports, per objective, how many
+    #: screens ordered on it. A run that screened on two of three objectives
+    #: says so here in a form no reader can mistake for "screened on all
+    #: three", and it says it WITHOUT this module knowing any objective name.
+    SCREENED_PREFIX = "screened_on:"
 
     __slots__ = ("refreshes", "validated", "rejected_validation", "screens",
                  "screen_failures", "virtual_evaluations", "chosen_llm",
                  "chosen_rule", "revisions", "revisions_accepted",
-                 "gate_calls") + REJECTIONS + PROXY
+                 "gate_calls", "screens_full", "screens_partial",
+                 "rejected_unstable_subset",
+                 "_screened") + REJECTIONS + PROXY
 
     def __init__(self) -> None:
         for name in self.__slots__:
             setattr(self, name, 0)
+        #: objective name -> screens whose order was computed over it.
+        self._screened: Dict[str, int] = {}
 
     def record(self, verdict: Any) -> None:
         """Count one gate verdict, passed or rejected and why."""
@@ -217,8 +282,28 @@ class ScreeningTelemetry:
         if name in self.REJECTIONS:
             setattr(self, name, getattr(self, name) + 1)
 
+    def record_screen(self, report: Any) -> None:
+        """Count one screen, and WHICH objectives its order was computed over.
+
+        This is a correctness requirement, not a nicety: an order over a
+        subset is a different object from an order over the whole problem,
+        and a run that cannot distinguish them can report an endpoint it
+        cannot attribute.
+        """
+
+        if report.partial:
+            self.screens_partial += 1
+        else:
+            self.screens_full += 1
+        for name in report.screened_objectives:
+            self._screened[name] = self._screened.get(name, 0) + 1
+
     def as_dict(self) -> dict[str, int]:
-        return {name: getattr(self, name) for name in self.__slots__}
+        counters = {name: getattr(self, name) for name in self.__slots__
+                    if not name.startswith("_")}
+        for name, count in sorted(self._screened.items()):
+            counters[f"{self.SCREENED_PREFIX}{name}"] = count
+        return counters
 
 
 class Screening:
@@ -237,6 +322,7 @@ class Screening:
         *,
         pool_factor: int = 4,
         exploration_floor: float = 0.25,
+        unscreened_objective_floor: float = 1.0,
         validation_splits: int = 3,
         revise: Any = None,
         max_revisions: int = 2,
@@ -253,6 +339,11 @@ class Screening:
             raise ValueError(
                 f"exploration_floor must be in [0, 1), got {exploration_floor}"
             )
+        if not 0.0 <= unscreened_objective_floor <= 1.0:
+            raise ValueError(
+                "unscreened_objective_floor must be in [0, 1], got "
+                f"{unscreened_objective_floor}"
+            )
         if validation_splits < 1:
             raise ValueError(
                 f"validation_splits must be at least 1, got {validation_splits}"
@@ -262,6 +353,25 @@ class Screening:
         self.builders = tuple(builders)
         self.pool_factor = int(pool_factor)
         self.exploration_floor = float(exploration_floor)
+        #: How much of a generation is reserved from the screen when the gate
+        #: certified the surrogate on only SOME objectives, expressed as a
+        #: multiple of the share of objectives the screen is blind to.
+        #:
+        #: The screen orders by domination over the certified subset, and
+        #: domination over a subset is a stricter relation than domination
+        #: over the whole problem: a candidate that is excellent only on an
+        #: excluded objective is dominated on the subset and sinks. So a
+        #: partial screen is not merely less informed than a full one, it is
+        #: SYSTEMATICALLY biased against the objectives it cannot see, and
+        #: the flat 0.25 floor -- sized for a screen that might be wrong,
+        #: not for one that is wrong in a known direction -- is not the right
+        #: protection. At 1.0 (the default) the reserved share is the
+        #: unscreened share of the objectives: 1/3 of the generation stays
+        #: unscreened when 2 of 3 objectives are certified, 2/3 when 1 of 3
+        #: is, and the ordinary ``exploration_floor`` still applies as a
+        #: lower bound. At 0.0 a partial screen is treated exactly like a
+        #: full one, which is the arm this default was measured against.
+        self.unscreened_objective_floor = float(unscreened_objective_floor)
         self.validation_splits = int(validation_splits)
         #: What this consumer relies on, declared to the gate rather than
         #: assumed by it. The screen consumes an ORDER (`screen_offspring`
@@ -362,6 +472,10 @@ class Screening:
             added += 1
         self._proxy.ledger.rows_used = len(self._proxy_rows)
         return added
+        #: The objectives the gate certified the installed surrogate for.
+        #: ``None`` when nothing is installed. The screen orders on exactly
+        #: these and treats the rest as unknown.
+        self._objectives: Optional[Tuple[str, ...]] = None
 
     def refresh(
         self,
@@ -398,6 +512,7 @@ class Screening:
 
         self.telemetry.refreshes += 1
         self._predict = None
+        self._objectives = None
         data = list(evaluated)
         # Cheap-fidelity evidence, where the campaign has none of its own.
         # REAL SUPERSEDES CHEAP, always and by key; the cheap rows are
@@ -415,9 +530,12 @@ class Screening:
             proxy_used = len(extra)
             data = data + extra
         self.telemetry.proxy_rows_used = proxy_used
-        best: Optional[Tuple[float, str, str, SurrogateBuilder]] = None
+        names = [spec.name for spec in specs]
+        required = self.gate.objectives_required(len(names))
+        best: Optional[Tuple[Tuple[int, float], str, str,
+                             SurrogateBuilder, Tuple[str, ...]]] = None
         for name, authored_by, builder in self.builders:
-            ratios = []
+            verdicts = []
             failed = False
             for split in range(self.validation_splits):
                 verdict = validate_surrogate(
@@ -427,14 +545,42 @@ class Screening:
                 if not verdict.passed:
                     failed = True
                     break
-                per = list(verdict.mse_ratio.values())
-                ratios.append(sum(per) / len(per) if per else 1.0)
+                verdicts.append(verdict)
             if failed:
                 self.telemetry.rejected_validation += 1
                 continue
+            # The variance guard applies PER OBJECTIVE, because that is the
+            # granularity the verdict now has. An artifact certified on
+            # {area, latency} by one re-partition and on {area, energy} by
+            # the next is stable on {area} alone -- it has not shown it can
+            # order latency or energy across fits -- so the certified set is
+            # the INTERSECTION and it must still meet the policy's
+            # requirement. Under the conjunction every passing split
+            # certifies every objective, so the intersection is the whole set
+            # and this is a no-op.
+            certified = set(names)
+            for verdict in verdicts:
+                certified &= set(verdict.passing_objectives)
+            scope = tuple(n for n in names if n in certified)
+            if len(scope) < required or not scope:
+                self.telemetry.rejected_unstable_subset += 1
+                continue
+            ratios = []
+            for verdict in verdicts:
+                per = [verdict.mse_ratio[n] for n in scope
+                       if n in verdict.mse_ratio]
+                ratios.append(sum(per) / len(per) if per else 1.0)
             ratio = statistics.median(ratios) if ratios else 1.0
-            if best is None or ratio < best[0]:
-                best = (ratio, name, authored_by, builder)
+            # More certified objectives beats a better error ratio: an
+            # artifact that can order the whole problem is a different
+            # instrument from one that can order a third of it, and the
+            # ratio -- an average over whichever objectives each artifact
+            # got certified on -- is not comparable across different scopes.
+            # Under the conjunction every survivor has the same scope, so
+            # this reduces to the historical "lowest median ratio wins".
+            key = (-len(scope), ratio)
+            if best is None or key < best[0]:
+                best = (key, name, authored_by, builder, scope)
         # Revise only when the rules measurably beat the artifact -- a refresh
         # where nothing passes the gate carries no feedback a revision could
         # use, and the revision budget is small.
@@ -462,12 +608,13 @@ class Screening:
 
         if best is None:
             return False
-        _ratio, name, authored_by, builder = best
+        _key, name, authored_by, builder, scope = best
         try:
             self._predict = builder(data, specs)
         except Exception:
             self.telemetry.screen_failures += 1
             return False
+        self._objectives = scope
         self._name = name
         self.authored_by = authored_by
         self.telemetry.validated += 1
@@ -492,6 +639,7 @@ class Screening:
             report = screen_offspring(
                 pool, population_objectives, specs, self._predict,
                 surrogate_name=self._name,
+                objectives=self._objectives,
             )
         except Exception:
             self.telemetry.screen_failures += 1
@@ -500,4 +648,24 @@ class Screening:
             self.telemetry.screen_failures += 1
             return None
         self.telemetry.virtual_evaluations += report.virtual_evaluations
+        self.telemetry.record_screen(report)
         return report
+
+    def exploration_floor_for(self, report: ScreenReport) -> float:
+        """The share of the generation to keep away from THIS screen.
+
+        ``exploration_floor`` when the screen ordered on the whole problem.
+        When it ordered on a subset, the floor rises with the share of
+        objectives it could not see, scaled by
+        ``unscreened_objective_floor`` -- see that field for why a partial
+        screen needs more protection than a full one rather than the same.
+        The caller applies it; this class does not touch the budget.
+        """
+
+        declared = len(report.declared_objectives)
+        screened = len(report.screened_objectives)
+        if declared <= 0 or screened >= declared:
+            return self.exploration_floor
+        unscreened_share = (declared - screened) / declared
+        return max(self.exploration_floor,
+                   self.unscreened_objective_floor * unscreened_share)

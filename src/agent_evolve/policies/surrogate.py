@@ -20,6 +20,16 @@ venue at B <= 24, 27-28% of gate calls never reached scoring and the
 MSE-vs-train-mean term rejected 59-63% of the rest, while the rank term --
 the one the consumer actually depends on -- rejected 1.4-2.4%.
 
+**The verdict is per objective, and the policy says how many must pass.**
+An artifact that orders two of three objectives well is a usable ordering
+instrument on those two; requiring all three lets the least predictable one
+veto the others outright, which was measured happening on a live co-design
+venue (area 0.855, latency 0.606, energy 0.329 -- energy alone closed the
+gate). ``GatePolicy.min_passing_objectives`` declares the requirement, the
+default remains the conjunction, and a partial pass certifies a SCOPE:
+``SurrogateValidation.passing_objectives`` is what the consumer may order on
+and the rest stay unknown rather than assumed.
+
 **The evidence is cross-validated, not a single 30% holdout.** Every row is
 held out exactly once and the statistics pool across the folds, so a run with
 16 measured rows scores its surrogate on 16 held-out points instead of 4. At
@@ -49,6 +59,7 @@ from agent_evolve.policies.genetic import loci_of, read_locus
 __all__ = [
     "GatePolicy",
     "ORDERING_GATE",
+    "PARTIAL_ORDERING_GATE",
     "PREDICTION_GATE",
     "Predict",
     "SurrogateBuilder",
@@ -201,6 +212,17 @@ class GatePolicy:
         or the single ``"holdout"`` split of ``holdout_fraction``.
     ``min_rows``
         The absolute floor on measured rows below which no split is honest.
+    ``min_passing_objectives``
+        How many objectives must clear the terms above for the verdict to
+        pass. ``0`` means EVERY declared objective -- the conjunction, and
+        the historical behaviour. Any positive value admits a PARTIAL
+        verdict: the artifact is certified for the objectives it cleared and
+        for no others, and ``SurrogateValidation.passing_objectives`` names
+        them. A consumer that acts on a partial verdict must consume that
+        list; one that ignores it would be asserting predictions the gate
+        explicitly refused to certify. Values are clamped up to 1 and down to
+        the number of declared objectives, so the field is a floor on
+        evidence and never a way to pass with nothing.
     """
 
     purpose: str = "prediction"
@@ -210,6 +232,7 @@ class GatePolicy:
     folds: int = 0
     holdout_fraction: float = 0.3
     min_rows: int = 8
+    min_passing_objectives: int = 0
 
     def __post_init__(self) -> None:
         if self.purpose not in PURPOSES:
@@ -234,12 +257,38 @@ class GatePolicy:
                 f"holdout_fraction must be in (0, 1), got {self.holdout_fraction}")
         if self.min_rows < 2:
             raise ValueError(f"min_rows must be at least 2, got {self.min_rows}")
+        if self.min_passing_objectives < 0:
+            raise ValueError(
+                "min_passing_objectives must be 0 (every objective) or "
+                f"positive, got {self.min_passing_objectives}")
 
     @property
     def error_rejects(self) -> bool:
         """Does a worse-than-train-mean MSE reject, or only arbitrate?"""
 
         return self.purpose == "prediction"
+
+    @property
+    def admits_partial(self) -> bool:
+        """May a verdict pass while some declared objective failed?"""
+
+        return self.min_passing_objectives > 0
+
+    def objectives_required(self, declared: int) -> int:
+        """How many of *declared* objectives must clear the terms.
+
+        ``0`` means all of them. A positive setting is clamped into
+        ``[1, declared]``: never zero, because certifying an artifact for no
+        objective at all would let a screen order by nothing while reporting
+        that it screened; and never more than exist, so a policy written for
+        three objectives does not deadlock a two-objective problem.
+        """
+
+        if declared <= 0:
+            return 0
+        if not self.min_passing_objectives:
+            return declared
+        return max(1, min(self.min_passing_objectives, declared))
 
     def folds_for(self, n: int) -> int:
         """How many folds *n* rows get: the declared count, or one from n.
@@ -293,6 +342,18 @@ ORDERING_GATE = GatePolicy.for_purpose("ordering")
 #: at the historical thresholds.
 PREDICTION_GATE = GatePolicy.for_purpose("prediction")
 
+#: The ordering gate, admitting a PARTIAL verdict: an artifact certified on
+#: at least two objectives may order on exactly those, and the objectives it
+#: failed stay unknown rather than being ordered on regardless. The
+#: conjunction was measured turning a usable artifact away over one
+#: objective: on an expensive 3-objective co-design venue an authored
+#: surrogate read rank fidelity 0.855 (area) / 0.606 (latency) / 0.329
+#: (energy), and the all-objectives requirement let the third veto the two.
+#: Two, not one: ordering by domination over a single objective is a total
+#: order on that objective and discards the trade-off the problem is about,
+#: which is a different mechanism from the one this gate certifies.
+PARTIAL_ORDERING_GATE = ORDERING_GATE.replace(min_passing_objectives=2)
+
 
 @dataclass(frozen=True)
 class SurrogateValidation:
@@ -310,6 +371,15 @@ class SurrogateValidation:
     ``reason`` is the machine-readable term that rejected -- ``""`` when the
     verdict passed -- so a caller can count WHY a gate closed without
     parsing ``detail``.
+
+    ``passing_objectives`` names the objectives that cleared the policy's
+    terms, in declaration order. It is the SCOPE of the verdict, not a
+    detail: under a policy that admits partial verdicts a pass certifies the
+    artifact for these objectives and for no others, and a consumer that
+    orders on anything outside this tuple is using a prediction the gate
+    refused. Under the conjunction (``min_passing_objectives=0``) a passing
+    verdict lists every declared objective, so the field reads the same way
+    under both policies and no consumer needs to branch on the policy.
     """
 
     passed: bool
@@ -322,6 +392,20 @@ class SurrogateValidation:
     purpose: str = "prediction"
     scheme: str = "holdout"
     folds: int = 1
+    passing_objectives: Tuple[str, ...] = ()
+    declared_objectives: Tuple[str, ...] = ()
+
+    @property
+    def partial(self) -> bool:
+        """Did this verdict pass on a STRICT SUBSET of the objectives?
+
+        A run must never be able to report "the screen was active" without
+        being able to answer this, which is why it is derived from the two
+        tuples rather than from a flag a caller could forget to set.
+        """
+
+        return bool(self.passed) and (
+            len(self.passing_objectives) < len(self.declared_objectives))
 
     @property
     def mse_ratio(self) -> Dict[str, float]:
@@ -506,6 +590,7 @@ def validate_surrogate(
         "purpose": policy.purpose,
         "scheme": policy.scheme,
         "folds": policy.folds_for(n) if n else 0,
+        "declared_objectives": tuple(names),
     }
     if n < policy.min_rows:
         return SurrogateValidation(
@@ -566,20 +651,33 @@ def _score(pooled: "_Pooled", names, policy: GatePolicy,
         name: _spearman(pooled.predicted[name], pooled.actual[name])
         for name in names
     }
-    mse_ok = all(mse[name] < baseline[name] for name in names)
-    rank_ok = all(spearman[name] >= policy.min_rank_correlation
-                  for name in names)
+    # Both terms are decided PER OBJECTIVE, and the policy then says how many
+    # objectives have to clear them. Under the conjunction
+    # (min_passing_objectives = 0, `required` = len(names)) that is exactly
+    # the historical `all(...) and all(...)`; under a partial policy the same
+    # per-objective decisions are what `passing_objectives` reports, so the
+    # verdict's scope and its pass/fail come from one computation and cannot
+    # disagree.
+    rank_pass = [name for name in names
+                 if spearman[name] >= policy.min_rank_correlation]
+    if policy.error_rejects:
+        passing = [name for name in rank_pass if mse[name] < baseline[name]]
+    else:
+        passing = list(rank_pass)
+    required = policy.objectives_required(len(names))
     detail = ""
     reason = ""
-    if not rank_ok:
+    if len(rank_pass) < required:
         worst = min(names, key=lambda name: spearman[name])
         reason = "rank"
+        shortfall = (f"{len(rank_pass)} of {len(names)} objectives reach it, "
+                     f"{required} needed; " if policy.admits_partial else "")
         detail = (
-            f"rank agreement {spearman[worst]:.3f} on {worst!r} is below "
-            f"{policy.min_rank_correlation:.3f}: MSE fidelity is not rank "
-            "fidelity"
+            f"{shortfall}rank agreement {spearman[worst]:.3f} on {worst!r} is "
+            f"below {policy.min_rank_correlation:.3f}: MSE fidelity is not "
+            "rank fidelity"
         )
-    elif not mse_ok and policy.error_rejects:
+    elif len(passing) < required:
         worst = max(names,
                     key=lambda name: (mse[name] / baseline[name]
                                       if baseline[name] > 0.0 else math.inf))
@@ -589,9 +687,10 @@ def _score(pooled: "_Pooled", names, policy: GatePolicy,
         detail = (f"holdout error is {ratio} the train-mean baseline on "
                   f"{worst!r}: the magnitudes this purpose consumes are not "
                   "predictive")
-    passed = rank_ok and (mse_ok or not policy.error_rejects)
+    passed = len(passing) >= required and required > 0
     return SurrogateValidation(
         passed, mse, baseline, count,
         detail=detail, per_objective_spearman=spearman, reason=reason,
+        passing_objectives=tuple(passing) if passed else (),
         **stamp,
     )
