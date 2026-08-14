@@ -383,3 +383,22 @@ def test_authorship_refuses_the_authoring_strategy_by_name():
     with pytest.raises(ValueError, match="genetic"):
         optimize(_Problem(), budget=8, strategy="authoring",
                  proposer="random", authorship="surrogate")
+
+
+def test_pooled_add_survives_unsquarable_prediction():
+    """A finite-but-huge prediction fails its objective, never the run.
+
+    `(1e200 - x)**2` raises OverflowError rather than returning inf, so an
+    unguarded square turns one absurd prediction into a crashed campaign.
+    Cross-validation made this reachable: it squares every row, where a
+    single 30% holdout squared about a third of them.
+    """
+    from agent_evolve.core.problem import ObjectiveSpec
+    from agent_evolve.policies.surrogate import _Pooled
+
+    specs = [ObjectiveSpec("f", "min")]
+    pooled = _Pooled([s.name for s in specs])
+    holdout = [({"x": 0}, {"f": 1.0})]
+    unusable = pooled.add(holdout, [{"f": 1e200}], {"f": 1.0})
+    assert unusable == "f"
+    assert pooled.count == 0

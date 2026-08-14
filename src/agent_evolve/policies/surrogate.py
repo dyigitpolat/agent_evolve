@@ -424,9 +424,24 @@ class _Pooled:
                         or not isinstance(value, (int, float))
                         or not math.isfinite(float(value))):
                     return name
-                self.mse[name] += (float(value) - float(actual[name])) ** 2
-                self.baseline[name] += (
-                    train_mean[name] - float(actual[name])) ** 2
+                #: A prediction can be finite and still un-squarable: at
+                #: |x| ~ 1e200 the residual overflows a float and Python
+                #: raises OverflowError rather than returning inf, which
+                #: kills the run instead of failing the objective. An
+                #: artifact that predicts 1e200 is unusable for the same
+                #: reason a non-finite one is, so it takes the same exit.
+                #: Cross-validation made this reachable in practice: it
+                #: squares every row, where a single 30% holdout squared
+                #: about a third of them.
+                try:
+                    residual = (float(value) - float(actual[name])) ** 2
+                    baseline = (train_mean[name] - float(actual[name])) ** 2
+                except OverflowError:
+                    return name
+                if not (math.isfinite(residual) and math.isfinite(baseline)):
+                    return name
+                self.mse[name] += residual
+                self.baseline[name] += baseline
                 self.predicted[name].append(float(value))
                 self.actual[name].append(float(actual[name]))
         self.count += len(holdout)
