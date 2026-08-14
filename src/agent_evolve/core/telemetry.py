@@ -44,11 +44,19 @@ class RunTelemetry:
     against the budget. ``virtual_evaluations`` counts surrogate predictions —
     free by construction, and reported separately precisely so the two can
     never be conflated in a budget claim.
+
+    ``proxy_evaluations`` counts calls to a problem's CHEAPER evaluation
+    fidelity (``Problem.evaluate_proxy``). They are not free — they burn real
+    evaluator seconds — and they are not charged: the budget a claim is
+    denominated in counts full-fidelity evaluations. A campaign that spends
+    them must therefore report them, which is why they have a field of their
+    own here rather than a line in someone's log.
     """
 
     mechanisms: Tuple[MechanismTelemetry, ...] = ()
     real_evaluations: int = 0
     virtual_evaluations: int = 0
+    proxy_evaluations: int = 0
 
 
 def harvest_telemetry(
@@ -56,6 +64,7 @@ def harvest_telemetry(
     *,
     real_evaluations: int = 0,
     virtual_evaluations: int = 0,
+    proxy_evaluations: int = 0,
 ) -> RunTelemetry:
     """Collect telemetry from whichever *sources* carry it.
 
@@ -87,4 +96,5 @@ def harvest_telemetry(
         mechanisms=tuple(mechanisms),
         real_evaluations=int(real_evaluations),
         virtual_evaluations=int(virtual_evaluations),
+        proxy_evaluations=int(proxy_evaluations),
     )

@@ -191,10 +191,17 @@ class ScreeningTelemetry:
                   "rejected_rank", "rejected_error", "rejected_builder_failed",
                   "rejected_no_predictions", "rejected_bad_prediction")
 
+    #: The cheap fidelity's own counters, kept BESIDE the charged ones and
+    #: never added to them. `proxy_rows_used` is how many gate rows came from
+    #: the cheap evaluator on the last refresh; `chosen_proxy` counts the
+    #: generations the cheap fidelity itself won the gate and did the
+    #: ordering.
+    PROXY = ("proxy_rows_used", "chosen_proxy")
+
     __slots__ = ("refreshes", "validated", "rejected_validation", "screens",
                  "screen_failures", "virtual_evaluations", "chosen_llm",
                  "chosen_rule", "revisions", "revisions_accepted",
-                 "gate_calls") + REJECTIONS
+                 "gate_calls") + REJECTIONS + PROXY
 
     def __init__(self) -> None:
         for name in self.__slots__:
@@ -288,6 +295,73 @@ class Screening:
         self.authored_by = "none"
         self._predict: Optional[Predict] = None
         self._name = ""
+        #: The cheap fidelity, if the problem has one and the loop attached
+        #: it. `_proxy_rows` is gate EVIDENCE bought at that fidelity: it is
+        #: keyed so a real measurement always supersedes it, it never reaches
+        #: the archive, the population or the budget, and it is counted in
+        #: the source's own ledger.
+        self._proxy: Any = None
+        self._proxy_mode = "off"
+        self._proxy_rows: Dict[str, Tuple[Config, Mapping[str, float]]] = {}
+
+    # ------------------------------------------------------------------ proxy
+    def attach_proxy(self, source: Any, *, mode: str = "rows") -> None:
+        """Let this screen spend a CHEAPER evaluation fidelity.
+
+        ``mode="rows"`` -- the cheap evaluator buys gate EVIDENCE: rows the
+        campaign could not afford at full price, so the gate can reach a
+        verdict at budgets where the run has not yet measured its minimum
+        number of rows. This is the term that closes "too few rows", which is
+        a property of the budget and which no gate policy can fix.
+
+        ``mode="screen"`` -- the cheap evaluator competes AS a surrogate,
+        first in the builder order, and is cross-validated against the run's
+        own real measurements exactly like an authored artifact. This is the
+        term that can close a rank veto, and only if the cheap fidelity
+        really does rank the expensive one.
+
+        ``mode="both"`` -- both. ``mode="off"`` -- neither, and the screen is
+        then byte-identical to a screen with no proxy at all.
+        """
+
+        if mode not in ("off", "rows", "screen", "both"):
+            raise ValueError(
+                "proxy mode must be 'off', 'rows', 'screen' or 'both', "
+                f"got {mode!r}")
+        if mode == "off" or source is None:
+            self._proxy, self._proxy_mode = None, "off"
+            return
+        self._proxy = source
+        self._proxy_mode = mode
+        if mode in ("screen", "both"):
+            from agent_evolve.session.fidelity import proxy_fidelity_builder
+            name = f"proxy:{getattr(source, 'name', 'proxy')}"
+            if not any(entry[0] == name for entry in self.builders):
+                self.builders = ((name, "proxy", proxy_fidelity_builder(source)),
+                                 ) + self.builders
+
+    def prime(self, candidates: Sequence[Config],
+              measured_keys: Sequence[str] = ()) -> int:
+        """Buy gate evidence at the cheap fidelity. Returns rows added.
+
+        Called by the loop with the candidates it is about to consider. Rows
+        already measured for real are skipped, and any cheap row whose
+        candidate later gets measured is dropped by :meth:`refresh` -- cheap
+        evidence exists to fill a hole, never to outvote the real thing.
+        """
+
+        if self._proxy is None or self._proxy_mode not in ("rows", "both"):
+            return 0
+        known = set(measured_keys)
+        added = 0
+        for config, values in self._proxy.rows(candidates, exclude=known):
+            token = self._proxy.key(config)
+            if token in self._proxy_rows:
+                continue
+            self._proxy_rows[token] = (config, values)
+            added += 1
+        self._proxy.ledger.rows_used = len(self._proxy_rows)
+        return added
 
     def refresh(
         self,
@@ -325,8 +399,22 @@ class Screening:
         self.telemetry.refreshes += 1
         self._predict = None
         data = list(evaluated)
+        # Cheap-fidelity evidence, where the campaign has none of its own.
+        # REAL SUPERSEDES CHEAP, always and by key; the cheap rows are
+        # appended after the real ones so the recent-window trim below drops
+        # them first when the run has measured more than the window holds.
         if len(data) > self.max_training_rows:
             data = data[-self.max_training_rows:]
+        proxy_used = 0
+        if self._proxy is not None and self._proxy_rows:
+            measured = {self._proxy.key(config) for config, _values in data}
+            extra = [row for token, row in self._proxy_rows.items()
+                     if token not in measured]
+            room = self.max_training_rows - len(data)
+            extra = extra[:room] if room > 0 else []
+            proxy_used = len(extra)
+            data = data + extra
+        self.telemetry.proxy_rows_used = proxy_used
         best: Optional[Tuple[float, str, str, SurrogateBuilder]] = None
         for name, authored_by, builder in self.builders:
             ratios = []
@@ -385,6 +473,8 @@ class Screening:
         self.telemetry.validated += 1
         if authored_by == "llm":
             self.telemetry.chosen_llm += 1
+        elif authored_by == "proxy":
+            self.telemetry.chosen_proxy += 1
         else:
             self.telemetry.chosen_rule += 1
         return True

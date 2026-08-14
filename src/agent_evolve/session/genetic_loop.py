@@ -124,6 +124,19 @@ class GeneticConfig:
     #: seam. It replaces offspring construction, so it does not compose with
     #: `portfolio`; asking for both is refused rather than silently ignored.
     generator: Any = None
+    #: Whether the screen may spend the problem's CHEAPER evaluation fidelity
+    #: (``Problem.evaluate_proxy``), and how. "off" -- the default -- leaves
+    #: the loop byte-identical to the pre-proxy seam and is what every problem
+    #: without a cheap fidelity gets regardless. "rows" buys gate evidence at
+    #: the cheap fidelity, "screen" lets the cheap fidelity compete as a
+    #: surrogate under the gate, "both" does both. Proxy evaluations are
+    #: counted in their own ledger and are NEVER charged to
+    #: ``evaluation_budget``: the budget the claims are denominated in counts
+    #: real evaluations, and a cheap one is not one of them.
+    proxy_fidelity: str = "off"
+    #: A hard ceiling on proxy evaluations for the whole run. None -- no
+    #: ceiling. A consumer that exhausts it degrades to "no proxy".
+    proxy_ceiling: Optional[int] = None
 
 
 def domination_rank(
@@ -224,6 +237,21 @@ def run_genetic_loop(
         return max(0, config.evaluation_budget - spent())
 
     from agent_evolve.policies.search_state import SearchState
+
+    # --- the cheaper evaluation fidelity, if the problem has one -----------
+    # The source holds the problem's `evaluate_proxy` bound method and nothing
+    # else -- no problem, no cache, no budget -- so a proxy evaluation has no
+    # route to a charge. It is attached to the SCREEN, which is the only
+    # consumer that can use cheap evidence without putting it in the archive.
+    proxy_source: Any = None
+    if config.proxy_fidelity != "off" and config.screening is not None:
+        from agent_evolve.session.fidelity import ProxySource
+
+        proxy_source = ProxySource.for_problem(
+            problem, ceiling=config.proxy_ceiling)
+        if proxy_source is not None:
+            config.screening.attach_proxy(
+                proxy_source, mode=config.proxy_fidelity)
 
     all_valid: List[Any] = []
     all_meta: List[tuple] = []
@@ -453,6 +481,14 @@ def run_genetic_loop(
         # the budget -- the screen has no route to it by construction.
         screen_note: Optional[Dict[str, Any]] = None
         if config.screening is not None and kids:
+            # Cheap-fidelity evidence FIRST, so the gate this generation sees
+            # the rows the campaign could not afford. It buys evidence about
+            # THIS generation's candidates, which is the distribution the
+            # screen is about to rank, and it charges nothing.
+            if proxy_source is not None:
+                config.screening.prime(
+                    kids if pool_kids is None else pool_kids,
+                    [proxy_source.key(c) for c, _o in state.evaluated])
             active = config.screening.refresh(
                 list(state.evaluated), specs,
                 seed=(config.seed or 0) + gen)
@@ -570,10 +606,17 @@ def run_genetic_loop(
     if config.screening is not None:
         virtual = int(getattr(
             config.screening.telemetry, "virtual_evaluations", 0))
+    # Proxy evaluations are reported BESIDE the charged count, never inside
+    # it: `real_evaluations` is what the budget bought and what any
+    # evaluation-efficiency claim is denominated in.
+    proxy_evaluations = (0 if proxy_source is None
+                         else int(proxy_source.ledger.evaluations))
     return replace(result, telemetry=harvest_telemetry(
         (pick, prior_proposer_used, config.screening,
          getattr(config.screening, "author", None),
          config.portfolio, getattr(config.portfolio, "author", None),
-         config.generator, getattr(config.generator, "author", None)),
+         config.generator, getattr(config.generator, "author", None),
+         proxy_source),
         real_evaluations=spent(), virtual_evaluations=virtual,
+        proxy_evaluations=proxy_evaluations,
     ))
