@@ -17,6 +17,9 @@ from pydantic import BaseModel
 from agent_evolve import optimize
 from agent_evolve.core.problem import ObjectiveSpec, ValidationOutcome
 from agent_evolve.policies.surrogate import (
+    ORDERING_GATE,
+    PREDICTION_GATE,
+    GatePolicy,
     additive_surrogate,
     knn_surrogate,
     validate_surrogate,
@@ -124,6 +127,15 @@ def test_a_monotone_but_mse_poor_surrogate_still_passes_the_rank_term():
     )
 
 
+def _anti_ranker(evaluated, specs):
+    def predict(pool):
+        return [{"ones": 2.0 - 0.2 * sum(cfg["genome"]),
+                 "zeros": 4.0 + 0.2 * sum(cfg["genome"])}
+                for cfg in pool]
+
+    return predict
+
+
 def test_an_anti_ranking_surrogate_with_decent_mse_is_rejected():
     # The terra failure mode (study-2 trace read): on 8/14 losing seeds the
     # authored artifact PASSED the MSE-split gate and still hurt the
@@ -133,22 +145,20 @@ def test_an_anti_ranking_surrogate_with_decent_mse_is_rejected():
     # the train-mean baseline on every objective -- while ordering the
     # candidates exactly backwards. The old gate admitted this; the rank
     # term must reject it.
+    #
+    # The construction is a property of ONE split, so this pins the
+    # single-holdout scheme by name: it is the artifact that is on trial,
+    # not the sampling.
     def ones_row(count):
         return [1] * count + [0] * (6 - count)
 
     # seed=0 puts indices {1, 8, 9} in the holdout split of 12 rows.
     rows = [ones_row(c) for c in (4, 0, 5, 6, 4, 5, 6, 4, 1, 2, 5, 6)]
     skewed = _data(rows)
+    split = GatePolicy.for_purpose("prediction", scheme="holdout")
 
-    def anti_ranker(evaluated, specs):
-        def predict(pool):
-            return [{"ones": 2.0 - 0.2 * sum(cfg["genome"]),
-                     "zeros": 4.0 + 0.2 * sum(cfg["genome"])}
-                    for cfg in pool]
-
-        return predict
-
-    verdict = validate_surrogate(anti_ranker, skewed, SPECS, seed=0)
+    verdict = validate_surrogate(_anti_ranker, skewed, SPECS, seed=0,
+                                 policy=split)
     assert all(verdict.per_objective_mse[k] < verdict.baseline_mse[k]
                for k in ("ones", "zeros")), (
         "the test problem drifted: the MSE gate alone must admit this artifact"
@@ -159,13 +169,33 @@ def test_an_anti_ranking_surrogate_with_decent_mse_is_rejected():
         "an artifact that inverts the candidate ordering must not screen, "
         "however small its MSE"
     )
-    assert "rank" in verdict.detail
-    disabled = validate_surrogate(anti_ranker, skewed, SPECS, seed=0,
-                                  min_rank_correlation=-1.0)
+    assert "rank" in verdict.detail and verdict.reason == "rank"
+    disabled = validate_surrogate(_anti_ranker, skewed, SPECS, seed=0,
+                                  policy=split, min_rank_correlation=-1.0)
     assert disabled.passed, (
         "with the rank term disabled the MSE gate admits it: the rejection "
         "above is the rank term's doing, nothing else's"
     )
+
+
+def test_an_anti_ranking_surrogate_is_rejected_under_every_purpose():
+    """The rank term is the one thing no policy may switch off.
+
+    An artifact that inverts the ordering is exactly what a screen must
+    never be handed, so the ordering purpose -- the one that stopped
+    rejecting on magnitude -- must reject it at least as hard as the
+    prediction purpose does.
+    """
+
+    rows = [[1] * c + [0] * (6 - c) for c in (4, 0, 5, 6, 4, 5, 6, 4, 1, 2, 5, 6)]
+    skewed = _data(rows)
+    for policy in (PREDICTION_GATE, ORDERING_GATE,
+                   GatePolicy.for_purpose("ordering", scheme="holdout",
+                                          min_effective_holdout=2)):
+        verdict = validate_surrogate(_anti_ranker, skewed, SPECS, seed=0,
+                                     policy=policy)
+        assert not verdict.passed, policy
+        assert verdict.reason == "rank", policy
 
 
 # --- the screen --------------------------------------------------------------

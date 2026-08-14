@@ -277,9 +277,19 @@ def _build_screening(
 ) -> Optional[Any]:
     if config.surrogate == "off":
         return None
-    from agent_evolve.policies.surrogate import additive_surrogate, knn_surrogate
+    from agent_evolve.policies.surrogate import (
+        ORDERING_GATE,
+        additive_surrogate,
+        knn_surrogate,
+    )
     from agent_evolve.session.screening import Screening
 
+    # The screen sorts candidates and never reads a predicted magnitude, so
+    # it is gated on rank fidelity and arbitrated on error. The revision hook
+    # below must judge the artifact under the SAME policy, or the residual
+    # feedback the model receives describes a different bar from the one it
+    # is actually held to.
+    screening_gate = ORDERING_GATE
     builders: list = []
     author_note: Optional[SimpleNamespace] = None
     if config.surrogate == "llm":
@@ -343,7 +353,10 @@ def _build_screening(
             if current is None:
                 return None
             builder = authored_surrogate_builder(current, runtime)
-            verdict = validate_surrogate(builder, evaluated, specs, seed=1)
+            # Under the gate the SCREEN uses, or the feedback would describe a
+            # bar the artifact is not actually judged against.
+            verdict = validate_surrogate(builder, evaluated, specs, seed=1,
+                                         policy=screening_gate)
             try:
                 predictions = builder(list(evaluated), specs)(
                     [candidate_config for candidate_config, _obj in evaluated])
@@ -366,6 +379,7 @@ def _build_screening(
         exploration_floor=config.exploration_floor,
         revise=revise,
         max_training_rows=config.screen_training_rows,
+        gate=screening_gate,
     )
     if author_note is not None:
         # Harvested beside the screen's own counters: how authoring went is

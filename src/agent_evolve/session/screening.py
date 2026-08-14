@@ -6,6 +6,14 @@ never the evaluation cache -- so "the surrogate cannot spend budget" is a
 property of the import graph, not a convention. The only route from here to
 a real evaluation is that the loop measures the candidates this module
 merely ordered.
+
+Because ORDERING is the whole of what this module consumes, it validates its
+surrogates under :data:`~agent_evolve.policies.surrogate.ORDERING_GATE`:
+rank fidelity rejects, and the error ratio against the train-mean predictor
+is computed for arbitration among passers. The screen is the reason that
+distinction exists -- under a gate that also rejected on magnitude it went
+dark on the venues where saving an evaluation is worth anything, ordering 7
+of 186 generations on an expensive venue against 54% on a cheap one.
 """
 
 from __future__ import annotations
@@ -17,6 +25,8 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from agent_evolve.core.problem import ObjectiveSpec
 from agent_evolve.policies.surrogate import (
+    ORDERING_GATE,
+    GatePolicy,
     Predict,
     SurrogateBuilder,
     validate_surrogate,
@@ -128,6 +138,14 @@ def screen_offspring(
     predicted past the current front rises. Never scalarized. ``None`` (from
     the predictor, or on malformed predictions) means "screen nothing": the
     caller falls back to measuring its original picks.
+
+    This function consumes an ORDER and nothing else: the returned
+    ``predicted`` rows are telemetry, and the loop reads only ``order``. That
+    is why the gate this screen validates under is
+    :data:`~agent_evolve.policies.surrogate.ORDERING_GATE` -- rank fidelity
+    is what the output can be wrong about, and a calibration test on
+    magnitudes nobody reads can only reject artifacts that would have
+    ordered correctly.
     """
 
     if not pool:
@@ -164,21 +182,33 @@ def screen_offspring(
 class ScreeningTelemetry:
     """What the screen did, counted. Reaches the result via harvest."""
 
+    #: Why a builder was rejected, counted per (builder, split) verdict.
+    #: Without this a campaign cannot tell "the model is not predictive"
+    #: from "the gate never had enough data to look" -- which is exactly the
+    #: distinction that turned out to decide whether the mechanism runs at
+    #: all -- and every study that needed it had to monkeypatch the gate.
+    REJECTIONS = ("rejected_insufficient_rows", "rejected_insufficient_holdout",
+                  "rejected_rank", "rejected_error", "rejected_builder_failed",
+                  "rejected_no_predictions", "rejected_bad_prediction")
+
     __slots__ = ("refreshes", "validated", "rejected_validation", "screens",
                  "screen_failures", "virtual_evaluations", "chosen_llm",
-                 "chosen_rule", "revisions", "revisions_accepted")
+                 "chosen_rule", "revisions", "revisions_accepted",
+                 "gate_calls") + REJECTIONS
 
     def __init__(self) -> None:
-        self.refreshes = 0
-        self.validated = 0
-        self.rejected_validation = 0
-        self.screens = 0
-        self.screen_failures = 0
-        self.virtual_evaluations = 0
-        self.chosen_llm = 0
-        self.chosen_rule = 0
-        self.revisions = 0
-        self.revisions_accepted = 0
+        for name in self.__slots__:
+            setattr(self, name, 0)
+
+    def record(self, verdict: Any) -> None:
+        """Count one gate verdict, passed or rejected and why."""
+
+        self.gate_calls += 1
+        if verdict.passed:
+            return
+        name = f"rejected_{verdict.reason or 'unknown'}"
+        if name in self.REJECTIONS:
+            setattr(self, name, getattr(self, name) + 1)
 
     def as_dict(self) -> dict[str, int]:
         return {name: getattr(self, name) for name in self.__slots__}
@@ -204,6 +234,7 @@ class Screening:
         revise: Any = None,
         max_revisions: int = 2,
         max_training_rows: int = 1024,
+        gate: GatePolicy = ORDERING_GATE,
     ) -> None:
         if pool_factor < 2:
             raise ValueError(f"pool_factor must be at least 2, got {pool_factor}")
@@ -219,10 +250,21 @@ class Screening:
             raise ValueError(
                 f"validation_splits must be at least 1, got {validation_splits}"
             )
+        if not isinstance(gate, GatePolicy):
+            raise TypeError(f"gate must be a GatePolicy, got {type(gate).__name__}")
         self.builders = tuple(builders)
         self.pool_factor = int(pool_factor)
         self.exploration_floor = float(exploration_floor)
         self.validation_splits = int(validation_splits)
+        #: What this consumer relies on, declared to the gate rather than
+        #: assumed by it. The screen consumes an ORDER (`screen_offspring`
+        #: reads `report.order` and nothing else), so rank fidelity is the
+        #: hard term and the error ratio arbitrates among passers. Overriding
+        #: this with a prediction-purpose policy restores the historical
+        #: behaviour, at the historical cost: a magnitude test on a small
+        #: holdout rejects most of the artifacts that would have ordered
+        #: correctly.
+        self.gate = gate
         #: The evolving-surrogate hook: called with (evaluated, specs) when
         #: the llm builder exists and did not win this refresh, at most
         #: max_revisions times per run. Returns a replacement
@@ -257,20 +299,24 @@ class Screening:
         """Re-arbitrate: today's data decides WHO may screen, if anyone.
 
         Every builder is validated on ``validation_splits`` INDEPENDENT
-        held-out splits and must pass the gate on EVERY one; among the
-        survivors, the lowest median mse/baseline ratio wins the generation.
-        The all-splits requirement is the variance guard the ladder1 E2 row
-        demanded: a high-variance authored artifact can pass one small
-        holdout by luck and then mis-screen mid-run -- measured at the
+        re-partitions of today's data and must pass ``self.gate`` on EVERY
+        one; among the survivors, the lowest median mse/baseline ratio wins
+        the generation. The all-splits requirement is the variance guard the
+        ladder1 E2 row demanded: a high-variance authored artifact can pass
+        one partition by luck and then mis-screen mid-run -- measured at the
         cheapest scale, where authored screening HURT the endpoint under the
-        single-split gate. Surviving every split of today's data is the
-        in-loop generalization of "pass on both frozen datasets
-        independently". Best-passing across splits stays the arbitration:
-        listing the authored builder first would be trust, this is
-        measurement. The gate's rank-agreement term applies on every split
-        too, but it only GATES -- the ratio arbitrating among passers stays
-        pure mse/baseline (rank-unfaithful passers were the measured
-        failure, not mis-ranking among passers).
+        single-split gate. Surviving every re-partition of today's data is
+        the in-loop generalization of "pass on both frozen datasets
+        independently"; under cross-validation each split already scores the
+        artifact on every row, so what the splits vary is which rows it was
+        FITTED on, which is the instability the guard exists to catch.
+        Best-passing across splits stays the arbitration: listing the
+        authored builder first would be trust, this is measurement. The
+        gate's rank-agreement term applies on every split too, but it only
+        GATES -- the ratio arbitrating among passers stays pure mse/baseline
+        (rank-unfaithful passers were the measured failure, not mis-ranking
+        among passers), and under the ordering purpose that ratio is the ONLY
+        thing the error term does.
 
         Only the most recent ``max_training_rows`` measurements take part:
         see that field for why a refresh must not grow with the run.
@@ -287,16 +333,13 @@ class Screening:
             failed = False
             for split in range(self.validation_splits):
                 verdict = validate_surrogate(
-                    builder, data, specs, seed=seed + split * 7919)
+                    builder, data, specs, policy=self.gate,
+                    seed=seed + split * 7919)
+                self.telemetry.record(verdict)
                 if not verdict.passed:
                     failed = True
                     break
-                per = [
-                    verdict.per_objective_mse[objective]
-                    / verdict.baseline_mse[objective]
-                    for objective in verdict.per_objective_mse
-                    if verdict.baseline_mse[objective] > 0.0
-                ]
+                per = list(verdict.mse_ratio.values())
                 ratios.append(sum(per) / len(per) if per else 1.0)
             if failed:
                 self.telemetry.rejected_validation += 1
