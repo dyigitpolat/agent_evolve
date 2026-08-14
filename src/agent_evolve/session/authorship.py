@@ -86,6 +86,32 @@ class AuthorshipConfig:
     #: One-shot authoring is what the ladder cells measure; revision LEVELS
     #: the rungs (W3), so it is capped here and ablatable to 0.
     generation_revisions: int = 1
+    #: MEASUREMENT-CONDITIONED RE-AUTHORING. After the archive grows by this
+    #: many CHARGED evaluations, the generator is re-authored against the
+    #: run's own measured trace -- the front, what improved, which parameter
+    #: the measurements say moves which cost -- instead of against emission
+    #: counters. ``0`` (the default) is the static-prior seam every sealed row
+    #: to date ran, and off is byte-identical to it: no evidence call fires,
+    #: no evidence is rendered, no counter moves.
+    #:
+    #: This is the channel `generation_revisions` is not. Revision fires on
+    #: EMISSION DEFECTS (rejects, collapse, no survivors); a generator drawing
+    #: valid candidates out of a region already measured to be bad is not
+    #: deficient by that test and is never revised. The cadence is declared
+    #: here, in evaluations, so a campaign states it rather than inheriting a
+    #: number from a code path.
+    generation_reauthor_every: int = 0
+    #: How many measurement-conditioned re-authorings one run may pay for.
+    generation_reauthorings: int = 0
+    #: THE LOCUS-IMPORTANCE CHANNEL. On the same cadence, ask the model which
+    #: parameters and values the measurements justify concentrating the
+    #: remaining budget on, type the answer as a narrowing of the DECLARED
+    #: domains, and let the gate refuse it (see
+    #: policies.measurement_evidence.admit_locus_prior). Requires a cadence.
+    generation_locus_prior: bool = False
+    #: How many priors one run may have admitted, and how far one may narrow.
+    generation_locus_priors: int = 1
+    generation_prior_max_narrowing_log10: float = 2.0
     limits: RuntimeLimits = field(default_factory=RuntimeLimits)
 
     def __post_init__(self) -> None:
@@ -109,6 +135,21 @@ class AuthorshipConfig:
                 f"authorship.generation must be one of {_GENERATION}, got "
                 f"{self.generation!r}"
             )
+        if self.generation_reauthor_every < 0:
+            raise ValueError(
+                "authorship.generation_reauthor_every is a cadence in charged "
+                "evaluations and must be non-negative, got "
+                f"{self.generation_reauthor_every}")
+        if self.generation_locus_prior and self.generation_reauthor_every <= 0:
+            raise ValueError(
+                "authorship.generation_locus_prior is authored from the "
+                "measured trace on the generation_reauthor_every cadence; set "
+                "that cadence, or the prior would fire on no declared rule")
+        if (self.generation_reauthor_every or self.generation_reauthorings
+                or self.generation_locus_prior) and self.generation == "off":
+            raise ValueError(
+                "the measurement-conditioned channel re-authors the GENERATOR; "
+                "it needs authorship.generation='llm'")
         if self.generation != "off" and self.operators != "off":
             # Both construct the generation's candidates. Accepting the pair
             # would silently run one of them and bill the caller for two.
@@ -265,6 +306,14 @@ def _build_generator(
         return revise_generator(complete, artifact=current, feedback=feedback,
                                 telemetry=telemetry)
 
+    def reauthor(current: Any, evidence: str) -> Any:
+        # The OTHER channel: the same artifact, the same gate, and a prompt
+        # carrying the run's measured trace instead of its emission counters.
+        from agent_evolve.policies.llm_generator import reauthor_generator
+        return reauthor_generator(complete, artifact=current,
+                                  evidence=evidence, telemetry=telemetry)
+
+    conditioned = config.generation_reauthor_every > 0
     generator = AuthoredGenerator(
         artifact,
         AuthoredRuntime(limits=config.limits),
@@ -272,6 +321,15 @@ def _build_generator(
         pool_size=config.generation_pool_size,
         revise=revise if config.generation_revisions > 0 else None,
         max_revisions=config.generation_revisions,
+        objectives=tuple(objectives),
+        reauthor=(reauthor if conditioned
+                  and config.generation_reauthorings > 0 else None),
+        reauthor_every=config.generation_reauthor_every,
+        max_reauthorings=config.generation_reauthorings,
+        prior_author=(complete if conditioned
+                      and config.generation_locus_prior else None),
+        max_priors=config.generation_locus_priors,
+        prior_max_narrowing_log10=config.generation_prior_max_narrowing_log10,
     )
     generator.author = author_note
     return generator, None
