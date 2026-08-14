@@ -388,3 +388,36 @@ def test_a_negative_ceiling_is_refused():
 
 def test_ledger_dict_is_all_integers():
     assert all(isinstance(v, int) for v in ProxyLedger().as_dict().values())
+
+
+def test_one_refused_candidate_does_not_blind_the_screen_to_the_rest():
+    """A pool member the cheap fidelity refuses is ranked LAST, not fatal."""
+
+    class _Picky(_Additive):
+        def evaluate_proxy(self, config):
+            self.proxy_calls += 1
+            if config["x0"] == 3:
+                raise RuntimeError("the cheap simulator refuses this one")
+            return {"cost": self._cost(config), "mass": self._mass(config)}
+
+    problem = _Picky()
+    source = ProxySource.for_problem(problem)
+    predict = proxy_fidelity_builder(source)([], problem.objectives)
+    pool = [{f"x{i}": 0 for i in range(problem.n_loci)},
+            {f"x{i}": 1 for i in range(problem.n_loci)},
+            dict({f"x{i}": 0 for i in range(problem.n_loci)}, x0=3)]
+    predicted = predict(pool)
+    assert predicted is not None and len(predicted) == 3
+    # the refused one is worse than every candidate the proxy could measure
+    assert predicted[2]["cost"] > max(predicted[0]["cost"], predicted[1]["cost"])
+    assert predicted[2]["mass"] > max(predicted[0]["mass"], predicted[1]["mass"])
+
+
+def test_a_pool_the_cheap_fidelity_refuses_entirely_screens_nothing():
+    class _Refuses(_Additive):
+        def evaluate_proxy(self, config):
+            raise RuntimeError("no")
+
+    source = ProxySource.for_problem(_Refuses())
+    predict = proxy_fidelity_builder(source)([], _Refuses().objectives)
+    assert predict([{"x0": 1}, {"x0": 2}]) is None

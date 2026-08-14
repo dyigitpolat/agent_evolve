@@ -205,14 +205,32 @@ def proxy_fidelity_builder(source: ProxySource) -> Callable[..., Any]:
     """
 
     def build(rows: Any, specs: Any) -> Callable[[Sequence[Config]], Any]:
+        names = [spec.name for spec in specs]
+        goals = {spec.name: spec.goal for spec in specs}
+
         def predict(configs: Sequence[Config]) -> Any:
-            out = []
+            out: list[Optional[Dict[str, float]]] = []
             for config in configs:
-                values = source.evaluate(config)
-                if values is None:
-                    return None            # no cheap answer -> screen nothing
-                out.append(values)
-            return out
+                out.append(source.evaluate(config))
+            got = [row for row in out if row is not None]
+            if not got:
+                return None          # no cheap answer at all -> screen nothing
+            if len(got) == len(out):
+                return out
+            # A candidate the cheap fidelity REFUSES is ranked last, not
+            # dropped: refusing one member of a pool must not blind the screen
+            # to the other n-1. This mirrors what the expensive evaluator
+            # already does with an infeasible candidate -- it returns a
+            # penalty vector rather than nothing -- and it keeps the returned
+            # sequence aligned with the pool the caller passed in.
+            worst: Dict[str, float] = {}
+            for name in names:
+                values = [row[name] for row in got]
+                span = max(values) - min(values)
+                pad = abs(span) * 0.1 + (abs(max(values, key=abs)) * 1e-9) + 1e-12
+                worst[name] = (max(values) + pad if goals.get(name) == "min"
+                               else min(values) - pad)
+            return [dict(worst) if row is None else row for row in out]
 
         return predict
 
