@@ -55,11 +55,12 @@ __all__ = [
     "locus_effects",
     "render_measurement_evidence",
     "evidence_digest",
-    "LocusPrior",
+    "WeightedRestriction",
     "PriorVerdict",
-    "parse_locus_prior",
-    "admit_locus_prior",
-    "LOCUS_PRIOR_PROMPT",
+    "parse_weighted_restriction",
+    "admit_weighted_restriction",
+    "apply_weighted_restriction",
+    "WEIGHTED_RESTRICTION_PROMPT",
 ]
 
 #: One measured candidate: its configuration, what the evaluator returned,
@@ -290,9 +291,11 @@ def evidence_digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-# ===================================================== the locus-importance channel
 
-LOCUS_PRIOR_PROMPT = """You are advising a black-box multi-objective \
+
+# ================================================ the locus-importance channel
+
+WEIGHTED_RESTRICTION_PROMPT = """You are advising a black-box multi-objective \
 optimizer about WHERE IN ITS SEARCH SPACE to concentrate the rest of its
 evaluations.
 
@@ -307,36 +310,54 @@ WHAT THE OPTIMIZER HAS ACTUALLY MEASURED SO FAR:
 {evidence}
 
 Read the measurements, not the parameter names. Decide which parameters
-actually move the measured costs, and for those parameters which values are
-worth spending the remaining budget on.
+actually move the measured costs, and for those parameters how much of the
+remaining budget each value deserves.
 
 Reply with ONLY a JSON object, no prose and no code fence, of this shape:
 
-{{"restrict": {{"<parameter>": ["<value>", ...], ...}},
+{{"weight": {{"<parameter>": {{"<value>": <positive number>, ...}}, ...}},
  "because": {{"<parameter>": "<one short sentence citing the measurements>"}}}}
 
 Rules, and the harness checks every one of them:
 - Name ONLY parameters that appear in the search space above, and ONLY values
   that parameter declares. Anything else and the whole reply is REFUSED.
-- You may only NARROW. Every value you drop is a value the optimizer will not
-  sample again this run, so a parameter you cannot justify from the
-  measurements should simply be left out.
-- Never drop a value that a current non-dominated front member holds. The
-  harness refuses the whole reply if you do -- excluding a measured optimum is
-  the one failure that cannot be recovered from.
-- Leave "restrict" empty if the measurements do not justify narrowing
-  anything. An honest empty answer is accepted and costs nothing."""
+- Weights BIAS sampling; they exclude nothing. A value you do not mention
+  keeps weight 1. Every declared value stays reachable no matter what you
+  reply, so you cannot lose the optimum -- but you can waste budget, so
+  weight only what the measurements justify.
+- Weights must be positive numbers, and within one parameter the heaviest
+  value may outweigh the lightest by at most {max_ratio}x (unmentioned values
+  count as weight 1). More concentration than that and the whole reply is
+  REFUSED: concentration is the point; a de-facto exclusion is not.
+- Leave "weight" empty if the measurements do not justify biasing anything.
+  An honest empty answer is accepted and costs nothing."""
 
 
 @dataclass(frozen=True)
-class LocusPrior:
-    """A model-authored narrowing of declared domains, with its reasons."""
+class WeightedRestriction:
+    """A model-authored GRADED bias over declared domains, with its reasons.
 
-    restrict: Mapping[str, Tuple[Any, ...]] = ()
+    The graded replacement for the hard-restriction prior: per-locus VALUE
+    WEIGHTS that bias where sampling mass lands and exclude NOTHING. Every
+    declared value keeps positive weight (implicitly ``1.0`` when the model
+    does not name it), so the one unrecoverable failure of the hard form --
+    a restriction that excludes a measured optimum -- is structurally
+    impossible rather than gated against: the ``excludes_front`` predicate is
+    satisfied vacuously because nothing is ever excluded, and the
+    vacuous-or-veto pathology it had on large fronts (W1: 81% of a trace
+    non-dominated leaves a median of ZERO unexplored values in any admissible
+    hard restriction) cannot occur.
+    """
+
+    #: parameter -> {value token -> weight}. Positive, finite, capped in
+    #: ratio by the gate. Values a parameter declares but the mapping does
+    #: not name carry an implicit weight of 1.0.
+    weight: Mapping[str, Mapping[str, float]] = ()
     because: Mapping[str, str] = ()
 
     def as_note(self) -> Dict[str, Any]:
-        return {"restrict": {k: list(v) for k, v in dict(self.restrict).items()},
+        return {"weight": {k: {t: float(w) for t, w in dict(v).items()}
+                           for k, v in dict(self.weight).items()},
                 "because": dict(self.because)}
 
 
@@ -346,25 +367,27 @@ class PriorVerdict:
 
     admitted: bool
     reason: str = ""
-    prior: Optional[LocusPrior] = None
-    #: log10 of the factor the surviving space is smaller by.
-    narrowing: float = 0.0
+    prior: Optional[WeightedRestriction] = None
+    #: The largest max/min weight ratio any one parameter carries, implicit
+    #: weights included. ``1.0`` is "biases nothing".
+    concentration: float = 1.0
 
     def as_note(self) -> Dict[str, Any]:
         note: Dict[str, Any] = {"admitted": bool(self.admitted),
                                 "reason": self.reason,
-                                "narrowing_log10": round(self.narrowing, 4)}
+                                "concentration": round(self.concentration, 4)}
         if self.prior is not None:
             note.update(self.prior.as_note())
         return note
 
 
-def parse_locus_prior(text: str) -> Optional[LocusPrior]:
-    """The model's reply as a typed prior, or ``None`` if it is not one.
+def parse_weighted_restriction(text: str) -> Optional[WeightedRestriction]:
+    """The model's reply as a typed restriction, or ``None`` if it is not one.
 
     Whole-reply acceptance, exactly as the authored-artifact gate does it: a
-    reply that is not a JSON object of the declared shape is not repaired into
-    one, because a repaired prior is a prior nobody authored.
+    reply that is not a JSON object of the declared shape -- weights as
+    numbers, per parameter, per value -- is not repaired into one, because a
+    repaired prior is a prior nobody authored.
     """
 
     if not isinstance(text, str):
@@ -383,107 +406,126 @@ def parse_locus_prior(text: str) -> Optional[LocusPrior]:
         return None
     if not isinstance(parsed, dict):
         return None
-    restrict = parsed.get("restrict")
-    if restrict is None:
-        restrict = {}
-    if not isinstance(restrict, dict):
+    weight = parsed.get("weight")
+    if weight is None:
+        weight = {}
+    if not isinstance(weight, dict):
         return None
-    typed: Dict[str, Tuple[Any, ...]] = {}
-    for name, values in restrict.items():
-        if not isinstance(values, list):
+    typed: Dict[str, Dict[str, float]] = {}
+    for name, values in weight.items():
+        if not isinstance(values, dict):
             return None
-        typed[str(name)] = tuple(values)
+        entry: Dict[str, float] = {}
+        for token, w in values.items():
+            if isinstance(w, bool) or not isinstance(w, (int, float)):
+                return None
+            entry[str(token)] = float(w)
+        typed[str(name)] = entry
     because = parsed.get("because") or {}
     if not isinstance(because, dict):
         because = {}
-    return LocusPrior(restrict=typed,
-                      because={str(k): str(v) for k, v in because.items()})
+    return WeightedRestriction(
+        weight=typed, because={str(k): str(v) for k, v in because.items()})
 
 
-def admit_locus_prior(
-    prior: Optional[LocusPrior],
+def admit_weighted_restriction(
+    prior: Optional[WeightedRestriction],
     *,
     domains: Mapping[str, Sequence[Any]],
-    front: Sequence[MeasuredRow] = (),
-    max_narrowing_log10: float = 2.0,
-    min_values_kept: int = 1,
+    max_weight_ratio: float = 8.0,
 ) -> PriorVerdict:
-    """Refuse, or admit with the narrowing measured. Never repair.
+    """Refuse, or admit with the concentration measured. Never repair.
 
-    Five refusals, in the order a wrong prior does damage:
+    Refusals, in the order a wrong prior does damage:
 
-    ``unparsed``      there is no typed prior to judge.
-    ``empty``         it narrows nothing, so there is nothing to measure and
-                      nothing to admit -- an honest no-op, recorded as one.
+    ``unparsed``      there is no typed restriction to judge.
+    ``empty``         it weights nothing (or weights everything equally), so
+                      there is nothing to measure and nothing to admit -- an
+                      honest no-op, recorded as one.
     ``undeclared``    a parameter or a value the schema never declared. The
                       whole reply goes, not the offending entry: a prior that
                       is wrong about the schema has not read the schema, and
                       dropping only the bad line would admit the rest on the
                       strength of an author that demonstrably guessed.
-    ``excludes_front``  it drops a value held by a MEASURED non-dominated
-                      member. This is the catastrophe the channel exists to
-                      be safe against -- a restriction that excludes the true
-                      optimum cannot be recovered from by any later
-                      generation -- so it is checked against the run's own
-                      measurements rather than argued about.
-    ``over_narrow``   it shrinks the space by more than
-                      ``max_narrowing_log10`` orders of magnitude, or empties
-                      a parameter below ``min_values_kept``. Concentration is
-                      the point; collapse is not.
+    ``invalid_weight``  a weight that is not a positive finite number. Same
+                      whole-reply rule.
+    ``over_concentrated``  some parameter's heaviest value outweighs its
+                      lightest (implicit ``1.0`` included) by more than
+                      ``max_weight_ratio``. The cap is what keeps a graded
+                      bias from becoming a de-facto exclusion.
+
+    What is NOT here, deliberately: ``excludes_front``. A weighted
+    restriction cannot exclude anything -- every declared value keeps
+    positive mass -- so the predicate the hard form had to gate on is
+    satisfied structurally, and the W1 vacuous-or-veto pathology (a large
+    front leaves nothing an admissible hard restriction may drop) has no
+    lever to act on.
     """
 
     if prior is None:
         return PriorVerdict(False, "unparsed")
-    restrict = {k: tuple(v) for k, v in dict(prior.restrict).items() if v is not None}
-    if not restrict:
+    weight = {k: dict(v) for k, v in dict(prior.weight).items() if v}
+    if not weight:
         return PriorVerdict(False, "empty", prior)
 
     declared = {str(k): [_token(v) for v in (values or ())]
                 for k, values in dict(domains).items()}
-    narrowing = 0.0
-    for name, values in restrict.items():
+    concentration = 1.0
+    for name, values in weight.items():
         if name not in declared or not declared[name]:
             return PriorVerdict(False, f"undeclared parameter {name!r}", prior)
         allowed = set(declared[name])
-        tokens = [_token(v) for v in values]
-        if not tokens or any(t not in allowed for t in tokens):
-            return PriorVerdict(False, f"undeclared value for {name!r}", prior)
-        kept = len(set(tokens))
-        if kept < min_values_kept:
-            return PriorVerdict(False, f"{name!r} kept {kept} values", prior)
-        if kept > len(allowed):                      # cannot happen; cheap guard
-            return PriorVerdict(False, f"{name!r} widens its domain", prior)
-        narrowing += math.log10(len(allowed) / kept) if kept else 0.0
+        for token, w in values.items():
+            if token not in allowed:
+                return PriorVerdict(
+                    False, f"undeclared value for {name!r}", prior)
+            if not math.isfinite(w) or w <= 0.0:
+                return PriorVerdict(
+                    False, f"invalid_weight for {name!r}", prior)
+        # Implicit 1.0 for every declared value the reply does not name.
+        full = [values.get(token, 1.0) for token in allowed]
+        ratio = max(full) / min(full)
+        concentration = max(concentration, ratio)
 
-    if narrowing <= 0.0:
-        return PriorVerdict(False, "empty", prior, narrowing)
-    for config, _objectives, _s in front:
-        for name, values in restrict.items():
-            tokens = {_token(v) for v in values}
-            for locus in loci_of(dict(config)):
-                if str(locus) != name:
-                    continue
-                if _token(read_locus(config, locus)) not in tokens:
-                    return PriorVerdict(
-                        False,
-                        f"excludes a measured front member at {name!r}",
-                        prior, narrowing)
-    if narrowing > max_narrowing_log10:
-        return PriorVerdict(False, f"over_narrow ({narrowing:.2f} decades)",
-                            prior, narrowing)
-    return PriorVerdict(True, "admitted", prior, narrowing)
+    if concentration <= 1.0:
+        return PriorVerdict(False, "empty", prior, concentration)
+    if concentration > float(max_weight_ratio):
+        return PriorVerdict(
+            False, f"over_concentrated ({concentration:.3g}x > "
+            f"{float(max_weight_ratio):g}x)", prior, concentration)
+    return PriorVerdict(True, "admitted", prior, concentration)
 
 
-def apply_locus_prior(
+def apply_weighted_restriction(
     domains: Mapping[str, Sequence[Any]],
-    prior: LocusPrior,
+    prior: WeightedRestriction,
 ) -> Dict[str, List[Any]]:
-    """*domains* narrowed by an ADMITTED *prior*. Narrows only, never empties."""
+    """*domains* with sampling mass biased by an ADMITTED *prior*.
 
-    out: Dict[str, List[Any]] = {k: list(v) for k, v in dict(domains).items()}
-    for name, values in dict(prior.restrict).items():
-        tokens = {_token(v) for v in values}
-        kept = [v for v in out.get(name, ()) if _token(v) in tokens]
-        if kept:
-            out[name] = kept
+    The bias is mechanical and sampler-agnostic: each declared value appears
+    in its locus's list a number of times proportional to its weight
+    (implicit ``1.0`` where unnamed), scaled so the lightest value appears
+    exactly once. A generator that draws uniformly from the list it is given
+    -- which is all the authored-sampler contract promises -- therefore lands
+    its mass where the weights say, and EVERY declared value remains present,
+    so nothing is excluded and validation against the declared domains never
+    sees an illegal value. The admission cap on the weight ratio is also the
+    cap on how long these lists can grow.
+    """
+
+    out: Dict[str, List[Any]] = {}
+    for name, values in dict(domains).items():
+        weights = dict(prior.weight or {}).get(name)
+        if not weights:
+            out[name] = list(values)
+            continue
+        per_value = [(v, float(weights.get(_token(v), 1.0))) for v in values]
+        lightest = min((w for _v, w in per_value), default=1.0)
+        if lightest <= 0.0:                       # admission forbids this;
+            out[name] = list(values)              # degrade, never divide by 0
+            continue
+        biased: List[Any] = []
+        for v, w in per_value:
+            biased.extend([v] * max(1, round(w / lightest)))
+        out[name] = biased
     return out

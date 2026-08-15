@@ -74,11 +74,13 @@ generator is re-authored against the measured
 ``(configuration -> objectives)`` trace -- the current front, what improved
 and what did not, and which parameter the measurements say moves which cost
 (:mod:`agent_evolve.policies.measurement_evidence`). ``locus_prior`` is the
-second consumer of the same evidence: the model names the parameters and
-values worth the remaining budget, the harness types the answer as a
-narrowing of the declared domains, and a GATE refuses it -- rather than
-trusts it -- whenever it is undeclared, empty, over-narrow, or excludes a
-value a measured non-dominated member holds.
+second consumer of the same evidence: the model weighs the parameters and
+values worth the remaining budget, the harness types the answer as a GRADED
+bias over the declared domains -- per-locus value weights that exclude
+NOTHING -- and a GATE refuses it, rather than trusts it, whenever it is
+undeclared, empty, garbage-weighted or concentrated past the declared
+weight-ratio cap. Because nothing is excluded, excluding a measured front
+member is structurally impossible rather than gated against.
 
 Both are OFF by default (``reauthor_every=0``), and off is the seam that ran
 every sealed row to date. Both record what evidence the model was shown (its
@@ -115,13 +117,12 @@ from agent_evolve.policies.llm_surrogate import (
     json_compact,
 )
 from agent_evolve.policies.measurement_evidence import (
-    LOCUS_PRIOR_PROMPT,
+    WEIGHTED_RESTRICTION_PROMPT,
     MeasuredRow,
-    admit_locus_prior,
-    apply_locus_prior,
+    admit_weighted_restriction,
+    apply_weighted_restriction,
     evidence_digest,
-    front_of,
-    parse_locus_prior,
+    parse_weighted_restriction,
     render_measurement_evidence,
 )
 
@@ -1036,7 +1037,7 @@ class AuthoredGenerator:
         evidence_effects_shown: int = 8,
         prior_author: Optional[Callable[[str], str]] = None,
         max_priors: int = 1,
-        prior_max_narrowing_log10: float = 2.0,
+        prior_max_weight_ratio: float = 8.0,
         prior_unwind_batches: int = 2,
     ) -> None:
         if pool_factor < 1:
@@ -1046,6 +1047,10 @@ class AuthoredGenerator:
         if reauthor_every < 0:
             raise ValueError(
                 f"reauthor_every must be non-negative, got {reauthor_every}")
+        if prior_max_weight_ratio < 1.0:
+            raise ValueError(
+                "prior_max_weight_ratio caps a graded prior's concentration "
+                f"and must be at least 1, got {prior_max_weight_ratio}")
         if prior_author is not None and reauthor_every <= 0:
             # The evidence channel has one cadence and both consumers ride it.
             # A prior asked for on no cadence would fire never or every
@@ -1098,7 +1103,7 @@ class AuthoredGenerator:
         #: The locus-importance channel, and the gate that refuses it.
         self.prior_author = prior_author
         self.max_priors = int(max_priors)
-        self.prior_max_narrowing_log10 = float(prior_max_narrowing_log10)
+        self.prior_max_weight_ratio = float(prior_max_weight_ratio)
         self.prior_unwind_batches = int(prior_unwind_batches)
         self.telemetry = GeneratorTelemetry()
         self.mechanism = "authored_generator"
@@ -1575,21 +1580,21 @@ class AuthoredGenerator:
             return
         self.telemetry.priors_proposed += 1
         evidence = self._render_evidence(rows, domains)
-        prompt = LOCUS_PRIOR_PROMPT.format(
+        prompt = WEIGHTED_RESTRICTION_PROMPT.format(
             goals="\n".join(f"  {s.name}: {s.goal}imise" for s in self.objectives),
             domains="\n".join(
                 f"  {name}: {json_compact(list(values))}"
                 for name, values in sorted(dict(domains).items())),
-            evidence=evidence)
+            evidence=evidence,
+            max_ratio=f"{float(self.prior_max_weight_ratio):g}")
         try:
             reply = self.prior_author(prompt)
         except Exception:
             reply = ""
-        verdict = admit_locus_prior(
-            parse_locus_prior(reply),
+        verdict = admit_weighted_restriction(
+            parse_weighted_restriction(reply),
             domains=domains,
-            front=front_of(rows, self.objectives),
-            max_narrowing_log10=self.prior_max_narrowing_log10)
+            max_weight_ratio=self.prior_max_weight_ratio)
         self._log("locus_prior", rows=len(rows), evidence=evidence,
                   emitted=(None if verdict.prior is None
                            else evidence_digest(json_compact(
@@ -1609,14 +1614,15 @@ class AuthoredGenerator:
         if self._prior is None:
             return {k: list(v) for k, v in dict(declared).items()}
         self._prior_batches += 1
-        return apply_locus_prior(declared, self._prior)
+        return apply_weighted_restriction(declared, self._prior)
 
     def _unwind_prior_if_it_stopped_paying(self) -> None:
         """An admitted prior is still a bet, and a bet must be checkable.
 
-        The gate refuses a prior that excludes a measured front member, which
-        is the only unrecoverable failure. Everything else it can only be
-        wrong about, so the prior is held only while it pays: after
+        A graded restriction cannot exclude a measured front member -- every
+        declared value keeps positive mass -- so nothing about it is
+        unrecoverable. It can still be WRONG, and wrong only shows up as
+        spend: the prior is held only while it pays. After
         ``prior_unwind_batches`` generations drawn under it with not one new
         survivor, it is dropped and the run finishes on the declared domains.
         """

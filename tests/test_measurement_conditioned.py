@@ -8,9 +8,11 @@ defend the three things that makes true rather than claimed:
 * what the model is SHOWN is a pure function of the measured trace, swappable
   through one declared parameter, so a shuffled-evidence control can be built
   without editing the product;
-* a model-authored RESTRICTION is refused by a gate rather than trusted, and
-  the one unrecoverable failure -- excluding a measured optimum -- is checked
-  against the run's own front.
+* a model-authored RESTRICTION is refused by a gate rather than trusted, is
+  GRADED -- per-locus value weights that bias sampling and exclude nothing,
+  so the one unrecoverable failure of the hard form (excluding a measured
+  optimum) is structurally impossible -- capped in concentration, and
+  unwound when it stops producing survivors.
 """
 
 from __future__ import annotations
@@ -26,12 +28,12 @@ from agent_evolve.core.problem import ObjectiveSpec
 from agent_evolve.infrastructure.authored_runtime import AuthoredRuntime
 from agent_evolve.policies.llm_generator import AuthoredGenerator
 from agent_evolve.policies.measurement_evidence import (
-    LocusPrior,
-    admit_locus_prior,
-    apply_locus_prior,
+    WeightedRestriction,
+    admit_weighted_restriction,
+    apply_weighted_restriction,
     front_of,
     locus_effects,
-    parse_locus_prior,
+    parse_weighted_restriction,
     render_measurement_evidence,
     spearman,
 )
@@ -304,75 +306,94 @@ def _front():
 
 @pytest.mark.parametrize("reply, reason", [
     ("not json at all", "unparsed"),
-    ('{"restrict": {}}', "empty"),
-    ('{"restrict": {"nosuch": ["a"]}}', "undeclared parameter"),
-    ('{"restrict": {"knob": ["zzz"]}}', "undeclared value"),
-    ('{"restrict": {"knob": []}}', "undeclared value"),
+    ('{"weight": {"knob": ["a"]}}', "unparsed"),         # list where a map goes
+    ('{"weight": {"knob": {"a": "big"}}}', "unparsed"),  # weight not a number
+    ('{"weight": {}}', "empty"),
+    ('{"weight": {"knob": {"a": 1, "b": 1}}}', "empty"),  # equal = biases nothing
+    ('{"weight": {"nosuch": {"a": 2}}}', "undeclared parameter"),
+    ('{"weight": {"knob": {"zzz": 2}}}', "undeclared value"),
+    ('{"weight": {"knob": {"a": 0}}}', "invalid_weight"),
+    ('{"weight": {"knob": {"a": -3}}}', "invalid_weight"),
 ])
 def test_the_gate_refuses_and_says_why(reply, reason):
-    verdict = admit_locus_prior(parse_locus_prior(reply), domains=DOMAINS)
+    verdict = admit_weighted_restriction(parse_weighted_restriction(reply),
+                                         domains=DOMAINS)
     assert not verdict.admitted
     assert verdict.reason.startswith(reason)
 
 
-def test_the_gate_refuses_a_prior_that_excludes_a_measured_front_member():
+def test_the_gate_refuses_an_over_concentrated_prior():
+    prior = WeightedRestriction(weight={"knob": {"a": 16.0}})
+    refused = admit_weighted_restriction(prior, domains=DOMAINS,
+                                         max_weight_ratio=8.0)
+    assert not refused.admitted
+    assert refused.reason.startswith("over_concentrated")
+    assert refused.concentration == 16.0
+    admitted = admit_weighted_restriction(prior, domains=DOMAINS,
+                                          max_weight_ratio=16.0)
+    assert admitted.admitted
+
+
+def test_an_admissible_prior_structurally_excludes_nothing():
+    # The graded form has no excludes_front refusal to test, because there is
+    # nothing it COULD exclude: whatever the weights, every declared value
+    # keeps positive mass. This is the structural fix for W1's vacuous-or-veto
+    # pathology -- assert it on the applied domains, where it is load-bearing.
     front = _front()
     best = front[0][0]["knob"]
-    other = [v for v in DOMAINS["knob"] if v != best][:2]
-    verdict = admit_locus_prior(
-        LocusPrior(restrict={"knob": tuple(other)}), domains=DOMAINS, front=front)
-    assert not verdict.admitted
-    assert "excludes a measured front member" in verdict.reason
+    others = {v: 8.0 for v in DOMAINS["knob"] if v != best}
+    verdict = admit_weighted_restriction(
+        WeightedRestriction(weight={"knob": others}), domains=DOMAINS)
+    assert verdict.admitted                     # the hard form had to veto this
+    biased = apply_weighted_restriction(DOMAINS, verdict.prior)
+    for name, declared in DOMAINS.items():
+        assert set(biased[name]) == set(declared)   # nothing excluded, ever
 
 
-def test_the_gate_refuses_an_over_narrow_prior():
-    wide = {f"k{i}": [f"v{j}" for j in range(10)] for i in range(3)}
-    prior = LocusPrior(restrict={name: ("v0",) for name in wide})
-    assert not admit_locus_prior(prior, domains=wide,
-                                 max_narrowing_log10=2.0).admitted
-    assert admit_locus_prior(prior, domains=wide,
-                             max_narrowing_log10=4.0).admitted
-
-
-def test_the_gate_admits_a_narrowing_that_keeps_the_front():
-    front = _front()
-    best = front[0][0]["knob"]
-    verdict = admit_locus_prior(
-        LocusPrior(restrict={"knob": (best, "b")}), domains=DOMAINS, front=front)
+def test_the_gate_admits_a_measured_bias_and_reports_its_concentration():
+    verdict = admit_weighted_restriction(
+        WeightedRestriction(weight={"knob": {"a": 4.0, "b": 2.0}}),
+        domains=DOMAINS)
     assert verdict.admitted
-    assert verdict.narrowing > 0
+    assert verdict.concentration == 4.0          # implicit 1.0 on c and d
 
 
 def test_one_bad_entry_refuses_the_whole_reply_rather_than_being_dropped():
-    prior = parse_locus_prior(
-        '{"restrict": {"knob": ["a", "b"], "other": ["nope"]}}')
-    verdict = admit_locus_prior(prior, domains=DOMAINS)
+    prior = parse_weighted_restriction(
+        '{"weight": {"knob": {"a": 2, "b": 2}, "other": {"nope": 2}}}')
+    verdict = admit_weighted_restriction(prior, domains=DOMAINS)
     assert not verdict.admitted
     assert verdict.prior is not None            # judged, not silently repaired
 
 
-def test_applying_a_prior_narrows_and_never_empties():
-    narrowed = apply_locus_prior(DOMAINS, LocusPrior(restrict={"knob": ("a", "b")}))
-    assert narrowed["knob"] == ["a", "b"]
-    assert narrowed["other"] == ["p", "q"]
-    untouched = apply_locus_prior(DOMAINS, LocusPrior(restrict={"knob": ("zz",)}))
-    assert untouched["knob"] == DOMAINS["knob"]
+def test_applying_a_prior_biases_mass_and_keeps_every_value():
+    biased = apply_weighted_restriction(
+        DOMAINS, WeightedRestriction(weight={"knob": {"a": 3.0, "b": 2.0}}))
+    assert biased["knob"].count("a") == 3
+    assert biased["knob"].count("b") == 2
+    assert biased["knob"].count("c") == 1 and biased["knob"].count("d") == 1
+    assert biased["other"] == ["p", "q"]        # unweighted loci untouched
 
 
 # ------------------------------------------------- the prior inside the loop
 
 def test_an_admitted_prior_moves_where_the_generator_SAMPLES():
     gen = generator(reauthor_every=4, max_priors=1,
-                    prior_author=lambda p: '{"restrict": {"knob": ["a", "b"]}}')
+                    prior_author=lambda p:
+                    '{"weight": {"knob": {"a": 8, "b": 8}}}')
     seed_front(gen)
     gen.propose(template=TEMPLATE, candidate_model=Candidate, restriction=None,
-                archive=[], want=4, rng=random.Random(0), seed=1)
+                archive=[], want=16, rng=random.Random(0), seed=1)
     assert gen.telemetry.priors_admitted == 1
     # What the GENERATOR emitted, not the pool it was topped up into: a short
     # pool is filled with schema-uniform draws over the DECLARED domains,
     # which is the credential-free fallback and not the generator's output.
+    # The bias is GRADED: mass concentrates on the weighted values but the
+    # unweighted ones stay reachable, so assert the shift, not an exclusion.
     assert gen.last_report is not None and gen.last_report.accepted
-    assert all(c["knob"] in ("a", "b") for c in gen.last_report.accepted)
+    knobs = [c["knob"] for c in gen.last_report.accepted]
+    weighted = sum(1 for k in knobs if k in ("a", "b"))
+    assert weighted > len(knobs) - weighted     # mass moved where the weights say
 
 
 def test_a_prior_narrows_sampling_and_not_what_is_LEGAL():
@@ -390,7 +411,7 @@ def propose(archive, n, domains, seed):
     gen = AuthoredGenerator(
         artifact(ignore_domains), AuthoredRuntime(), pool_factor=2,
         objectives=SPECS, reauthor_every=4, max_priors=1,
-        prior_author=lambda p: '{"restrict": {"knob": ["a"]}}')
+        prior_author=lambda p: '{"weight": {"knob": {"a": 4}}}')
     seed_front(gen)
     drive(gen, generations=4, want=4,
           cost=lambda c: float(DOMAINS["knob"].index(c["knob"])))
@@ -400,7 +421,8 @@ def propose(archive, n, domains, seed):
 
 def test_a_prior_that_stops_paying_is_unwound():
     gen = generator(reauthor_every=4, max_priors=1, prior_unwind_batches=1,
-                    prior_author=lambda p: '{"restrict": {"knob": ["a", "b"]}}')
+                    prior_author=lambda p:
+                    '{"weight": {"knob": {"a": 4, "b": 4}}}')
     seed_front(gen)
     # Nothing measured after the prior lands ever survives, so the bet stops
     # paying and the generator must finish on the declared domains.
@@ -411,7 +433,7 @@ def test_a_prior_that_stops_paying_is_unwound():
 
 def test_a_refused_prior_is_counted_and_never_installed():
     gen = generator(reauthor_every=4, max_priors=1,
-                    prior_author=lambda p: '{"restrict": {"knob": ["nope"]}}')
+                    prior_author=lambda p: '{"weight": {"knob": {"nope": 3}}}')
     drive(gen, generations=6, want=4)
     assert gen.telemetry.priors_proposed == 1
     assert gen.telemetry.priors_refused == 1

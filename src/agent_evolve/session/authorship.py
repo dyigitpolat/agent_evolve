@@ -123,13 +123,20 @@ class AuthorshipConfig:
     generation_reauthorings: int = 0
     #: THE LOCUS-IMPORTANCE CHANNEL. On the same cadence, ask the model which
     #: parameters and values the measurements justify concentrating the
-    #: remaining budget on, type the answer as a narrowing of the DECLARED
-    #: domains, and let the gate refuse it (see
-    #: policies.measurement_evidence.admit_locus_prior). Requires a cadence.
+    #: remaining budget on, type the answer as a GRADED bias over the
+    #: DECLARED domains -- per-locus value weights that exclude NOTHING --
+    #: and let the gate refuse it (see
+    #: policies.measurement_evidence.admit_weighted_restriction). Requires a
+    #: cadence. Because nothing is excluded, the prior can waste budget but
+    #: can never drop the optimum, and it is unwound when it stops producing
+    #: survivors.
     generation_locus_prior: bool = False
-    #: How many priors one run may have admitted, and how far one may narrow.
+    #: How many priors one run may have admitted, and the concentration cap:
+    #: within one parameter the heaviest value may outweigh the lightest by
+    #: at most this ratio, so a graded bias cannot become a de-facto
+    #: exclusion.
     generation_locus_priors: int = 1
-    generation_prior_max_narrowing_log10: float = 2.0
+    generation_prior_max_weight_ratio: float = 8.0
     limits: RuntimeLimits = field(default_factory=RuntimeLimits)
 
     def __post_init__(self) -> None:
@@ -158,6 +165,12 @@ class AuthorshipConfig:
                 "authorship.generation_reauthor_every is a cadence in charged "
                 "evaluations and must be non-negative, got "
                 f"{self.generation_reauthor_every}")
+        if self.generation_prior_max_weight_ratio < 1.0:
+            raise ValueError(
+                "authorship.generation_prior_max_weight_ratio caps how far a "
+                "graded prior may concentrate (heaviest over lightest value "
+                "of one parameter) and must be at least 1, got "
+                f"{self.generation_prior_max_weight_ratio}")
         if self.generation_locus_prior and self.generation_reauthor_every <= 0:
             raise ValueError(
                 "authorship.generation_locus_prior is authored from the "
@@ -376,7 +389,7 @@ def _build_generator(
         prior_author=(complete if conditioned
                       and config.generation_locus_prior else None),
         max_priors=config.generation_locus_priors,
-        prior_max_narrowing_log10=config.generation_prior_max_narrowing_log10,
+        prior_max_weight_ratio=config.generation_prior_max_weight_ratio,
     )
     holder["generator"] = generator
     generator.author = author_note
