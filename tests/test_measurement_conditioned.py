@@ -28,7 +28,7 @@ from agent_evolve.core.problem import ObjectiveSpec
 from agent_evolve.infrastructure.authored_runtime import AuthoredRuntime
 from agent_evolve.policies.llm_generator import AuthoredGenerator
 from agent_evolve.policies.measurement_evidence import (
-    WeightedRestriction,
+    WeightedProposal,
     admit_weighted_restriction,
     apply_weighted_restriction,
     front_of,
@@ -323,7 +323,7 @@ def test_the_gate_refuses_and_says_why(reply, reason):
 
 
 def test_the_gate_refuses_an_over_concentrated_prior():
-    prior = WeightedRestriction(weight={"knob": {"a": 16.0}})
+    prior = WeightedProposal(weight={"knob": {"a": 16.0}})
     refused = admit_weighted_restriction(prior, domains=DOMAINS,
                                          max_weight_ratio=8.0)
     assert not refused.admitted
@@ -343,8 +343,14 @@ def test_an_admissible_prior_structurally_excludes_nothing():
     best = front[0][0]["knob"]
     others = {v: 8.0 for v in DOMAINS["knob"] if v != best}
     verdict = admit_weighted_restriction(
-        WeightedRestriction(weight={"knob": others}), domains=DOMAINS)
+        WeightedProposal(weight={"knob": others}), domains=DOMAINS)
     assert verdict.admitted                     # the hard form had to veto this
+    # The admitted prior IS the package's generic graded form, and its
+    # support is the full declared domain: the generic `allowed` view -- the
+    # one the unwind test and structure record read -- excludes nothing.
+    from agent_evolve.policies.weighted_prior import WeightedRestriction
+    assert isinstance(verdict.prior, WeightedRestriction)
+    assert set(verdict.prior.allowed["knob"]) == set(DOMAINS["knob"])
     biased = apply_weighted_restriction(DOMAINS, verdict.prior)
     for name, declared in DOMAINS.items():
         assert set(biased[name]) == set(declared)   # nothing excluded, ever
@@ -352,7 +358,7 @@ def test_an_admissible_prior_structurally_excludes_nothing():
 
 def test_the_gate_admits_a_measured_bias_and_reports_its_concentration():
     verdict = admit_weighted_restriction(
-        WeightedRestriction(weight={"knob": {"a": 4.0, "b": 2.0}}),
+        WeightedProposal(weight={"knob": {"a": 4.0, "b": 2.0}}),
         domains=DOMAINS)
     assert verdict.admitted
     assert verdict.concentration == 4.0          # implicit 1.0 on c and d
@@ -363,12 +369,15 @@ def test_one_bad_entry_refuses_the_whole_reply_rather_than_being_dropped():
         '{"weight": {"knob": {"a": 2, "b": 2}, "other": {"nope": 2}}}')
     verdict = admit_weighted_restriction(prior, domains=DOMAINS)
     assert not verdict.admitted
-    assert verdict.prior is not None            # judged, not silently repaired
+    assert verdict.proposal is not None         # judged, not silently repaired
 
 
 def test_applying_a_prior_biases_mass_and_keeps_every_value():
-    biased = apply_weighted_restriction(
-        DOMAINS, WeightedRestriction(weight={"knob": {"a": 3.0, "b": 2.0}}))
+    verdict = admit_weighted_restriction(
+        WeightedProposal(weight={"knob": {"a": 3.0, "b": 2.0}}),
+        domains=DOMAINS)
+    assert verdict.admitted
+    biased = apply_weighted_restriction(DOMAINS, verdict.prior)
     assert biased["knob"].count("a") == 3
     assert biased["knob"].count("b") == 2
     assert biased["knob"].count("c") == 1 and biased["knob"].count("d") == 1

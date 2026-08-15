@@ -1596,9 +1596,9 @@ class AuthoredGenerator:
             domains=domains,
             max_weight_ratio=self.prior_max_weight_ratio)
         self._log("locus_prior", rows=len(rows), evidence=evidence,
-                  emitted=(None if verdict.prior is None
+                  emitted=(None if verdict.proposal is None
                            else evidence_digest(json_compact(
-                               verdict.prior.as_note()))),
+                               verdict.proposal.as_note()))),
                   accepted=verdict.admitted, verdict=verdict.as_note())
         if not verdict.admitted:
             self.telemetry.priors_refused += 1

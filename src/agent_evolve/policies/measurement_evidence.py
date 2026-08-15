@@ -55,7 +55,7 @@ __all__ = [
     "locus_effects",
     "render_measurement_evidence",
     "evidence_digest",
-    "WeightedRestriction",
+    "WeightedProposal",
     "PriorVerdict",
     "parse_weighted_restriction",
     "admit_weighted_restriction",
@@ -292,7 +292,6 @@ def evidence_digest(text: str) -> str:
 
 
 
-
 # ================================================ the locus-importance channel
 
 WEIGHTED_RESTRICTION_PROMPT = """You are advising a black-box multi-objective \
@@ -334,24 +333,18 @@ Rules, and the harness checks every one of them:
 
 
 @dataclass(frozen=True)
-class WeightedRestriction:
-    """A model-authored GRADED bias over declared domains, with its reasons.
+class WeightedProposal:
+    """The model's reply, typed and UNJUDGED: a weight table and its reasons.
 
-    The graded replacement for the hard-restriction prior: per-locus VALUE
-    WEIGHTS that bias where sampling mass lands and exclude NOTHING. Every
-    declared value keeps positive weight (implicitly ``1.0`` when the model
-    does not name it), so the one unrecoverable failure of the hard form --
-    a restriction that excludes a measured optimum -- is structurally
-    impossible rather than gated against: the ``excludes_front`` predicate is
-    satisfied vacuously because nothing is ever excluded, and the
-    vacuous-or-veto pathology it had on large fronts (W1: 81% of a trace
-    non-dominated leaves a median of ZERO unexplored values in any admissible
-    hard restriction) cannot occur.
+    This is the parse product, not the prior. The gate judges it, and only an
+    ADMITTED proposal becomes a
+    :class:`~agent_evolve.policies.weighted_prior.WeightedRestriction` -- the
+    package's one generic graded-prior form -- constructed over the FULL
+    declared domains with strictly positive weights, so it excludes nothing
+    by construction.
     """
 
-    #: parameter -> {value token -> weight}. Positive, finite, capped in
-    #: ratio by the gate. Values a parameter declares but the mapping does
-    #: not name carry an implicit weight of 1.0.
+    #: parameter -> {value token -> weight}, exactly as replied.
     weight: Mapping[str, Mapping[str, float]] = ()
     because: Mapping[str, str] = ()
 
@@ -367,7 +360,10 @@ class PriorVerdict:
 
     admitted: bool
     reason: str = ""
-    prior: Optional[WeightedRestriction] = None
+    proposal: Optional[WeightedProposal] = None
+    #: The admitted prior: the generic graded form, over the full declared
+    #: domains, every weight strictly positive. ``None`` unless admitted.
+    prior: Optional["WeightedRestriction"] = None
     #: The largest max/min weight ratio any one parameter carries, implicit
     #: weights included. ``1.0`` is "biases nothing".
     concentration: float = 1.0
@@ -376,13 +372,13 @@ class PriorVerdict:
         note: Dict[str, Any] = {"admitted": bool(self.admitted),
                                 "reason": self.reason,
                                 "concentration": round(self.concentration, 4)}
-        if self.prior is not None:
-            note.update(self.prior.as_note())
+        if self.proposal is not None:
+            note.update(self.proposal.as_note())
         return note
 
 
-def parse_weighted_restriction(text: str) -> Optional[WeightedRestriction]:
-    """The model's reply as a typed restriction, or ``None`` if it is not one.
+def parse_weighted_restriction(text: str) -> Optional[WeightedProposal]:
+    """The model's reply as a typed proposal, or ``None`` if it is not one.
 
     Whole-reply acceptance, exactly as the authored-artifact gate does it: a
     reply that is not a JSON object of the declared shape -- weights as
@@ -424,12 +420,12 @@ def parse_weighted_restriction(text: str) -> Optional[WeightedRestriction]:
     because = parsed.get("because") or {}
     if not isinstance(because, dict):
         because = {}
-    return WeightedRestriction(
+    return WeightedProposal(
         weight=typed, because={str(k): str(v) for k, v in because.items()})
 
 
 def admit_weighted_restriction(
-    prior: Optional[WeightedRestriction],
+    proposal: Optional[WeightedProposal],
     *,
     domains: Mapping[str, Sequence[Any]],
     max_weight_ratio: float = 8.0,
@@ -438,15 +434,15 @@ def admit_weighted_restriction(
 
     Refusals, in the order a wrong prior does damage:
 
-    ``unparsed``      there is no typed restriction to judge.
+    ``unparsed``      there is no typed proposal to judge.
     ``empty``         it weights nothing (or weights everything equally), so
                       there is nothing to measure and nothing to admit -- an
                       honest no-op, recorded as one.
     ``undeclared``    a parameter or a value the schema never declared. The
-                      whole reply goes, not the offending entry: a prior that
-                      is wrong about the schema has not read the schema, and
-                      dropping only the bad line would admit the rest on the
-                      strength of an author that demonstrably guessed.
+                      whole reply goes, not the offending entry: a proposal
+                      that is wrong about the schema has not read the schema,
+                      and dropping only the bad line would admit the rest on
+                      the strength of an author that demonstrably guessed.
     ``invalid_weight``  a weight that is not a positive finite number. Same
                       whole-reply rule.
     ``over_concentrated``  some parameter's heaviest value outweighs its
@@ -454,72 +450,90 @@ def admit_weighted_restriction(
                       ``max_weight_ratio``. The cap is what keeps a graded
                       bias from becoming a de-facto exclusion.
 
-    What is NOT here, deliberately: ``excludes_front``. A weighted
-    restriction cannot exclude anything -- every declared value keeps
-    positive mass -- so the predicate the hard form had to gate on is
-    satisfied structurally, and the W1 vacuous-or-veto pathology (a large
-    front leaves nothing an admissible hard restriction may drop) has no
-    lever to act on.
+    What is NOT here, deliberately: ``excludes_front``. The admitted prior is
+    a :class:`~agent_evolve.policies.weighted_prior.WeightedRestriction`
+    built over the FULL declared domain of every named parameter with
+    strictly positive weights, so its support IS the declared domain: it can
+    exclude nothing, the predicate the hard form had to gate on is satisfied
+    structurally, and the W1 vacuous-or-veto pathology (a large front leaves
+    nothing an admissible hard restriction may drop) has no lever to act on.
     """
 
-    if prior is None:
+    if proposal is None:
         return PriorVerdict(False, "unparsed")
-    weight = {k: dict(v) for k, v in dict(prior.weight).items() if v}
+    weight = {k: dict(v) for k, v in dict(proposal.weight).items() if v}
     if not weight:
-        return PriorVerdict(False, "empty", prior)
+        return PriorVerdict(False, "empty", proposal)
 
     declared = {str(k): [_token(v) for v in (values or ())]
                 for k, values in dict(domains).items()}
     concentration = 1.0
     for name, values in weight.items():
         if name not in declared or not declared[name]:
-            return PriorVerdict(False, f"undeclared parameter {name!r}", prior)
+            return PriorVerdict(
+                False, f"undeclared parameter {name!r}", proposal)
         allowed = set(declared[name])
         for token, w in values.items():
             if token not in allowed:
                 return PriorVerdict(
-                    False, f"undeclared value for {name!r}", prior)
+                    False, f"undeclared value for {name!r}", proposal)
             if not math.isfinite(w) or w <= 0.0:
                 return PriorVerdict(
-                    False, f"invalid_weight for {name!r}", prior)
+                    False, f"invalid_weight for {name!r}", proposal)
         # Implicit 1.0 for every declared value the reply does not name.
         full = [values.get(token, 1.0) for token in allowed]
         ratio = max(full) / min(full)
         concentration = max(concentration, ratio)
 
     if concentration <= 1.0:
-        return PriorVerdict(False, "empty", prior, concentration)
+        return PriorVerdict(False, "empty", proposal, concentration=concentration)
     if concentration > float(max_weight_ratio):
         return PriorVerdict(
             False, f"over_concentrated ({concentration:.3g}x > "
-            f"{float(max_weight_ratio):g}x)", prior, concentration)
-    return PriorVerdict(True, "admitted", prior, concentration)
+            f"{float(max_weight_ratio):g}x)", proposal,
+            concentration=concentration)
+
+    from agent_evolve.policies.weighted_prior import WeightedRestriction
+
+    weighted: Dict[str, Tuple[Tuple[Any, ...], Tuple[float, ...]]] = {}
+    for name, values in weight.items():
+        declared_values = tuple(dict(domains)[name])
+        weighted[name] = (declared_values,
+                          tuple(float(values.get(_token(v), 1.0))
+                                for v in declared_values))
+    return PriorVerdict(True, "admitted", proposal,
+                        prior=WeightedRestriction(weighted),
+                        concentration=concentration)
 
 
 def apply_weighted_restriction(
     domains: Mapping[str, Sequence[Any]],
-    prior: WeightedRestriction,
+    prior: "WeightedRestriction",
 ) -> Dict[str, List[Any]]:
     """*domains* with sampling mass biased by an ADMITTED *prior*.
 
-    The bias is mechanical and sampler-agnostic: each declared value appears
-    in its locus's list a number of times proportional to its weight
-    (implicit ``1.0`` where unnamed), scaled so the lightest value appears
-    exactly once. A generator that draws uniformly from the list it is given
-    -- which is all the authored-sampler contract promises -- therefore lands
-    its mass where the weights say, and EVERY declared value remains present,
-    so nothing is excluded and validation against the declared domains never
-    sees an illegal value. The admission cap on the weight ratio is also the
-    cap on how long these lists can grow.
+    The generic ``weights_for`` seam biases draws the HARNESS makes; an
+    authored sampler draws from whatever list it is handed, so for that path
+    the bias must live in the list itself. It is mechanical and
+    sampler-agnostic: each declared value appears a number of times
+    proportional to its weight (implicit ``1.0`` where unnamed), scaled so
+    the lightest value appears exactly once. A generator that draws uniformly
+    from the list it is given -- which is all the authored-sampler contract
+    promises -- therefore lands its mass where the weights say, and EVERY
+    declared value remains present, so nothing is excluded and validation
+    against the declared domains never sees an illegal value. The admission
+    cap on the weight ratio is also the cap on how long these lists can grow.
     """
 
+    entries = dict(getattr(prior, "weighted", {}) or {})
     out: Dict[str, List[Any]] = {}
     for name, values in dict(domains).items():
-        weights = dict(prior.weight or {}).get(name)
-        if not weights:
+        entry = entries.get(name)
+        if not entry:
             out[name] = list(values)
             continue
-        per_value = [(v, float(weights.get(_token(v), 1.0))) for v in values]
+        table = {_token(v): float(w) for v, w in zip(*entry)}
+        per_value = [(v, table.get(_token(v), 1.0)) for v in values]
         lightest = min((w for _v, w in per_value), default=1.0)
         if lightest <= 0.0:                       # admission forbids this;
             out[name] = list(values)              # degrade, never divide by 0
