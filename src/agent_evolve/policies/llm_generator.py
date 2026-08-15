@@ -57,6 +57,33 @@ things the HARNESS already knows and the model was left to re-derive:
 
 Each is counted separately, ablatable separately, and off restores the
 sealed behaviour exactly.
+
+Two of those channels fire on EMISSION DEFECTS -- a rejected candidate, a
+collapsed batch, a generator whose children never survive. That is a repair
+loop for a broken sampler, and it is not the same thing as guidance: a
+generator that emits perfectly valid candidates from a region the run has
+already measured to be bad is never revised at all, because nothing about it
+is defective. The prior it encodes is STATIC -- written once from the semantic
+card, in a ladder cell from an empty archive -- and where a recallable domain
+prior is strong that is worth a great deal, while where one is not it is worth
+exactly nothing, three times measured.
+
+``reauthor_every`` is the other trigger, and it fires on SEARCH PROGRESS
+rather than on defects: after the run has charged that many evaluations, the
+generator is re-authored against the measured
+``(configuration -> objectives)`` trace -- the current front, what improved
+and what did not, and which parameter the measurements say moves which cost
+(:mod:`agent_evolve.policies.measurement_evidence`). ``locus_prior`` is the
+second consumer of the same evidence: the model names the parameters and
+values worth the remaining budget, the harness types the answer as a
+narrowing of the declared domains, and a GATE refuses it -- rather than
+trusts it -- whenever it is undeclared, empty, over-narrow, or excludes a
+value a measured non-dominated member holds.
+
+Both are OFF by default (``reauthor_every=0``), and off is the seam that ran
+every sealed row to date. Both record what evidence the model was shown (its
+digest), what it emitted, and whether the emission was accepted, so no run can
+imply it reasoned over measurements when it did not.
 """
 
 from __future__ import annotations
@@ -87,6 +114,16 @@ from agent_evolve.policies.llm_surrogate import (
     accept_block,
     json_compact,
 )
+from agent_evolve.policies.measurement_evidence import (
+    LOCUS_PRIOR_PROMPT,
+    MeasuredRow,
+    admit_locus_prior,
+    apply_locus_prior,
+    evidence_digest,
+    front_of,
+    parse_locus_prior,
+    render_measurement_evidence,
+)
 
 __all__ = [
     "GeneratorTelemetry",
@@ -95,11 +132,13 @@ __all__ = [
     "AuthoredGenerator",
     "author_generator",
     "revise_generator",
+    "reauthor_generator",
     "render_generation_feedback",
     "validate_pool",
     "candidate_key",
     "GENERATOR_PROMPT",
     "GENERATOR_REVISION_PROMPT",
+    "GENERATOR_EVIDENCE_PROMPT",
 ]
 
 Config = Dict[str, Any]
@@ -171,6 +210,22 @@ class GeneratorTelemetry:
     #: at a smaller ``n``, and how many of those retries came back usable.
     runtime_retries: int = 0
     runtime_recovered: int = 0
+    #: The MEASUREMENT-CONDITIONED channel, counted apart from the
+    #: defect-triggered one above, because they are different mechanisms and a
+    #: campaign that cannot tell them apart cannot attribute anything.
+    #: ``reauthorings`` fired; ``reauthorings_accepted`` came back as a usable
+    #: artifact; ``evidence_rows_shown`` is how many measured rows the model
+    #: was actually given across those calls.
+    reauthorings: int = 0
+    reauthorings_accepted: int = 0
+    evidence_rows_shown: int = 0
+    #: The locus-importance channel. ``priors_refused`` is the number the GATE
+    #: threw out and is the counter that says the gate is doing its job;
+    #: ``priors_unwound`` counts admitted priors later dropped for not paying.
+    priors_proposed: int = 0
+    priors_admitted: int = 0
+    priors_refused: int = 0
+    priors_unwound: int = 0
 
     def as_dict(self) -> dict[str, int]:
         return {f.name: int(getattr(self, f.name)) for f in fields(self)}
@@ -611,6 +666,41 @@ only ({imports}), deterministic, no I/O.
 Reply with ONLY one fenced Python code block and no other text."""
 
 
+GENERATOR_EVIDENCE_PROMPT = """You wrote this candidate generator for a \
+black-box multi-objective optimizer:
+
+```python
+{source}
+```
+
+The optimizer has been running it and MEASURING what it drew. Here is the
+evidence -- the run's own measurements, and nothing else:
+
+{evidence}
+
+Now reason about where to sample next, and rewrite the function so its mass
+lands there. Concretely: which parameters do the measurements say actually
+move the costs, and in which direction? Which regions has the run already
+measured and found not competitive, so that re-proposing them wastes the rest
+of the budget? Where is the front, and what is the smallest change to a front
+member that has not been measured yet?
+
+Your previous version was written before any of this was measured. It is not
+being corrected for a defect -- it is being asked to use information that did
+not exist when it was written. If the measurements do not support a change,
+say so by returning a function that differs only where they do.
+
+Same contract as before: exactly this signature
+
+    {contract}
+
+exactly `n` configurations, every value taken from `domains` at that locus,
+the same shape as the archive members, randomness derived from `seed`,
+standard library only ({imports}), deterministic, no I/O.
+{scaffold}{limits}
+Reply with ONLY one fenced Python code block and no other text."""
+
+
 def _locus_block(domains: Optional[Mapping[str, Sequence[Any]]]) -> str:
     """The per-locus domain echo, as a prompt section (empty when unknown)."""
 
@@ -714,6 +804,42 @@ def revise_generator(
     )
     return _author(complete, prompt, contract=contract, attempts=attempts,
                    telemetry=tel, name=f"{artifact.name}_rev")
+
+
+def reauthor_generator(
+    complete: Callable[[str], str],
+    *,
+    artifact: AuthoredArtifact,
+    evidence: str,
+    attempts: int = 1,
+    telemetry: Optional[AuthorTelemetry] = None,
+    scaffold: bool = True,
+    limits: Any = None,
+    max_n: Optional[int] = None,
+) -> Optional[AuthoredArtifact]:
+    """Re-author the sampler against the run's MEASURED trace.
+
+    Structurally identical to :func:`revise_generator` -- same contract, same
+    whole-reply gate, same degradation to the artifact already in hand -- and
+    different in the one way that matters: the prompt carries measurements
+    instead of emission counters, so the model is asked to reason about the
+    search rather than to repair its own output. The scaffold and resource
+    contracts are echoed exactly as they are for authorship and revision: a
+    re-authored sampler runs in the same sandbox as the one it replaces.
+    """
+
+    tel = telemetry if telemetry is not None else AuthorTelemetry()
+    contract = CONTRACTS["generator"]
+    prompt = GENERATOR_EVIDENCE_PROMPT.format(
+        source=artifact.source,
+        evidence=evidence,
+        scaffold=_scaffold_block(scaffold),
+        limits=_limits_block(limits, max_n),
+        contract=contract.description,
+        imports=", ".join(sorted(ALLOWED_IMPORTS)),
+    )
+    return _author(complete, prompt, contract=contract, attempts=attempts,
+                   telemetry=tel, name=f"{artifact.name}_evidence")
 
 
 def _author(complete, prompt, *, contract, attempts, telemetry, name):
@@ -899,11 +1025,35 @@ class AuthoredGenerator:
         repair: bool = True,
         revision_guard: bool = False,
         shrink_on_overrun: int = 4,
+        objectives: Sequence[ObjectiveSpec] = (),
+        reauthor: Optional[Callable[[AuthoredArtifact, str],
+                                    Optional[AuthoredArtifact]]] = None,
+        reauthor_every: int = 0,
+        max_reauthorings: int = 0,
+        evidence_view: Optional[Callable[[Sequence[MeasuredRow]],
+                                         Sequence[MeasuredRow]]] = None,
+        evidence_front_shown: int = 8,
+        evidence_effects_shown: int = 8,
+        prior_author: Optional[Callable[[str], str]] = None,
+        max_priors: int = 1,
+        prior_max_narrowing_log10: float = 2.0,
+        prior_unwind_batches: int = 2,
     ) -> None:
         if pool_factor < 1:
             raise ValueError(f"pool_factor must be at least 1, got {pool_factor}")
         if pool_size < 0:
             raise ValueError(f"pool_size must be non-negative, got {pool_size}")
+        if reauthor_every < 0:
+            raise ValueError(
+                f"reauthor_every must be non-negative, got {reauthor_every}")
+        if prior_author is not None and reauthor_every <= 0:
+            # The evidence channel has one cadence and both consumers ride it.
+            # A prior asked for on no cadence would fire never or every
+            # generation depending on who read the code, which is exactly the
+            # magic number this knob exists to replace.
+            raise ValueError(
+                "a locus prior is authored from the measured trace on the "
+                "reauthor_every cadence; set reauthor_every > 0")
         self.artifact = artifact
         self.runtime = runtime
         self.pool_factor = int(pool_factor)
@@ -930,6 +1080,26 @@ class AuthoredGenerator:
         #: it and a timeout costs the whole pool, as it did when Wave D
         #: measured 39,993 uniformly-filled slots against 7,104 emissions.
         self.shrink_on_overrun = int(shrink_on_overrun)
+        #: The MEASUREMENT-CONDITIONED channel. ``reauthor_every`` is a
+        #: cadence in CHARGED EVALUATIONS -- a declared, typed knob rather
+        #: than a magic number -- and ``0`` (the default) is the seam every
+        #: sealed row to date ran: no evidence call ever fires.
+        self.objectives = tuple(objectives)
+        self.reauthor = reauthor
+        self.reauthor_every = int(reauthor_every)
+        self.max_reauthorings = int(max_reauthorings)
+        #: What the model is SHOWN. The identity view is the product; a view
+        #: returning another run's rows is the shuffled-evidence control, and
+        #: it is a parameter rather than a patch precisely so the control can
+        #: be built without editing this file.
+        self.evidence_view = evidence_view
+        self.evidence_front_shown = int(evidence_front_shown)
+        self.evidence_effects_shown = int(evidence_effects_shown)
+        #: The locus-importance channel, and the gate that refuses it.
+        self.prior_author = prior_author
+        self.max_priors = int(max_priors)
+        self.prior_max_narrowing_log10 = float(prior_max_narrowing_log10)
+        self.prior_unwind_batches = int(prior_unwind_batches)
         self.telemetry = GeneratorTelemetry()
         self.mechanism = "authored_generator"
         self.authored_by = artifact.authored_by
@@ -942,6 +1112,22 @@ class AuthoredGenerator:
                                         int, Config]] = None
         self._rejected_edits: List[Dict[str, Any]] = []
         self._pending_edit: Optional[Dict[str, Any]] = None
+        #: The measured trace, in measurement order. This is the evidence, and
+        #: it is the ONLY thing this class knows about outcomes: it arrives
+        #: through `record_measured`, which the loop already calls, so the
+        #: generator still never sees the problem, the evaluator or the cache.
+        self._rows: List[MeasuredRow] = []
+        self._evidence_at = 0
+        self._prior_asked_at = -1
+        self._prior: Any = None
+        self._prior_batches = 0
+        self._survived_at_prior = 0
+        #: One record per evidence-conditioned call: what was shown (digest
+        #: and row count), what came back, and whether it was accepted.
+        #: Telemetry as correctness -- a run cannot claim this channel fired
+        #: without the record that says what it saw.
+        self.evidence_log: List[Dict[str, Any]] = []
+        self._noted = 0
 
     # -- sizing -------------------------------------------------------------
 
@@ -970,6 +1156,11 @@ class AuthoredGenerator:
 
         self._seen.add(candidate_key(config))
         self.telemetry.measured += 1
+        if objectives is not None:
+            # The measured trace: kept whether or not it survived, because
+            # "this region was measured and is NOT competitive" is exactly the
+            # evidence a survivor list cannot carry.
+            self._rows.append((dict(config), dict(objectives), bool(survived)))
         if survived:
             self.telemetry.survived += 1
             if objectives is not None:
@@ -997,19 +1188,40 @@ class AuthoredGenerator:
         """
 
         n = self.pool_for(want)
-        domains = {
+        declared = {
             str(locus): list(locus_domain(candidate_model, locus,
                                           restriction=restriction))
             for locus in loci_of(template)
         }
-        self._domains = domains
+        self._domains = declared
+        # Search-progress triggers, on the DECLARED domains: the evidence and
+        # the prior both describe the space the problem published, not a space
+        # a previous prior already narrowed, or a second prior would compound
+        # the first one's bet without ever measuring it.
+        # ONE cadence tick, read once and consumed by both channels: asking
+        # each of them separately would let whichever ran first advance the
+        # anchor and starve the other, which is a rule nobody declared.
+        due = self._due()
+        self._maybe_reauthor(declared, due)
+        self._maybe_author_prior(declared, due)
+        if due:
+            self._evidence_at = self.telemetry.measured
+        domains = self._effective_domains(declared)
         shown = [dict(config) for config in list(archive)[:self.archive_shown]]
         self._maybe_revise()
         self._last_call = (shown, n, domains, int(seed), dict(template))
 
         self.telemetry.batches += 1
+        # The generator SAMPLES from the (possibly biased) domains and is
+        # VALIDATED against the declared ones. A prior is guidance about where
+        # to spend, not a new definition of what is legal, so a candidate
+        # outside the prior but inside the schema is admitted rather than
+        # counted as a defect -- otherwise installing a prior would
+        # manufacture rejections and fire the defect-repair channel on a
+        # generator that did exactly what it was asked.
         report = self._run(self.artifact, shown, n, domains, seed,
-                           template=template, rng=rng, count=True)
+                           template=template, rng=rng, count=True,
+                           validate_domains=declared)
         self.last_report = report
         self.census.merge(report.census)
         self._score_pending_edit(report)
@@ -1030,19 +1242,27 @@ class AuthoredGenerator:
         return pool
 
     def _run(self, artifact, archive, n, domains, seed, *, template, rng,
-             count: bool) -> PoolReport:
+             count: bool,
+             validate_domains: Optional[Mapping[str, Sequence[Any]]] = None,
+             ) -> PoolReport:
         """One emission through the scaffold, validated. Optionally counted.
 
         *count* is false for the revision guard's frozen replay, which must
         measure a challenger without the run's telemetry recording an
         emission the loop never saw.
+
+        *validate_domains*, when given, is what the pool is judged against --
+        the DECLARED domains -- while *domains* is what the sampler draws
+        from (a weighted prior may have biased them). Sampling guidance must
+        never redefine what is legal.
         """
 
         rows = self._emit(artifact, archive, n, domains, seed,
                           template=template, count=count)
         return validate_pool(
-            rows, template=template, domains=domains, seen=self._seen,
-            limit=n, repair=self.repair,
+            rows, template=template,
+            domains=validate_domains if validate_domains is not None else domains,
+            seen=self._seen, limit=n, repair=self.repair,
             rng=rng if rng is not None else random.Random(seed))
 
     def _emit(self, artifact, archive, n, domains, seed, *, template,
@@ -1267,6 +1487,149 @@ class AuthoredGenerator:
         self._rejected_edits.append(pending)
         del self._rejected_edits[:-3]
 
+    # -- the SEARCH-PROGRESS channel: reasoning over measurements ------------
+
+    def _evidence_rows(self) -> List[MeasuredRow]:
+        """The rows the model will be shown. Identity, unless a view is set."""
+
+        rows: Sequence[MeasuredRow] = tuple(self._rows)
+        if self.evidence_view is not None:
+            try:
+                rows = self.evidence_view(rows)
+            except Exception:               # a control that throws must not
+                rows = ()                   # be able to kill a measurement
+        return [row for row in rows]
+
+    def _render_evidence(self, rows, domains) -> str:
+        return render_measurement_evidence(
+            rows, self.objectives, domains,
+            front_shown=self.evidence_front_shown,
+            effects_shown=self.evidence_effects_shown,
+            charged=self.telemetry.measured)
+
+    def _due(self) -> bool:
+        """Has the archive grown by ``reauthor_every`` charged evaluations?"""
+
+        return (self.reauthor_every > 0
+                and self.telemetry.measured - self._evidence_at
+                >= self.reauthor_every)
+
+    def _log(self, kind: str, *, rows: int, evidence: str,
+             emitted: Optional[str], accepted: bool, **extra: Any) -> None:
+        record: Dict[str, Any] = {
+            "kind": kind,
+            "at_measured": int(self.telemetry.measured),
+            "rows_shown": int(rows),
+            "evidence_sha256": evidence_digest(evidence),
+            "evidence_chars": len(evidence),
+            "emitted": emitted,
+            "accepted": bool(accepted),
+        }
+        record.update(extra)
+        self.evidence_log.append(record)
+
+    def _maybe_reauthor(self, domains: Mapping[str, Sequence[Any]],
+                        due: bool) -> None:
+        """Re-author the sampler against the measured trace, on cadence.
+
+        The trigger is SEARCH PROGRESS, not an emission defect: a generator
+        that emits perfectly valid candidates out of a region the run has
+        already measured to be uncompetitive is never deficient, and is
+        exactly the case the defect trigger cannot see.
+        """
+
+        if (self.reauthor is None or not due
+                or self.telemetry.reauthorings >= self.max_reauthorings):
+            return
+        rows = self._evidence_rows()
+        if not rows:
+            return
+        self.telemetry.reauthorings += 1
+        self.telemetry.evidence_rows_shown += len(rows)
+        evidence = self._render_evidence(rows, domains)
+        try:
+            replacement = self.reauthor(self.artifact, evidence)
+        except Exception:               # a re-authoring must not kill a run
+            replacement = None
+        self._log("reauthor", rows=len(rows), evidence=evidence,
+                  emitted=(None if replacement is None
+                           else replacement.source_sha256),
+                  accepted=replacement is not None,
+                  replaced=self.artifact.source_sha256)
+        if replacement is None:
+            return
+        self.telemetry.reauthorings_accepted += 1
+        self.artifact = replacement
+
+    def _maybe_author_prior(self, domains: Mapping[str, Sequence[Any]],
+                            due: bool) -> None:
+        """Ask which loci matter, type the answer, and let the GATE refuse it."""
+
+        self._unwind_prior_if_it_stopped_paying()
+        if (self.prior_author is None or not due
+                or self._prior is not None
+                or self.telemetry.priors_proposed >= self.max_priors):
+            return
+        rows = self._evidence_rows()
+        if not rows:
+            return
+        self.telemetry.priors_proposed += 1
+        evidence = self._render_evidence(rows, domains)
+        prompt = LOCUS_PRIOR_PROMPT.format(
+            goals="\n".join(f"  {s.name}: {s.goal}imise" for s in self.objectives),
+            domains="\n".join(
+                f"  {name}: {json_compact(list(values))}"
+                for name, values in sorted(dict(domains).items())),
+            evidence=evidence)
+        try:
+            reply = self.prior_author(prompt)
+        except Exception:
+            reply = ""
+        verdict = admit_locus_prior(
+            parse_locus_prior(reply),
+            domains=domains,
+            front=front_of(rows, self.objectives),
+            max_narrowing_log10=self.prior_max_narrowing_log10)
+        self._log("locus_prior", rows=len(rows), evidence=evidence,
+                  emitted=(None if verdict.prior is None
+                           else evidence_digest(json_compact(
+                               verdict.prior.as_note()))),
+                  accepted=verdict.admitted, verdict=verdict.as_note())
+        if not verdict.admitted:
+            self.telemetry.priors_refused += 1
+            return
+        self.telemetry.priors_admitted += 1
+        self._prior = verdict.prior
+        self._prior_batches = 0
+        self._survived_at_prior = self.telemetry.survived
+
+    def _effective_domains(
+        self, declared: Mapping[str, Sequence[Any]]
+    ) -> Dict[str, List[Any]]:
+        if self._prior is None:
+            return {k: list(v) for k, v in dict(declared).items()}
+        self._prior_batches += 1
+        return apply_locus_prior(declared, self._prior)
+
+    def _unwind_prior_if_it_stopped_paying(self) -> None:
+        """An admitted prior is still a bet, and a bet must be checkable.
+
+        The gate refuses a prior that excludes a measured front member, which
+        is the only unrecoverable failure. Everything else it can only be
+        wrong about, so the prior is held only while it pays: after
+        ``prior_unwind_batches`` generations drawn under it with not one new
+        survivor, it is dropped and the run finishes on the declared domains.
+        """
+
+        if self._prior is None or self.prior_unwind_batches <= 0:
+            return
+        if self._prior_batches < self.prior_unwind_batches:
+            return
+        if self.telemetry.survived > self._survived_at_prior:
+            return
+        self._prior = None
+        self.telemetry.priors_unwound += 1
+
     def note(self) -> Dict[str, Any]:
         """The per-generation history record for the last batch."""
 
@@ -1274,4 +1637,13 @@ class AuthoredGenerator:
                 else PoolReport().as_note())
         note["artifact"] = f"{self.artifact.name}:{self.artifact.source_sha256[:8]}"
         note["revisions"] = self.telemetry.revisions_accepted
+        if self.reauthor_every > 0:
+            # What the model saw and what it emitted, in the run's own record.
+            # Only what is NEW since the last generation's note: the full log
+            # stays on the object, and the history is a diary rather than n
+            # copies of the same list.
+            fresh = self.evidence_log[self._noted:]
+            self._noted = len(self.evidence_log)
+            note["evidence"] = [dict(record) for record in fresh]
+            note["prior_active"] = self._prior is not None
         return note
