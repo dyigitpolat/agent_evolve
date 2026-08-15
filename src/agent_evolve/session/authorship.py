@@ -86,6 +86,24 @@ class AuthorshipConfig:
     #: One-shot authoring is what the ladder cells measure; revision LEVELS
     #: the rungs (W3), so it is capped here and ablatable to 0.
     generation_revisions: int = 1
+    #: Keep an authored revision only when a FROZEN replay measures it
+    #: better -- strictly lower defect rate, no loss of novelty. Off by
+    #: default because every sealed row is defined on unguarded revision;
+    #: it is the third arm of the revision-value row, not a silent change.
+    generation_revision_guard: bool = False
+    #: Ship the emit harness into the sandbox (the authored code builds
+    #: candidates through ``build``) and assemble a partially-correct
+    #: emission rather than dropping it whole. Both default ON: they are the
+    #: fix for the measured assignment-genome authoring failure, and both are
+    #: ablatable so the fix can be measured against its own absence.
+    generation_scaffold: bool = True
+    generation_repair: bool = True
+    #: Echo the sandbox's own wall/CPU/memory budget into the authoring
+    #: prompt, and retry a batch that overran it at ``n // 4`` rather than
+    #: losing the whole pool. An unstated budget is a budget the author
+    #: cannot honour, and on `upms_j14_m3` the overrun -- not the shape --
+    #: is what emptied most batches.
+    generation_limits_echo: bool = True
     limits: RuntimeLimits = field(default_factory=RuntimeLimits)
 
     def __post_init__(self) -> None:
@@ -177,7 +195,8 @@ def build_authorship(
         config, complete, schema_text, say, candidate_model,
         init_template, init_k)
     generator, generator_note = _build_generator(
-        config, complete, objectives, schema_text, say)
+        config, complete, objectives, schema_text, say,
+        candidate_model, init_template)
     return AuthorshipPolicies(
         screening=_build_screening(config, complete, objectives,
                                    schema_text, say),
@@ -222,6 +241,8 @@ def _build_generator(
     objectives: Sequence[Any],
     schema_text: str,
     say: Callable[[str], None],
+    candidate_model: Any = None,
+    template: Any = None,
 ) -> tuple:
     """``(generator, author_note)``; both ``None`` when generation is off.
 
@@ -250,20 +271,39 @@ def _build_generator(
     from agent_evolve.policies.llm_generator import (author_generator,
                                                      revise_generator)
 
+    # The per-locus admissible sets the run will actually pass, echoed into
+    # the authoring prompt. Derived from the problem's own schema exactly as
+    # the sampler derives them; absent a template there are no loci to name,
+    # and the prompt keeps the field-level card it always had.
+    domains = _generator_domains(candidate_model, template)
     artifact = author_generator(
         complete, objectives=list(objectives), schema_text=schema_text,
-        attempts=config.authoring_attempts, telemetry=telemetry)
+        attempts=config.authoring_attempts, telemetry=telemetry,
+        domains=domains, scaffold=config.generation_scaffold,
+        limits=(config.limits if config.generation_limits_echo else None),
+        max_n=_generator_max_n(config))
     if artifact is None:
         say(f"the model authored no usable generator in "
             f"{config.authoring_attempts} attempt(s); candidates stay "
             "schema-uniform.")
         return None, author_note
 
+    holder: dict = {}
+
     def revise(current: Any, feedback: str) -> Any:
         # The evolving generator: its own source plus what the harness
-        # measured about the candidates it emitted. Same gate as authoring.
-        return revise_generator(complete, artifact=current, feedback=feedback,
-                                telemetry=telemetry)
+        # measured about the candidates it emitted -- which loci rejected,
+        # why, with a sample, and which edits already failed. Same gate as
+        # authoring. The echo is the RUN's domains when a batch has been
+        # emitted (a restriction may have narrowed them), the declared ones
+        # otherwise.
+        live = getattr(holder.get("generator"), "_domains", None)
+        return revise_generator(
+            complete, artifact=current, feedback=feedback,
+            telemetry=telemetry, domains=live or domains,
+            scaffold=config.generation_scaffold,
+            limits=(config.limits if config.generation_limits_echo else None),
+            max_n=_generator_max_n(config))
 
     generator = AuthoredGenerator(
         artifact,
@@ -272,9 +312,47 @@ def _build_generator(
         pool_size=config.generation_pool_size,
         revise=revise if config.generation_revisions > 0 else None,
         max_revisions=config.generation_revisions,
+        scaffold=config.generation_scaffold,
+        repair=config.generation_repair,
+        revision_guard=config.generation_revision_guard,
+        shrink_on_overrun=(4 if config.generation_limits_echo else 0),
     )
+    holder["generator"] = generator
     generator.author = author_note
     return generator, None
+
+
+def _generator_max_n(config: "AuthorshipConfig") -> int:
+    """The largest pool one call may be asked for, for the prompt's echo.
+
+    Sized from the same two knobs the sampler is: an explicit pool size when
+    one is set, otherwise the factor times the offspring a generation can
+    afford. The population sizing caps offspring at ten, so this is an upper
+    bound rather than a guess.
+    """
+
+    if config.generation_pool_size:
+        return int(config.generation_pool_size)
+    return int(config.generation_pool_factor) * 10
+
+
+def _generator_domains(candidate_model: Any, template: Any) -> dict:
+    """``{locus name: admissible values}`` for the authoring prompt's echo.
+
+    Empty whenever the caller supplied no template or no candidate model --
+    there is then nothing to echo, and the prompt is exactly the one every
+    sealed row was authored under.
+    """
+
+    if candidate_model is None or not template:
+        return {}
+    from agent_evolve.policies.genetic import loci_of, locus_domain
+
+    try:
+        return {str(locus): list(locus_domain(candidate_model, locus))
+                for locus in loci_of(dict(template))}
+    except Exception:
+        return {}
 
 
 def _build_screening(

@@ -158,6 +158,7 @@ def test_an_out_of_domain_generator_has_its_slots_filled_uniformly():
         "        out.append(bad if i % 2 else wrong_shape)\n"
         "    return out\n"
     )
+    generator.repair = False                    # the per-CANDIDATE fallback
     pool = _propose(generator, want=2)          # pool_factor 4 -> 8 candidates
     assert len(pool) == 8, "the pool must be topped up to the size asked for"
     assert all(set(c["genome"]) <= {0, 1} and len(c["genome"]) == N
@@ -167,6 +168,42 @@ def test_an_out_of_domain_generator_has_its_slots_filled_uniformly():
     assert counters["rejected_out_of_domain"] == 3
     assert counters["rejected_shape"] == 4
     assert counters["filled_uniform"] == 7
+
+
+def test_the_per_locus_fallback_keeps_what_the_model_got_right():
+    """The same emission under the emit harness's repair, which is the default.
+
+    Nothing invalid reaches the pool either way -- that invariant is the
+    gate's, not the fallback's. What changes is WHOSE draw fills the slot: a
+    candidate whose every locus is out of domain still cannot be repaired
+    into anything of the model's, but one that got some loci right keeps
+    them, and the harness's share is counted rather than absorbed.
+    """
+
+    generator = _generator(
+        "def propose(archive, n, domains, seed):\n"
+        "    good = {'genome': [1, 1, 1, 1, 1, 1]}\n"
+        "    mixed = {'genome': [1, 7, 0, 7, 1, 0]}\n"
+        "    short = {'genome': [1, 0, 1]}\n"
+        "    return [good, mixed, short] + [{'genome': [0, 1] * 3}\n"
+        "                                   for _ in range(n - 3)]\n",
+        max_revisions=0,
+    )
+    pool = _propose(generator, want=2)
+    assert all(set(c["genome"]) <= {0, 1} and len(c["genome"]) == N
+               for c in pool), "an invalid candidate reached the pool"
+    counters = generator.telemetry.as_dict()
+    assert counters["rejected_shape"] == 0 and counters["rejected_out_of_domain"] == 0
+    assert counters["repaired"] == 2, "the mixed and the short one were assembled"
+    # Four loci decided by the harness: two out-of-domain in `mixed`, three
+    # positions missing from `short` -- minus nothing, because `short`'s three
+    # supplied positions were all admissible.
+    assert counters["repaired_loci"] == 5
+    census = generator.census
+    assert census.out_of_domain_by_locus == {"genome[1]": 1, "genome[3]": 1}
+    assert census.samples["domain:genome[1]"] == 7
+    assert set(census.repaired_by_locus) == {
+        "genome[1]", "genome[3]", "genome[3]", "genome[4]", "genome[5]"}
 
 
 def test_a_crashing_generator_costs_a_pool_not_a_run():
