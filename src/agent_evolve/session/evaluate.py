@@ -76,12 +76,31 @@ class EvaluationCache(dict):
     that immediately instead of assuming a saving it never got.
 
     ``misses`` is what the budget actually counts: distinct artifacts measured.
+
+    A REFUSAL is a measurement too. An artifact whose ``evaluate`` raised was
+    charged -- it ran the evaluator, it took the wall-clock -- so its outcome
+    is recorded exactly like a successful one, and a re-proposed refusal is
+    served from memory instead of being charged again. On a venue that
+    refuses over half of what is proposed (the EDA case: 53%), forgetting
+    refusals meant a config could be billed every time the sampler re-drew
+    it. ``refusal_hits`` counts those replays, apart from ``hits``, because
+    "we did not pay for a success again" and "we did not pay for a failure
+    again" are different savings and a campaign should see both.
     """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.hits = 0
         self.misses = 0
+        self.refusal_hits = 0
+        #: artifact key -> (message, failure phase) of the charged refusal.
+        self._refusals: Dict[str, Tuple[str, str]] = {}
+
+    def record_refusal(self, key: str, message: str, phase: str) -> None:
+        self._refusals[key] = (str(message), str(phase))
+
+    def refusal(self, key: str) -> Optional[Tuple[str, str]]:
+        return self._refusals.get(key)
 
     #: Hard ceiling on ``misses``. Once reached, no further artifact is
     #: measured; a budget that is only checked between generations is not a
@@ -140,6 +159,19 @@ def evaluate_batch(
             continue
 
         key = artifact_key(artifact) if cache is not None else None
+        if key is not None and isinstance(cache, EvaluationCache):
+            remembered = cache.refusal(key)
+            if remembered is not None:
+                # This artifact was already measured and REFUSED, and that
+                # refusal was charged once. Replay the recorded outcome --
+                # same message, same phase, so the feedback upstream is
+                # identical -- without running the evaluator or charging the
+                # budget again (evaluation_attempted stays False: no
+                # evaluation happened HERE).
+                message, phase = remembered
+                cache.refusal_hits += 1
+                _record(_failure(config, objectives, message, phase), failed)
+                continue
         if key is not None and key in cache:
             normalized = dict(cache[key])
             if isinstance(cache, EvaluationCache):
@@ -169,6 +201,11 @@ def evaluate_batch(
                 # many artifacts that took, and report the budget as honoured.
                 if isinstance(cache, EvaluationCache):
                     cache.misses += 1
+                    if key is not None:
+                        # Remember the refusal under the artifact's identity,
+                        # so re-proposing it is a replay, never a second bill.
+                        cache.record_refusal(
+                            key, format_optimizer_error(exc), "evaluation")
                 _record(
                     _failure(
                         config,

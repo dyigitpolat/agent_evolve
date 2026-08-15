@@ -110,3 +110,70 @@ def test_invalid_objective_contract_aborts(objectives):
 
     with pytest.raises(ProblemContractError):
         evaluate_batch(_BadObjectives(), [{"a": 1}], OBJS)
+
+
+# --------------------------------------------------- refusals are charged ONCE
+
+class _RefusingVenue:
+    """A venue that refuses a large share of what is proposed (the EDA case:
+
+    53% of proposed configurations came back refused). A refusal RUNS the
+    evaluator and is charged -- and before W9's fix it was charged AGAIN every
+    time the sampler re-proposed the same configuration, because only
+    successes were recorded in the cache.
+    """
+
+    objectives = OBJS
+
+    def __init__(self):
+        self.evaluator_runs = 0
+
+    def evaluate(self, config):
+        self.evaluator_runs += 1
+        if config["a"] % 2:
+            raise ValueError(f"refused: a={config['a']} violates the DRC deck")
+        return {"score": float(config["a"]), "penalty": 0.0}
+
+
+def test_a_reproposed_refusal_is_replayed_and_never_charged_twice():
+    from agent_evolve.session.evaluate import EvaluationCache
+
+    venue = _RefusingVenue()
+    cache = EvaluationCache()
+    # An EDA-shaped proposal stream: about half the distinct configs refuse,
+    # and the sampler re-proposes everything it has already tried.
+    proposals = [{"a": i % 8} for i in range(32)]   # 8 distinct, 32 proposed
+    valid, failed, ordered = evaluate_batch(venue, proposals, OBJS, cache=cache)
+
+    assert venue.evaluator_runs == 8                # distinct artifacts, once each
+    assert cache.misses == 8                        # ... and that is the whole bill
+    assert cache.hits == 12                         # 4 successes replayed 3x
+    assert cache.refusal_hits == 12                 # 4 refusals replayed 3x
+    assert len(ordered) == 32
+
+    # The replayed refusal carries the SAME feedback as the charged one and
+    # does not claim an evaluation happened here.
+    charged = [r for r in failed if r.evaluation_attempted]
+    replayed = [r for r in failed if not r.evaluation_attempted]
+    assert len(charged) == 4 and len(replayed) == 12
+    assert {r.failure_phase for r in replayed} == {"evaluation"}
+    assert {r.error_message for r in replayed} <= {r.error_message for r in charged}
+
+
+def test_a_remembered_refusal_is_served_even_when_the_budget_is_spent():
+    from agent_evolve.session.evaluate import EvaluationCache
+
+    venue = _RefusingVenue()
+    cache = EvaluationCache()
+    cache.budget = 2
+    evaluate_batch(venue, [{"a": 1}, {"a": 2}], OBJS, cache=cache)
+    assert cache.exhausted()
+
+    # Re-proposing the refused config is a REPLAY of its recorded outcome,
+    # not a budget event: the caller learns why it failed, not that the
+    # budget is spent, and nothing more is billed.
+    _valid, failed, _ordered = evaluate_batch(venue, [{"a": 1}], OBJS, cache=cache)
+    assert failed[0].failure_phase == "evaluation"
+    assert "refused" in failed[0].error_message
+    assert venue.evaluator_runs == 2
+    assert cache.misses == 2
