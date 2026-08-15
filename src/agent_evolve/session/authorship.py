@@ -65,7 +65,15 @@ class AuthorshipConfig:
     #: may order anything: ``0`` = every declared objective (the conjunction),
     #: a positive value = that many, with the screen ordering on exactly the
     #: certified ones. See policies.surrogate.GatePolicy.min_passing_objectives.
-    screen_min_passing_objectives: int = 0
+    #:
+    #: The default is the MEASURED arm, not taste: partial screening at 2
+    #: beat the shipped conjunction 102/54 (sign test p = 1.5e-4, better >
+    #: worse in all four cells where the arms can differ; wave-K
+    #: aug14_partial_screen.md), and it is INERT when the gate certifies
+    #: every objective -- on a 2-objective venue the partial gate IS the
+    #: conjunction, identical in every counter (100/100 identical runs).
+    #: ``0`` restores the historical conjunction exactly.
+    screen_min_passing_objectives: int = 2
     #: The share of a generation reserved from a PARTIAL screen, as a multiple
     #: of the share of objectives it could not see. See
     #: session.screening.Screening.unscreened_objective_floor.

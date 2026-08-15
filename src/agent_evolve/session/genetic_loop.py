@@ -125,15 +125,24 @@ class GeneticConfig:
     #: `portfolio`; asking for both is refused rather than silently ignored.
     generator: Any = None
     #: Whether the screen may spend the problem's CHEAPER evaluation fidelity
-    #: (``Problem.evaluate_proxy``), and how. "off" -- the default -- leaves
-    #: the loop byte-identical to the pre-proxy seam and is what every problem
-    #: without a cheap fidelity gets regardless. "rows" buys gate evidence at
-    #: the cheap fidelity, "screen" lets the cheap fidelity compete as a
+    #: (``Problem.evaluate_proxy``), and how. "off" leaves the loop
+    #: byte-identical to the pre-proxy seam and is what every problem without
+    #: a cheap fidelity gets regardless. "rows" buys gate evidence at the
+    #: cheap fidelity, "screen" lets the cheap fidelity compete as a
     #: surrogate under the gate, "both" does both. Proxy evaluations are
     #: counted in their own ledger and are NEVER charged to
     #: ``evaluation_budget``: the budget the claims are denominated in counts
     #: real evaluations, and a cheap one is not one of them.
-    proxy_fidelity: str = "off"
+    #:
+    #: The default is the MEASURED arm: "screen" won 23/24 seeds against the
+    #: no-proxy screen pooled over both budgets (12/0 at B=24, p = 0.00049;
+    #: 11/12 at B=16, p = 0.006; wave-K aug14_multifidelity.md), with the
+    #: shuffled-proxy control identical to no-proxy in all 12 runs -- the
+    #: gain is the cheap MEASUREMENT, not the machinery. The seam is active
+    #: iff the problem exposes ``evaluate_proxy``: ``ProxySource.for_problem``
+    #: returns None otherwise and nothing attaches, so every problem without
+    #: a cheap fidelity keeps the pre-proxy behaviour bit for bit.
+    proxy_fidelity: str = "screen"
     #: A hard ceiling on proxy evaluations for the whole run. None -- no
     #: ceiling. A consumer that exhausts it degrades to "no proxy".
     proxy_ceiling: Optional[int] = None

@@ -509,11 +509,13 @@ def _screens(result) -> List[Mapping[str, Any]]:
     return [h["screen"] for h in result.history if "screen" in h]
 
 
-def test_the_default_run_is_the_conjunction_and_says_which_objectives():
+def test_the_default_run_screens_partially_and_says_which_objectives():
     from agent_evolve.session.authorship import AuthorshipConfig
 
-    assert AuthorshipConfig().screen_min_passing_objectives == 0, (
-        "partial screening is opt-in; the shipped default is the conjunction"
+    assert AuthorshipConfig().screen_min_passing_objectives == 2, (
+        "the v0.4 default is the MEASURED partial arm (102/54, p=1.5e-4, "
+        "wave-K aug14_partial_screen.md), inert when every objective passes; "
+        "0 restores the historical conjunction"
     )
     problem = _Problem()
     result = optimize(problem, budget=24, seed=9, authorship="surrogate")
