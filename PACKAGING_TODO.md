@@ -94,9 +94,10 @@ an uncommitted working-tree addition, additive-only, backed by
       snapshot (e.g. `docs/measurements.md` with the same exact numbers) or a
       link to the paper; the numbers themselves must not be retyped from
       memory when that snapshot is made.
-- [ ] **`LICENSE.draft` holder line** — "AgentEvolve authors" is deliberately
-      impersonal; owner decides the released holder line, then the draft
-      replaces `LICENSE` (currently a personal-name MIT) or is discarded.
+- [x] **LICENSE holder line — SETTLED 2026-08-18 by the owner.** The released
+      holder is the named individual: `LICENSE` stands unchanged at
+      `Copyright (c) 2026 Yigit Polat`, MIT. `LICENSE.draft` and its impersonal
+      "AgentEvolve authors" form are discarded, not promoted.
 
 ## 5. Noticed while drafting (pre-release polish, not this draft's scope)
 
@@ -164,17 +165,26 @@ transcripts are in `papers/agent_evolve_iclr_2027/V6_RELEASE.md`.
 
 ### Still open, and now explicit
 
-- [ ] **LICENSE holder line — the one item that is the owner's and only the
-      owner's.** `LICENSE` currently reads `Copyright (c) 2026 Yigit Polat`;
-      `LICENSE.draft` offers the impersonal `AgentEvolve authors`. Neither has
-      been signed off. Nothing in this cut changed either file. Decide, then
-      either keep `LICENSE` as is or promote the draft over it.
+- [x] **LICENSE holder line — CLOSED 2026-08-18.** The owner decided the
+      released holder is the named individual. `LICENSE` stands as written
+      (`Copyright (c) 2026 Yigit Polat`, MIT); `LICENSE.draft` is deleted. This
+      was the item blocking a public cut, so the paper's "available at"
+      sentence becomes writable once the branch is pushed — which remains the
+      owner's action, not this repository's.
 - [ ] **Integer loci with `ge`/`le` bounds declare no finite domain**, so the
       operators leave them alone — `diagnose` says so out loud, and the knapsack
       example searches nothing because of it. Making bounded integers
       enumerable is a genuine generic improvement *and* it would change search
       behaviour on every venue with an integer locus, including measured ones.
       That is a research-integrity call, not a packaging one.
+      **DEFERRED UNTIL AFTER SUBMISSION, by the owner, 2026-08-18.** The
+      reasoning is the deadline, not the merits: changing it now would move the
+      substrate under sealed rows six weeks before ICLR (full paper 2026-09-25),
+      and re-verifying every venue with an integer locus is not a pre-deadline
+      purchase. It ships as a DOCUMENTED LIMITATION — `diagnose` already says it
+      out loud, which is the behaviour that makes deferring honest rather than
+      quiet. Revisit after submission, and when it lands, re-run the affected
+      sealed cells and disclose any number that moves rather than absorbing it.
 - [ ] **`Development Status :: 4 - Beta`** — still the declared signal; confirm
       it is the intended one for a first public cut.
 - [ ] **651 `_LEGACY_EXPORTS`** — ship-as-is remains the default; unchanged.

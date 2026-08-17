@@ -17,11 +17,9 @@ description = "A drop-in NSGA-II replacement whose authored machinery installs o
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-# Named explicitly, because the default glob is LICENSE* and that shipped
-# `LICENSE.draft` -- whose first line reads "DRAFT -- NOT IN EFFECT" -- into the
-# wheel beside the real licence. A distribution must carry exactly the licence
-# that governs it. The draft stays in the repository as the owner-review
-# artifact for the copyright-holder line, and is not distributed.
+# Named explicitly rather than left to the default LICENSE* glob: a
+# distribution must carry exactly the licence that governs it, and a glob
+# picks up anything licence-shaped that happens to sit beside it.
 license-files = ["LICENSE"]
 keywords = ["optimization", "multi-objective", "pareto", "llm", "evolutionary"]
 classifiers = [
