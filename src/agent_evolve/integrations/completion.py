@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 __all__ = ["Completion", "completion_for", "credential_for"]
 
@@ -43,6 +43,8 @@ def completion_for(
     timeout_s: float = 300.0,
     journal: Any = None,
     effort: Optional[str] = None,
+    provider_only: Optional[Sequence[str]] = None,
+    max_output_tokens: Optional[int] = None,
 ) -> Optional[Completion]:
     """A completion callable for *model*, or ``None`` with no credential.
 
@@ -54,8 +56,73 @@ def completion_for(
     body carries ``{"reasoning": {"effort": <level>}}`` and each journalled
     record additionally echoes ``effort_requested`` plus the reply's
     ``finish_reason``/``native_finish_reason`` (so honoring is verifiable
-    from journals alone). When omitted, the request body and the journal
-    record are byte-identical to the pre-effort seam.
+    from journals alone). When omitted, the request body is byte-identical to
+    the pre-effort seam.
+
+    ``provider_only`` is the second ADDITIVE pin: when given, the body carries
+    ``{"provider": {"only": [...]}}``, which is what the shipped
+    ``OpenRouterModelExecutionProfile`` declares for these routes
+    (``provider_only=("openai",)``). It matters for any dose or scale ladder:
+    a router free to move between serving providers can change the *reasoning
+    implementation* underneath a rung, so a measured dose difference would be
+    confounded with a routing difference.
+
+    It is deliberately NOT pinned by default. Pinning is a measurement-design
+    choice that belongs to the row that needs it, not to the product default:
+    the one row that measured the pin (ROW O2) found it a no-op against the
+    unpinned request, while a default pin would change the body of every call
+    this seam has ever made and so would silently re-cut the sealed rows'
+    replay. What ships instead is the EVIDENCE: the served provider is
+    journalled UNCONDITIONALLY, as ``provider_served`` (plus the reply
+    ``response_id``), whether or not the pin is used. Recording it costs
+    nothing and is the only way an auditor can check, from journals alone,
+    that a rung did not silently span providers -- which no journal in this
+    program could do before.
+
+    ``max_output_tokens`` is the third ADDITIVE pin, and it is the one that
+    stops a reasoning model from thinking its way past the answer. It is named
+    for the ``OpenRouterModelExecutionProfile`` field it is meant to carry
+    (``max_output_tokens``); the OpenRouter wire spelling it becomes is
+    ``max_tokens``. This seam used to send no completion limit at all, which
+    does NOT mean "no limit": it means the PROVIDER's default, measured at
+    65,536 on this route, while the route's own ``max_completion_tokens`` is
+    128,000 and the shipped profile declares ``max_output_tokens=128_000``.
+    At the top of the reasoning-effort range that gap is fatal -- a measured
+    ``max``-effort call spent 63,446 of its 65,536 output tokens on reasoning,
+    returned ``finish_reason="length"`` /
+    ``native_finish_reason="max_output_tokens"``, and produced **no content at
+    all**. Half the declared capacity was being left unused, and the artifact
+    was what got dropped. Worse, the truncation SELECTS: it deletes exactly the
+    calls that reasoned longest, which is the direction that manufactures a
+    null on a reasoning-effort ladder. ``agent_evolve.api.optimize`` therefore
+    passes the profile's declared ceiling by default (see
+    ``declared_max_output_tokens``) rather than accepting the provider's
+    silent one -- but this seam itself keeps NO default, so that a caller who
+    omits the cap still sends the sealed rows' exact body.
+
+    Which is why a missing completion now RAISES. ``choices[0].message.content``
+    can be ``None``, and this function used to return that ``None`` straight to
+    the caller -- who is documented above to never receive empty text, because
+    a policy that silently receives nothing degrades into random choice and
+    produces a null indistinguishable from an honest one. A ``None`` or blank
+    content is now treated exactly like a provider error: retried, and raised
+    after ``attempts``, carrying the ``finish_reason`` so the caller can see
+    the truncation rather than infer it.
+
+    JOURNAL SHAPE, stated once so readers can rely on it. What was SERVED is
+    always recorded -- ``model_served``, ``provider_served``, ``response_id``,
+    ``finish_reason``, ``native_finish_reason``, ``content_chars``, ``usage``
+    -- because truncation and provider drift are not effort-only hazards and
+    their evidence must not be gated on a pin the caller may not have used.
+    What was PINNED is recorded when it was sent: ``effort_requested`` and
+    ``max_output_tokens_requested`` appear only when the corresponding field
+    is in the body, so the ABSENCE of ``effort_requested`` in a record means
+    exactly one thing -- no ``reasoning`` field was sent, and the route
+    resolved its own ``default_effort``. That reading is what the M11 audit
+    used to separate the affected rows from the unaffected ones, and it stays
+    readable. ``provider_pinned`` is the single exception: it is always
+    present (``None`` when unpinned) because an auditor must pair it with
+    ``provider_served`` on EVERY record to ask "did this rung span providers?"
     """
 
     found = credential_for()
@@ -73,6 +140,10 @@ def completion_for(
         }
         if effort is not None:
             fields["reasoning"] = {"effort": effort}
+        if provider_only is not None:
+            fields["provider"] = {"only": list(provider_only)}
+        if max_output_tokens is not None:
+            fields["max_tokens"] = int(max_output_tokens)
         body = json.dumps(fields).encode()
         last: str | None = None
         for attempt in range(attempts):
@@ -89,19 +160,42 @@ def completion_for(
             except Exception as error:                  # network, decode, timeout
                 last = f"{type(error).__name__}: {error}"[:200]
             if payload is not None and "choices" in payload:
+                choice = payload["choices"][0]
+                text = (choice.get("message") or {}).get("content")
                 if journal is not None:
                     record = dict(model_requested=model,
                                   model_served=payload.get("model"),
-                                  usage=payload.get("usage") or {})
+                                  usage=payload.get("usage") or {},
+                                  provider_served=payload.get("provider"),
+                                  provider_pinned=(None if provider_only is None
+                                                   else list(provider_only)),
+                                  response_id=payload.get("id"),
+                                  finish_reason=choice.get("finish_reason"),
+                                  native_finish_reason=choice.get(
+                                      "native_finish_reason"),
+                                  content_chars=(None if text is None
+                                                 else len(text)))
                     if effort is not None:
-                        choice = payload["choices"][0]
                         record["effort_requested"] = effort
-                        record["finish_reason"] = choice.get("finish_reason")
-                        record["native_finish_reason"] = choice.get(
-                            "native_finish_reason")
+                    if max_output_tokens is not None:
+                        record["max_output_tokens_requested"] = int(
+                            max_output_tokens)
                     journal(record)
-                return payload["choices"][0]["message"]["content"]
-            if payload is not None:                     # a provider error body
+                if text is not None and text.strip():
+                    return text
+                # An empty completion is a NON-ANSWER, not an answer. At the
+                # top of the reasoning range the provider can spend the whole
+                # output budget on reasoning and return content=None with
+                # finish_reason="length"; returning that would hand a policy
+                # nothing while it reports a model arm. Retry, then raise.
+                last = (f"empty completion (finish_reason="
+                        f"{choice.get('finish_reason')!r}, native="
+                        f"{choice.get('native_finish_reason')!r}, "
+                        f"completion_tokens="
+                        f"{(payload.get('usage') or {}).get('completion_tokens')}"
+                        f", reasoning_tokens="
+                        f"{((payload.get('usage') or {}).get('completion_tokens_details') or {}).get('reasoning_tokens')})")
+            elif payload is not None:                   # a provider error body
                 last = json.dumps(payload.get("error", payload))[:300]
             time.sleep(2 ** attempt)
         raise RuntimeError(

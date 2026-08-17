@@ -571,6 +571,38 @@ def openrouter_model_execution_profile(
     return matches[0]
 
 
+def declared_max_output_tokens(model: str) -> "int | None":
+    """The completion ceiling THIS PRODUCT declares for *model*, or ``None``.
+
+    A route sent no ``max_tokens`` does not run uncapped; it runs at the
+    PROVIDER's undeclared default, which on ``openai/gpt-5.6-luna`` is 65,536
+    against a route ceiling of 128,000 and against the 128,000 the profile
+    above already declares.  The declaration was therefore unreachable from
+    the lightweight completion seam, and the gap silently truncated exactly
+    the calls that reasoned longest.  This resolver is the one place that
+    turns the declaration into a number a caller can send.
+
+    Matching is on ``requested_model`` and tolerates a harness prefix
+    (``"openrouter:openai/gpt-5.6-luna"``), because that is the form
+    ``Settings.model`` carries.  ``None`` means "this product declares
+    nothing for that route" -- an unknown model, or two profiles that
+    disagree -- and an honest ``None`` is returned rather than a guess, so
+    the caller keeps the pre-cap body instead of inventing a ceiling.
+    """
+
+    if type(model) is not str:
+        raise TypeError("model must be an exact string")
+    route = model.split(":", 1)[1] if ":" in model else model
+    declared = {
+        profile.max_output_tokens
+        for registry in (OPENROUTER_MODEL_EXECUTION_PROFILES,
+                         OPENROUTER_MODEL_EXECUTION_PROFILE_VARIANTS)
+        for profile in registry.values()
+        if profile.requested_model == route
+    }
+    return declared.pop() if len(declared) == 1 else None
+
+
 __all__ = [
     "DEEPSEEK_V4_PRO_STREAMLAKE_XHIGH",
     "DEEPSEEK_V4_PRO_STREAMLAKE_XHIGH_NATIVE_JSON",
@@ -584,5 +616,6 @@ __all__ = [
     "OpenRouterModelExecutionProfile",
     "QWEN_3_7_MAX_ALIBABA_XHIGH",
     "QWEN_3_7_MAX_ALIBABA_XHIGH_RATE_SAFE",
+    "declared_max_output_tokens",
     "openrouter_model_execution_profile",
 ]

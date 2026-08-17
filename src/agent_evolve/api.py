@@ -309,8 +309,22 @@ def optimize(
                     if journal_sink is not None:
                         journal_sink(record)
 
-                complete = completion_for(model or settings.model, settings,
-                                          journal=_record_usage, effort=effort)
+                # The shipped completion ceiling comes from the profile the
+                # product already declares for the route, not from the
+                # provider's undeclared default. Sending nothing was never
+                # "no cap": it was 65,536 on the default route, against the
+                # 128,000 the profile declares -- and the half that went
+                # missing was taken from the calls that reasoned longest.
+                # An unknown route still declares nothing, and then nothing
+                # is sent, so that path keeps the pre-cap body exactly.
+                from agent_evolve.integrations.pydantic_ai.model_execution_profile import (  # noqa: E501
+                    declared_max_output_tokens)
+
+                route = model or settings.model
+                cap = declared_max_output_tokens(route)
+                complete = completion_for(route, settings,
+                                          journal=_record_usage, effort=effort,
+                                          max_output_tokens=cap)
                 if complete is not None:
                     from agent_evolve.policies.semantics import domain_card
                     chooser = llm_chooser(
