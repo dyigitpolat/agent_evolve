@@ -1,5 +1,24 @@
 # Where this helps, and where it does not
 
+> **Read this alongside the README's [What is measured, and what is
+> not](../README.md#what-is-measured-and-what-is-not), which is the
+> authoritative scope and matches the paper claim for claim.** This file is
+> *regime guidance* — which shape of problem the tool suits, and what it costs
+> in wall-clock — drawn from earlier campaigns. Two things follow from that
+> division of labour and they matter:
+>
+> 1. **The claim of record is not in this file.** It is the dominance row in the
+>    README: 1.886× fewer charged evaluations than NSGA-II on a real RTL-to-GDS
+>    flow (`N = 48` in four blocks, `p = 0.0013`), and 1.959× fewer than our own
+>    credential-free loop. The `5.16×` below is an earlier, differently-scoped
+>    campaign and carries the three limits stated at the bottom of this file.
+> 2. **Two blocks that used to be here have been removed, not edited.** They
+>    reported results on a logic-synthesis venue that is **struck for venue
+>    validity** — the same strike the paper enforces with an automated gate — so
+>    the magnitudes may not be quoted, from here or from the archive. What
+>    replaces them is a note saying so, in the same place, so the absence cannot
+>    read as an oversight. See "Where it loses outright" below.
+
 Every number below was measured, most of them while trying to prove the
 opposite. They are published because knowing which problems this tool suits is
 worth more to you than a claim that it suits all of them, and because the
@@ -62,17 +81,26 @@ the provider. Nor does a more expensive evaluator: at 25.75x the evaluator
 cost, the classical arms reached our endpoint in 13-16 evaluations, which makes
 break-even undefined rather than favourable.
 
-**Where it loses outright.** On logic synthesis (BOiLS/ABC), uniform random
-search reached our endpoint in **0.55x** our evaluations -- it beat us -- and
-the official BOiLS implementation beat us on 3 of 4 seeds.
+**Where it loses outright — reported here as a non-hosting venue, without its
+numbers.** One of the ten venues we measured was a flow-synthesis benchmark on
+which uninformed random search beat us and the venue's own reference
+implementation beat us on most seeds. Those magnitudes are **struck for venue
+validity** and are therefore not quoted: the strike is on whether that venue can
+host a claim at all, not on whether the arithmetic was right, so restating the
+numbers "as a negative" would be citing exactly what was struck. The finding that
+survives is the shape and not the size — *there exist real venues where this
+loses to random search* — and it is why the two paragraphs below exist rather
+than a win rate.
 
-**Where no optimizer can be told from another.** On the BOiLS `multiplier`
-circuit, a single median random draw already accounts for roughly **80%** of
-the hypervolume a full 38-evaluation run produces, and the entire model-guided
-phase past the initial design is worth about **+1.03%**. That benchmark cannot
-separate any two optimizers, and neither can any benchmark like it. This is the
-single most useful thing we learned, and it is why `agent_evolve check` exists:
-your problem may be one of these, and half a minute will tell you.
+**Where no optimizer can be told from another.** Some benchmarks cannot separate
+any two optimizers: the spread a full run produces is inside the spread a handful
+of random draws produces, so every arm scores the same and whichever one you ran
+looks like the reason. This is the single most useful thing we learned, and it is
+why `agent_evolve diagnose` exists. It needs no model and no credential, and it
+answers the question before you spend anything — including on our own shipped
+`build_flags` example, where it returns a **no-headroom verdict** rather than a
+win (the transcript is in the README). Run it on *your* problem: half a minute of
+it beats any table, including this one.
 
 ## Cost
 

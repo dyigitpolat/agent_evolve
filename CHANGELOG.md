@@ -1,6 +1,77 @@
 # Changelog
 
-## 0.3.0 — unreleased
+## 0.4.0 — unreleased (the release cut)
+
+The cut that makes the package installable, swappable and honest about its own
+scope. Four defects found by *running* what the docs claimed, which is the only
+method that has ever worked here.
+
+### Fixed — four things that were described but not exercised
+
+- **The reference example did not run.** `agent_evolve run
+  examples.knapsack.problem_def:problem` and `python examples/knapsack/run.py`
+  both crashed deterministically, for every seed, with `ValueError: mask has 1
+  bits but the candidate has 3 loci`. A locus count is a property of a
+  *candidate*, not of a problem — a sequence field contributes one locus per
+  element — and the loop read it once from `seeds[0]`. `crossover` is now
+  defined on ragged parents (a locus the donor lacks is simply not inheritable)
+  and the mask is fitted to the parent it is applied to. Fixed-length genomes
+  are byte-identical, which is every measured row in the research record.
+  `tests/test_ragged_genome_recombination.py`.
+- **Every model call on the default route was rejected.** The completion seam
+  posts to OpenRouter's REST API, whose model IDs carry no provider prefix, but
+  the shipped default is `openrouter:openai/gpt-5.6-luna` — so each call
+  returned `HTTP 400: not a valid model ID`, four times, and the caller fell
+  back to the classical path. The fallback guarantee is why nothing crashed and
+  also why nobody noticed: the run produced a result and the ledger said
+  `calls: 0`. `wire_model()` strips only the `openrouter:` prefix; other vendor
+  prefixes are left alone so a mistake fails where it was made.
+  `tests/test_completion_wire_model.py`.
+- **`proposer="auto"` stopped choosing the credential-free path on machines with
+  no provider credential.** `credentials_present()` asked "does this look like a
+  secret", which is the *redaction* question, and `VSCODE_GIT_IPC_AUTH_TOKEN`
+  and `CLAUDE_CODE_MESSAGING_TOKEN` answered yes. Routing now requires a name a
+  model provider actually documents (`PROVIDER_CREDENTIAL_VARS`), or the
+  `AGENTEVOLVE_*` prefix as an explicit escape hatch. Redaction keeps the broad
+  rule, because over-classifying is safe there and unsafe here.
+  `tests/test_provider_credential_routing.py`.
+- **`cost_usd` was null on runs whose price was in the table.** Cost is now
+  derived from the provider's token counts and the package's published prices,
+  with `reported_by` naming both halves. An unpriced route still reports
+  unknown, never zero. `tests/test_provider_cost_reporting.py`.
+
+### Added — the drop-in claim, as a test
+
+- **`examples/pymoo_swap/`** is now two files that optimize the *same* pymoo
+  problem object: `nsga2_baseline.py` and `agentevolve_swap.py`. They differ by
+  six lines — one docstring, two imports, three lines of API contact — and the
+  problem definition does not change at all.
+  `tests/test_pymoo_swap_acceptance.py` recomputes that diff on every suite run
+  and fails if it grows, asserts both files still build the same problem, and
+  runs both arms. It deliberately does not assert which arm wins. The
+  single-file `swap_demo.py` it replaces is removed.
+
+### Changed — packaging and honesty
+
+- **Version is single-sourced** from `agent_evolve.__version__` via `dynamic =
+  ["version"]`; the metadata cannot drift from the attribute again.
+- **The `llm` extra pins `pydantic-ai==1.107.1`, `pydantic==2.13.4`,
+  `pydantic-core==2.46.4`** — the exact versions `boundary_codec` fails closed
+  on. The old `>=1.0,<2` range resolved 1.107.5 on a clean install and 27
+  boundary tests failed on first run. `tests/test_packaging_metadata.py` keeps
+  the metadata and the code's constants equal.
+- **New `pymoo` extra** for the swap example and its acceptance test.
+- **PEP 639 licence metadata** (`license = "MIT"`, `project.license-files`), and
+  `LICENSE.draft` is no longer shipped inside the wheel beside the real licence.
+  The build is now warning-free.
+- **`README.md` leads with the fallback guarantee**, states the venue-scoped
+  claims the paper states, and quotes real terminal output rather than
+  paraphrase. `README.oss.md` is removed: its scope table rested on a venue that
+  is struck for venue validity, and a draft that contradicts the paper is worse
+  than no draft. `docs/scope.md`'s two blocks on that venue are replaced by a
+  non-hosting note, so the absence cannot read as an oversight.
+
+## 0.3.0 — superseded by 0.4.0 before release
 
 The release that turns a research artifact into something a stranger can
 install and get value from.

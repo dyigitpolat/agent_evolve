@@ -91,6 +91,42 @@ def _resolve_proposer(proposer: str, announce: Callable[[str], None]) -> str:
     return "random"
 
 
+def _priced_usage(
+    route: str, input_tokens: int, output_tokens: int
+) -> tuple[Optional[str], str]:
+    """``(cost_usd, reported_by)`` for a run's token counts.
+
+    The two halves of a cost figure come from different places and the reporter
+    string says which is which: the token counts are the provider's own, the
+    per-million prices are this package's published table -- the same numbers
+    the CLI echoes before it spends anything. Keeping the provenance in the
+    field means nobody has to guess later whether a dollar figure was billed or
+    computed.
+
+    An unpriced route returns ``None``. A cost that cannot be derived is
+    reported as unknown rather than as zero, because zero reads as "nothing was
+    spent" when it means "nobody looked".
+    """
+    from decimal import Decimal
+
+    from agent_evolve.settings import model_price
+
+    measured = "openrouter response usage"
+    price = model_price(route)
+    if price is None:
+        return None, measured
+    per_m_in, per_m_out = price
+    million = Decimal(1_000_000)
+    cost = (
+        Decimal(str(per_m_in)) * Decimal(input_tokens) / million
+        + Decimal(str(per_m_out)) * Decimal(output_tokens) / million
+    )
+    return (
+        str(cost.quantize(Decimal("0.000001"))),
+        f"{measured}; cost derived from the package's published price table",
+    )
+
+
 def _build_harness(kind: str, seed: Optional[int], settings: AgentEvolveSettings) -> Any:
     bootstrap.load_integrations()
     if kind == "random":
@@ -437,12 +473,22 @@ def optimize(
                         result.telemetry,
                         mechanisms=result.telemetry.mechanisms + extra.mechanisms))
             if usage_ledger["calls"] and usage_ledger["tokens_known"]:
+                # Cost is DERIVED, and the reporter says so. The tokens are the
+                # provider's own count; the price is this package's published
+                # table (`MODEL_PRICES_PER_MTOK`), which is the same number the
+                # CLI echoes before spending anything. A route the table does
+                # not name reports `cost_usd: null` -- unknown stays unknown
+                # rather than becoming a guess with a dollar sign on it.
+                route = model or settings.model
+                cost_usd, reporter = _priced_usage(
+                    route, usage_ledger["input"], usage_ledger["output"])
                 usage = ProviderUsageSummary(
                     calls=usage_ledger["calls"],
                     input_tokens=usage_ledger["input"],
                     output_tokens=usage_ledger["output"],
-                    model=model or settings.model,
-                    reported_by="openrouter response usage",
+                    cost_usd=cost_usd,
+                    model=route,
+                    reported_by=reporter,
                 )
             else:
                 usage = ProviderUsageSummary(

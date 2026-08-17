@@ -447,9 +447,18 @@ def run_genetic_loop(
             a = population[choice.parent_a % len(population)][0]
             b = population[choice.parent_b % len(population)][0]
             mask = choice.mask
-            if len(mask) != n_loci:              # a chooser may be wrong; the
-                mask = mask[:n_loci] + tuple(    # loop must not crash on it
-                    bool(r.getrandbits(1)) for _ in range(n_loci - len(mask))
+            # The mask is fitted to the parent it is about to be applied to,
+            # NOT to `n_loci`. A locus count is a property of a candidate, not
+            # of a problem: a field holding a sequence contributes one locus per
+            # element, so two candidates of the same problem legitimately have
+            # different genome lengths. `n_loci` is read once from seeds[0], and
+            # using it here made the shipped knapsack example -- whose seeds are
+            # a 1-item and a 3-item selection -- crash deterministically on the
+            # first generation, because a 1-bit mask met a 3-locus parent.
+            want_bits = len(loci_of(a))
+            if len(mask) != want_bits:           # a chooser may be wrong; the
+                mask = mask[:want_bits] + tuple( # loop must not crash on it
+                    bool(r.getrandbits(1)) for _ in range(want_bits - len(mask))
                 )
             kid = crossover(a, b, mask=mask)
             return mutate(kid, candidate_model, rate=config.mutation_rate,

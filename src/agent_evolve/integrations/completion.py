@@ -17,12 +17,46 @@ import os
 import time
 from typing import Any, Callable, Optional, Sequence
 
-__all__ = ["Completion", "completion_for", "credential_for"]
+__all__ = ["Completion", "completion_for", "credential_for", "wire_model"]
 
 Completion = Callable[[str], str]
 
 _ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 _KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY")
+
+#: The harness prefix ``Settings.model`` carries. This seam talks to
+#: OpenRouter's REST API directly, and OpenRouter's wire model IDs do not carry
+#: it -- so it has to come off before the body is built.
+_HARNESS_PREFIX = "openrouter:"
+
+
+def wire_model(model: str) -> str:
+    """The OpenRouter wire model ID for a configured route.
+
+    One setting, ``AGENTEVOLVE_MODEL``, feeds two consumers that spell a model
+    differently: the pydantic-ai harness wants the provider-qualified
+    ``openrouter:openai/gpt-5.6-luna``, and this raw-HTTP seam wants the bare
+    ``openai/gpt-5.6-luna``. The package's *default* is written in the harness
+    spelling, so every call this seam made on the default route was rejected:
+
+        HTTP 400: "openrouter:openai/gpt-5.6-luna is not a valid model ID"
+
+    four times per call, after which the caller fell back to the classical path
+    -- which is the fallback guarantee doing its job, and also why the failure
+    could sit there unnoticed: the run still produced a result, and the usage
+    ledger reported ``calls: 0`` because no call ever completed.
+
+    Only the ``openrouter:`` prefix is removed. A different vendor prefix is
+    left exactly as written, because rewriting it would quietly send one
+    vendor's model ID to another vendor rather than failing where the mistake
+    is. Bodies that worked before are byte-identical, so no sealed replay
+    moves: the only strings this changes are the ones the provider rejected.
+    """
+    if type(model) is not str:
+        raise TypeError("model must be an exact string")
+    if model.lower().startswith(_HARNESS_PREFIX):
+        return model[len(_HARNESS_PREFIX):]
+    return model
 
 
 def credential_for() -> Optional[tuple[str, str]]:
@@ -129,13 +163,16 @@ def completion_for(
     if found is None:
         return None
     _name, key = found
+    # The body carries the wire ID; `model_requested` in the journal keeps the
+    # configured route, so a record still says which route was asked for.
+    on_the_wire = wire_model(model)
 
     def complete(prompt: str) -> str:
         import urllib.error
         import urllib.request
 
         fields: dict[str, Any] = {
-            "model": model,
+            "model": on_the_wire,
             "messages": [{"role": "user", "content": prompt}],
         }
         if effort is not None:

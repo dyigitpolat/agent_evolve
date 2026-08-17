@@ -76,10 +76,89 @@ _CREDENTIAL_SUFFIXES = (
 )
 
 
+#: The variable names model providers actually document. Used ONLY to answer the
+#: routing question below -- never to decide what to redact.
+#:
+#: Exact names, not a vendor substring. A substring rule reads
+#: `CLAUDE_CODE_MESSAGING_TOKEN` -- an agent harness's own IPC token -- as an
+#: Anthropic credential, which is the same false positive one level down. A new
+#: provider is one line here, and `proposer="llm"` reaches any provider without
+#: consulting this list at all.
+PROVIDER_CREDENTIAL_VARS = frozenset({
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_GENAI_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "MISTRAL_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GROQ_API_KEY",
+    "COHERE_API_KEY",
+    "CO_API_KEY",
+    "XAI_API_KEY",
+    "GROK_API_KEY",
+    "TOGETHER_API_KEY",
+    "FIREWORKS_API_KEY",
+    "PERPLEXITY_API_KEY",
+    "CEREBRAS_API_KEY",
+    "MOONSHOT_API_KEY",
+    "HUGGINGFACE_API_KEY",
+    "HUGGING_FACE_HUB_TOKEN",
+    "HF_TOKEN",
+    "AZURE_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "AWS_BEDROCK_API_KEY",
+    "OLLAMA_API_KEY",
+})
+
+#: Prefix reserved for this package, so an operator can declare a credential for
+#: a provider the list above does not name yet without editing the package.
+_PROVIDER_VAR_PREFIX = "AGENTEVOLVE_"
+
+
 def is_credential_name(name: str) -> bool:
-    """Whether *name* looks like a secret rather than plain configuration."""
+    """Whether *name* looks like a secret rather than plain configuration.
+
+    This is the **redaction** predicate: it decides what must not be echoed and
+    what an allowlist has to name explicitly. Over-classifying here is safe --
+    it protects more -- so the rule stays deliberately generic and no provider
+    is named, which is why a new provider is covered the day it first appears in
+    a ``.env``.
+
+    It is *not* the routing predicate. See :func:`is_provider_credential_name`.
+    """
     upper = name.upper()
     return upper.endswith(_CREDENTIAL_SUFFIXES) or upper in {"API_KEY", "TOKEN", "SECRET"}
+
+
+def is_provider_credential_name(name: str) -> bool:
+    """Whether *name* plausibly holds a credential for a **model provider**.
+
+    The two questions the generic rule above used to answer at once are not the
+    same question, and conflating them had a consequence in exactly one
+    direction. `credentials_present()` decides whether ``proposer="auto"`` may
+    reach a provider at all; asking "does this look like a secret" answered
+    *yes* for `VSCODE_GIT_IPC_AUTH_TOKEN` and `CLAUDE_CODE_MESSAGING_TOKEN`, so
+    on an ordinary developer machine -- an editor open, an agent running, no
+    provider account anywhere -- ``auto`` stopped choosing the credential-free
+    path and announced that it had found a credential. The documented default
+    was being flipped by a variable belonging to something else entirely.
+
+    So routing requires *both* a credential-shaped name and a vendor this
+    package can reach. Over-classifying is safe for redaction and unsafe for
+    routing, and the asymmetry is why these are two functions.
+
+    The escape hatch is explicit rather than inferred: ``proposer="llm"`` never
+    consults this at all, so an unrecognized vendor is one flag away and never a
+    silent misroute. ``AGENTEVOLVE_*`` credential names also route, so an
+    operator can declare one without editing the package.
+    """
+    upper = name.upper()
+    if upper in PROVIDER_CREDENTIAL_VARS:
+        return True
+    return upper.startswith(_PROVIDER_VAR_PREFIX) and is_credential_name(upper)
 
 
 def scrubbed_names() -> Tuple[str, ...]:
@@ -248,12 +327,18 @@ def credentials_present() -> bool:
     name the operator scrubbed does not count as present, so a run launched to
     demonstrate that it made no provider call falls back to random rather than
     quietly finding a key somewhere else.
+
+    The test is :func:`is_provider_credential_name`, not the broad redaction
+    rule: a secret-shaped variable belonging to an editor or an agent is not
+    evidence of a model-provider account, and treating it as one turned the
+    credential-free default off on machines that had no provider credential at
+    all.
     """
     scrubbed = set(scrubbed_names())
     for name, value in os.environ.items():
         if not value or name in scrubbed:
             continue
-        if is_credential_name(name):
+        if is_provider_credential_name(name):
             return True
     return False
 
@@ -268,6 +353,8 @@ __all__ = [
     "model_price",
     "enforce_scrubbed_environment",
     "is_credential_name",
+    "is_provider_credential_name",
+    "PROVIDER_CREDENTIAL_VARS",
     "load_credentials",
     "scrubbed_names",
 ]

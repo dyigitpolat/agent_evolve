@@ -28,7 +28,10 @@ from agent_evolve.core.results import Candidate, SearchResult
 from agent_evolve.harness.registry import harness_registry
 from agent_evolve.proposers.random_proposer import RandomProposer
 
-__version__ = "0.3.0"
+#: The one place the version is written. `pyproject.toml` declares
+#: `dynamic = ["version"]` and reads this literal, so the distribution metadata
+#: and the importable attribute cannot disagree.
+__version__ = "0.4.0"
 
 #: The supported public surface.
 __all__ = [

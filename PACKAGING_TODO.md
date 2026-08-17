@@ -128,3 +128,62 @@ an uncommitted working-tree addition, additive-only, backed by
 - Still open: HarnessBase not public while `harness_registry` is; `--json`
   output; `check` model-arm single-shot; `_LEGACY_EXPORTS` trim decision;
   LICENSE owner review; Beta classifier; untracked-file hygiene for sdist.
+
+---
+
+## State update 2026-08-18 — the V6 release cut (append-only)
+
+Everything below was **verified by running it**, not by reading the code. The
+transcripts are in `papers/agent_evolve_iclr_2027/V6_RELEASE.md`.
+
+### Closed
+
+- **Version skew, structurally.** `pyproject.toml` is now `dynamic =
+  ["version"]` reading `agent_evolve.__version__`. One literal, in the code.
+  `tests/test_packaging_metadata.py::test_version_is_single_sourced_from_the_code`
+  refuses a literal in the metadata; a second test asserts the installed
+  distribution and the attribute agree.
+- **The `pymoo` extra exists** (`pymoo>=0.6,<0.7`), and is in `all`.
+- **The swap demo is committed and wired into the suite** — and rebuilt as two
+  sibling files whose *diff* is the assertion. See `examples/pymoo_swap/README.md`.
+- **`--json`**: `run --json` verified end to end on a clean wheel install,
+  parses, and now carries a derived `cost_usd` with its provenance.
+- **`LICENSE.draft` is no longer distributed.** `project.license-files =
+  ["LICENSE"]` (PEP 639). The wheel had been shipping a file whose first line
+  reads "DRAFT — NOT IN EFFECT" beside the real licence.
+- **sdist/wheel hygiene.** Neither `abc.history` nor `.probe_launch/` reaches
+  the sdist (checked by listing the archive). Build emits zero warnings.
+- **Dependency floors are verified, not asserted.** A fresh venv at the declared
+  floors (`pydantic==2.7.4`, `python-dotenv==1.0.1`) runs the CLI end to end.
+- **The `llm` extra no longer declares a range the code refuses.** It pins the
+  three versions `boundary_codec` fails closed on; a test keeps metadata and
+  code equal.
+- **`README.oss.md` is deleted.** Six of its ten scope rows quoted a venue that
+  the paper's struck-citation gate strikes for venue validity. Its useful
+  content (the migration table, the five-obligation table) is in `README.md`.
+
+### Still open, and now explicit
+
+- [ ] **LICENSE holder line — the one item that is the owner's and only the
+      owner's.** `LICENSE` currently reads `Copyright (c) 2026 Yigit Polat`;
+      `LICENSE.draft` offers the impersonal `AgentEvolve authors`. Neither has
+      been signed off. Nothing in this cut changed either file. Decide, then
+      either keep `LICENSE` as is or promote the draft over it.
+- [ ] **Integer loci with `ge`/`le` bounds declare no finite domain**, so the
+      operators leave them alone — `diagnose` says so out loud, and the knapsack
+      example searches nothing because of it. Making bounded integers
+      enumerable is a genuine generic improvement *and* it would change search
+      behaviour on every venue with an integer locus, including measured ones.
+      That is a research-integrity call, not a packaging one.
+- [ ] **`Development Status :: 4 - Beta`** — still the declared signal; confirm
+      it is the intended one for a first public cut.
+- [ ] **651 `_LEGACY_EXPORTS`** — ship-as-is remains the default; unchanged.
+- [ ] **`HarnessBase` is not public while `harness_registry` is** — unchanged.
+- [ ] **`check`'s model arm is single-shot at `seed=0`** while `--repeats`
+      applies to the baseline only — unchanged, and `--help` still does not say so.
+- [ ] **`check` has no `--json`.** `run` does. Scripted use of the verdict still
+      has to parse prose.
+- [ ] **A scope snapshot inside the package.** `README.md` now carries the
+      numbers with their wave names, but the archive itself is deliberately not
+      distributed. A `docs/measurements.md` vendored snapshot is still the
+      cleanest answer for a standalone GitHub release.

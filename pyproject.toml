@@ -1,14 +1,28 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+# >=77 for PEP 639: `license` as an SPDX expression and `project.license-files`.
+# The older spellings (`license = {text = ...}`, a License classifier,
+# `tool.setuptools.license-files`) all build with a deprecation warning today and
+# stop working in Feb 2027, which is inside this tool's expected life.
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent_evolve"
-version = "0.3.0"
-description = "Multi-objective optimization driven by a language model, with the chance baseline built in"
+# Single-sourced from the code, which is the SSOT. Two literals drift, and this
+# one already had: the wheel metadata and `agent_evolve.__version__` disagreed
+# for a release cycle, so `agent_evolve version` printed a number no source file
+# contained. `tests/test_packaging_metadata.py` asserts they still agree.
+dynamic = ["version"]
+description = "A drop-in NSGA-II replacement whose authored machinery installs only when measurement says it beats the classical path"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+# Named explicitly, because the default glob is LICENSE* and that shipped
+# `LICENSE.draft` -- whose first line reads "DRAFT -- NOT IN EFFECT" -- into the
+# wheel beside the real licence. A distribution must carry exactly the licence
+# that governs it. The draft stays in the repository as the owner-review
+# artifact for the copyright-holder line, and is not distributed.
+license-files = ["LICENSE"]
 keywords = ["optimization", "multi-objective", "pareto", "llm", "evolutionary"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -16,7 +30,6 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -32,18 +45,51 @@ dependencies = [
 [project.optional-dependencies]
 # The model-driven proposer. Without it the package still installs and still
 # runs -- `proposer="random"` needs no provider and no credentials.
-llm = ["pydantic-ai>=1.0,<2"]
-pydantic_ai = ["pydantic-ai>=1.0,<2"]  # previous name, kept working
+#
+# These three ARE exact pins, against the rule stated above, and the reason is
+# in the code rather than in taste. `integrations/pydantic_ai/boundary_codec.py`
+# declares SUPPORTED_PYDANTIC_AI_VERSION / SUPPORTED_PYDANTIC_VERSION /
+# SUPPORTED_PYDANTIC_CORE_VERSION and *fails closed* on anything else, because
+# the recorded provider boundary has to replay bit-exactly for a sealed run to
+# mean anything. Declaring a range the code refuses to honour is worse than
+# pinning: a clean `pip install 'agent_evolve[llm]'` resolved pydantic-ai
+# 1.107.5 and 27 boundary-codec tests failed closed on first run. The metadata
+# now says what the code supports. `tests/test_packaging_metadata.py` asserts
+# these pins equal the constants, so widening one without the other is a test
+# failure rather than a silent install-time break.
+llm = [
+    "pydantic-ai==1.107.1",
+    "pydantic==2.13.4",
+    "pydantic-core==2.46.4",
+]
+pydantic_ai = [  # previous name, kept working
+    "pydantic-ai==1.107.1",
+    "pydantic==2.13.4",
+    "pydantic-core==2.46.4",
+]
 # The numerical acquisition engine. Kept as a proposal source alongside the
 # model, not replaced by it: the model supplies hit rate, the engine supplies
 # the rare large hit that carries a heavy-tailed total, and a good slate
 # composes both. Heavy, so it is opt-in.
 research = ["botorch>=0.11", "numpy>=1.24"]
+# The classical comparator, needed only by the drop-in swap example and its
+# acceptance test. The adapter itself never imports pymoo -- it reads the four
+# attributes every pymoo Problem carries -- so the core install stays at two
+# dependencies and `examples/pymoo_swap/` is what needs this extra.
+pymoo = ["pymoo>=0.6,<0.7"]
 # numpy is imported directly by some research analysis tests. It belongs in
 # dev rather than research because CI installs dev and runs collection over
 # the whole suite.
 dev = ["pytest>=7", "pytest-timeout>=2", "numpy>=1.24"]
-all = ["pydantic-ai>=1.0,<2", "pytest>=7", "pytest-timeout>=2", "numpy>=1.24"]
+all = [
+    "pydantic-ai==1.107.1",
+    "pydantic==2.13.4",
+    "pydantic-core==2.46.4",
+    "pymoo>=0.6,<0.7",
+    "pytest>=7",
+    "pytest-timeout>=2",
+    "numpy>=1.24",
+]
 
 [project.scripts]
 agent_evolve = "agent_evolve.cli:main"
@@ -51,6 +97,9 @@ agent_evolve = "agent_evolve.cli:main"
 [project.urls]
 Homepage = "https://github.com/dyigitpolat/agent_evolve"
 Source = "https://github.com/dyigitpolat/agent_evolve"
+
+[tool.setuptools.dynamic]
+version = { attr = "agent_evolve.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

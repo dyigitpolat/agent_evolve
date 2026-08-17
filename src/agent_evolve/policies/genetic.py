@@ -248,6 +248,17 @@ def crossover(
     how an external chooser -- a model, a heuristic -- expresses *where to cut*
     without ever authoring a candidate. With no mask, each locus is drawn
     independently at random, which is the unguided control.
+
+    The mask is indexed by *parent_a*'s loci, and its length must match them:
+    a mask of the wrong length is a caller bug and is refused by name rather
+    than silently reinterpreted.
+
+    **Ragged genomes.** When a field holds a sequence, each element is a locus,
+    so two candidates of the same problem may have different genome lengths.
+    A locus that *parent_b* does not have cannot be inherited from it, so the
+    child keeps *parent_a*'s value there. Recombination is therefore defined on
+    the loci the parents share, which reduces exactly to the fixed-length case
+    when the shapes match.
     """
 
     loci = loci_of(parent_a)
@@ -258,9 +269,10 @@ def crossover(
         raise ValueError(
             f"mask has {len(mask)} bits but the candidate has {len(loci)} loci"
         )
+    donor = frozenset(loci_of(parent_b))
     child = dict(parent_a)
     for locus, take_b in zip(loci, mask):
-        if take_b:
+        if take_b and locus in donor:
             child = write_locus(child, locus, read_locus(parent_b, locus))
     return child
 
