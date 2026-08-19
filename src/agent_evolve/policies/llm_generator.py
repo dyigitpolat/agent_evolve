@@ -69,7 +69,7 @@ prior is strong that is worth a great deal, while where one is not it is worth
 exactly nothing, three times measured.
 
 ``reauthor_every`` is the other trigger, and it fires on SEARCH PROGRESS
-rather than on defects: after the run has charged that many evaluations, the
+rather than on defects: after the run has MEASURED that many more rows, the
 generator is re-authored against the measured
 ``(configuration -> objectives)`` trace -- the current front, what improved
 and what did not, and which parameter the measurements say moves which cost
@@ -81,6 +81,19 @@ NOTHING -- and a GATE refuses it, rather than trusts it, whenever it is
 undeclared, empty, garbage-weighted or concentrated past the declared
 weight-ratio cap. Because nothing is excluded, excluding a measured front
 member is structurally impossible rather than gated against.
+
+The evidence is WHAT THE RUN MEASURED, not what this generator produced. Every
+charged evaluation the loop holds -- the initial population, a structure
+screen, and the generator's own children alike -- arrives through
+``note_measured``; only the children additionally move the attribution
+counters, through ``record_measured``. Keeping those two apart is what lets
+the channel speak at the first generation instead of the third: while the
+evidence clock was the generator's own children, the locus prior could not be
+authored before a median charge of 40 on a venue whose dominant knob is
+legible by charge 19, which is the whole of the W11 defect. ``reauthor_every``
+therefore governs how often an evidence call RECURS, and ``evidence_min_rows``
+-- default: the fewest rows a determinable effect can be computed from --
+governs when the first one may fire.
 
 Both are OFF by default (``reauthor_every=0``), and off is the seam that ran
 every sealed row to date. Both record what evidence the model was shown (its
@@ -117,6 +130,7 @@ from agent_evolve.policies.llm_surrogate import (
     json_compact,
 )
 from agent_evolve.policies.measurement_evidence import (
+    MIN_EVIDENCE_ROWS,
     WEIGHTED_RESTRICTION_PROMPT,
     MeasuredRow,
     admit_weighted_restriction,
@@ -1033,6 +1047,7 @@ class AuthoredGenerator:
         max_reauthorings: int = 0,
         evidence_view: Optional[Callable[[Sequence[MeasuredRow]],
                                          Sequence[MeasuredRow]]] = None,
+        evidence_min_rows: int = 0,
         evidence_front_shown: int = 8,
         evidence_effects_shown: int = 8,
         prior_author: Optional[Callable[[str], str]] = None,
@@ -1047,6 +1062,11 @@ class AuthoredGenerator:
         if reauthor_every < 0:
             raise ValueError(
                 f"reauthor_every must be non-negative, got {reauthor_every}")
+        if evidence_min_rows < 0:
+            raise ValueError(
+                "evidence_min_rows is the fewest measured rows the evidence "
+                "channel will author from and must be non-negative, got "
+                f"{evidence_min_rows}")
         if prior_max_weight_ratio < 1.0:
             raise ValueError(
                 "prior_max_weight_ratio caps a graded prior's concentration "
@@ -1098,6 +1118,21 @@ class AuthoredGenerator:
         #: it is a parameter rather than a patch precisely so the control can
         #: be built without editing this file.
         self.evidence_view = evidence_view
+        #: WHEN the channel may speak for the FIRST time, in measured rows.
+        #: The cadence above says how often an evidence call recurs; it cannot
+        #: also say when the first one is allowed, because a run holds
+        #: measurements before this generator has produced any (the initial
+        #: population is the whole of the evidence at generation 1) and a
+        #: cadence read as "wait for that many of MY OWN children" makes the
+        #: channel arrive generations after the evidence did -- the W11 defect.
+        #: ``0`` (the default) means AS SOON AS THE GATE CAN BE MET:
+        #: :data:`~agent_evolve.policies.measurement_evidence.MIN_EVIDENCE_ROWS`
+        #: rows, the fewest a determinable effect can be computed from. Setting
+        #: it equal to ``reauthor_every`` restores the pure-cadence rule
+        #: exactly, so the older behaviour is a declared configuration rather
+        #: than a lost one.
+        self.evidence_min_rows = (int(evidence_min_rows) if evidence_min_rows
+                                  else MIN_EVIDENCE_ROWS)
         self.evidence_front_shown = int(evidence_front_shown)
         self.evidence_effects_shown = int(evidence_effects_shown)
         #: The locus-importance channel, and the gate that refuses it.
@@ -1119,10 +1154,14 @@ class AuthoredGenerator:
         self._pending_edit: Optional[Dict[str, Any]] = None
         #: The measured trace, in measurement order. This is the evidence, and
         #: it is the ONLY thing this class knows about outcomes: it arrives
-        #: through `record_measured`, which the loop already calls, so the
-        #: generator still never sees the problem, the evaluator or the cache.
+        #: through `note_measured` -- which the loop calls for EVERY charged
+        #: evaluation it holds, whoever produced it -- so the generator still
+        #: never sees the problem, the evaluator or the cache.
         self._rows: List[MeasuredRow] = []
         self._evidence_at = 0
+        #: How many evidence ticks have fired. The first one is gated on
+        #: evidence (``evidence_min_rows``); every later one on the cadence.
+        self._evidence_ticks = 0
         self._prior_asked_at = -1
         self._prior: Any = None
         self._prior_batches = 0
@@ -1150,6 +1189,38 @@ class AuthoredGenerator:
         for config in configs:
             self._seen.add(candidate_key(config))
 
+    def note_measured(
+        self,
+        config: Config,
+        *,
+        objectives: Mapping[str, float],
+        survived: bool = False,
+    ) -> None:
+        """One charged evaluation the RUN holds. Evidence, not attribution.
+
+        Evidence is *what has been measured*, not *what this component
+        produced*. The distinction is the whole of the W11 fix: the initial
+        population, and anything else the loop charged before or beside this
+        generator, is measurement the model can reason over and must be shown
+        -- while the survival counters that decide whether the generator is
+        deficient stay credited to its own children alone (:meth:
+        `record_measured`). Conflating the two either blinds the channel for
+        two generations or forges the attribution; keeping them apart costs
+        one method.
+
+        The row is kept whether or not it survived, because "this region was
+        measured and is NOT competitive" is exactly the evidence a survivor
+        list cannot carry.
+
+        It does NOT touch the novelty ledger. What the run has already tried is
+        ``note_archive``'s declared job, the loop already calls it, and having
+        a second entry point quietly feed the same set would change the
+        duplicate and overlap counters of runs with this channel OFF -- which
+        must stay byte-identical to the sealed seam.
+        """
+
+        self._rows.append((dict(config), dict(objectives), bool(survived)))
+
     def record_measured(
         self,
         config: Config,
@@ -1157,15 +1228,17 @@ class AuthoredGenerator:
         survived: bool,
         objectives: Optional[Mapping[str, float]] = None,
     ) -> None:
-        """Credit at survival time, exactly as the operator portfolio does."""
+        """Credit at survival time, exactly as the operator portfolio does.
+
+        This generator's OWN child: it is both evidence and attribution, so
+        the row is noted and the counters that judge this generator move.
+        """
 
         self._seen.add(candidate_key(config))
         self.telemetry.measured += 1
         if objectives is not None:
-            # The measured trace: kept whether or not it survived, because
-            # "this region was measured and is NOT competitive" is exactly the
-            # evidence a survivor list cannot carry.
-            self._rows.append((dict(config), dict(objectives), bool(survived)))
+            self.note_measured(config, objectives=objectives,
+                               survived=survived)
         if survived:
             self.telemetry.survived += 1
             if objectives is not None:
@@ -1210,7 +1283,8 @@ class AuthoredGenerator:
         self._maybe_reauthor(declared, due)
         self._maybe_author_prior(declared, due)
         if due:
-            self._evidence_at = self.telemetry.measured
+            self._evidence_at = len(self._rows)
+            self._evidence_ticks += 1
         domains = self._effective_domains(declared)
         shown = [dict(config) for config in list(archive)[:self.archive_shown]]
         self._maybe_revise()
@@ -1510,20 +1584,51 @@ class AuthoredGenerator:
             rows, self.objectives, domains,
             front_shown=self.evidence_front_shown,
             effects_shown=self.evidence_effects_shown,
-            charged=self.telemetry.measured)
+            # What the RUN charged and this generator was told about, not what
+            # it produced: the model is entitled to know how much of the
+            # budget bought the rows in front of it.
+            charged=len(self._rows))
 
     def _due(self) -> bool:
-        """Has the archive grown by ``reauthor_every`` charged evaluations?"""
+        """Is an evidence-conditioned call due, and on WHOSE clock?
 
-        return (self.reauthor_every > 0
-                and self.telemetry.measured - self._evidence_at
-                >= self.reauthor_every)
+        Two conditions, in the order they bind.
+
+        The channel cannot reason about rows it does not hold, so the FIRST
+        call waits on EVIDENCE and nothing else: ``evidence_min_rows`` measured
+        rows, which by default is the fewest a determinable effect can be
+        computed from. Everything after it waits on the declared CADENCE --
+        ``reauthor_every`` further measured rows since the last call.
+
+        Splitting the two is the W11 fix. A single cadence had to answer both
+        questions at once, and answering "when may it first speak?" with "when
+        my own children number N" made the channel arrive two generations
+        after the evidence did: on the EDA venue the prior was authored at a
+        median charge of 40 against a 43.5-charge target, with the run's first
+        20 charges structurally invisible to it. Rows are counted, not
+        children; ``reauthor_every == 0`` still means the channel never fires.
+        """
+
+        if self.reauthor_every <= 0:
+            return False
+        if len(self._rows) < self.evidence_min_rows:
+            return False
+        if self._evidence_ticks == 0:
+            return True
+        return len(self._rows) - self._evidence_at >= self.reauthor_every
 
     def _log(self, kind: str, *, rows: int, evidence: str,
              emitted: Optional[str], accepted: bool, **extra: Any) -> None:
         record: Dict[str, Any] = {
             "kind": kind,
+            # Two different clocks, both recorded, neither standing in for the
+            # other: `at_measured` is this generator's OWN children (the
+            # attribution clock) and `at_rows` is every charged measurement the
+            # run had reported to it (the evidence clock). Before W11 they were
+            # the same number, which is precisely why the channel's lateness
+            # was invisible in its own telemetry.
             "at_measured": int(self.telemetry.measured),
+            "at_rows": len(self._rows),
             "rows_shown": int(rows),
             "evidence_sha256": evidence_digest(evidence),
             "evidence_chars": len(evidence),

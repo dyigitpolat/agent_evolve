@@ -48,6 +48,7 @@ from agent_evolve.core.results import dominates
 from agent_evolve.policies.genetic import Locus, loci_of, read_locus
 
 __all__ = [
+    "MIN_EVIDENCE_ROWS",
     "MeasuredRow",
     "EvidenceView",
     "front_of",
@@ -67,6 +68,16 @@ __all__ = [
 #: and whether it survived selection. Survival is the run's own weight-free
 #: quality verdict and costs nothing extra to carry.
 MeasuredRow = Tuple[Mapping[str, Any], Mapping[str, float], bool]
+
+#: The fewest measured rows from which this module can render ONE determinable
+#: statement about which knob moves which cost -- ``spearman`` is undefined
+#: below three pairs, so evidence built from fewer rows carries a front and a
+#: progress line and not a single ``effects`` entry, which is the term the
+#: locus-importance channel exists to act on. It is therefore the honest floor
+#: for "the evidence gate can be met", and it is exported so a consumer states
+#: its threshold in terms of what the evidence can actually support rather
+#: than picking a number.
+MIN_EVIDENCE_ROWS = 3
 
 #: The seam a CONTROL arm wraps. A view receives the rows this run measured
 #: and returns the rows the model will be shown. The identity view is the

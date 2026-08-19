@@ -19,7 +19,8 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import (
+    Any, Callable, Dict, List, Mapping, Optional, Sequence, Set)
 
 from agent_evolve.core.problem import ObjectiveSpec
 from agent_evolve.core.results import SearchResult, dominates
@@ -308,6 +309,34 @@ def run_genetic_loop(
         del state.side_information[:-64]            # bounded, newest kept
         return valid
 
+    def remember_measured(results: Sequence[Any],
+                          surviving: Optional[Set[str]] = None) -> None:
+        """Report charged measurements to the generator as EVIDENCE.
+
+        Every charge the run makes, whoever proposed it. A generator that
+        reasons over measurements is reasoning about the SPACE, and the space
+        does not care which component produced the point: the initial
+        population and the structure screen are measurements this run paid
+        for, and withholding them leaves the channel blind until the loop has
+        spent two generations reproducing evidence it already had. That was
+        W11, measured: the locus prior could not be authored before a median
+        charge of 40 on a venue whose dominant knob is legible by charge 19.
+
+        Attribution is the separate call: a generator is credited only with
+        the children it drew, so its survival counters -- and the revision and
+        unwind rules that read them -- are untouched by what it is shown.
+        """
+
+        generator = config.generator
+        note = getattr(generator, "note_measured", None)
+        if generator is None or not results or note is None:
+            return
+        kept = surviving or set()
+        for result in results:
+            note(result.configuration,
+                 objectives=dict(result.objectives),
+                 survived=_default_candidate_key(result.configuration) in kept)
+
     # --- initial population: the seeds, then SCHEMA-UNIFORM draws -----------
     # Not mutants of the seed. A population of near-copies of one
     # configuration is an anchored cloud around it; measured on a third-party
@@ -334,6 +363,10 @@ def run_genetic_loop(
                                   size=config.structure_budget, rng=rng,
                                   pool_by_field=config.structure_pooled)
         screen_valid = measure(screened, 0)
+        # Charged, therefore evidence. The screen's points never enter a
+        # population, so none of them is marked survived -- an absent verdict
+        # reported as absent rather than invented.
+        remember_measured(screen_valid)
         if screen_valid:
             attr = attribute(
                 [(r.configuration, dict(r.objectives)) for r in screen_valid],
@@ -411,6 +444,11 @@ def run_genetic_loop(
         # What the run has already measured, so the novelty guard can tell a
         # candidate that is new from one the generator is re-proposing.
         config.generator.note_archive([r.configuration for r in valid])
+    # ... and what those measurements SAID. The initial population is the only
+    # evidence in existence when the first pool is drawn; a channel that cannot
+    # see it cannot speak until generation 2, which is the W11 defect.
+    remember_measured(valid,
+                      {_default_candidate_key(c) for c, _o in population})
 
     pick = chooser or random_chooser(rng, n_loci)
     # Pool extras draw from their own stream: the main stream must spend

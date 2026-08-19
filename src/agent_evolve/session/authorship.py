@@ -127,6 +127,21 @@ class AuthorshipConfig:
     #: here, in evaluations, so a campaign states it rather than inheriting a
     #: number from a code path.
     generation_reauthor_every: int = 0
+    #: WHEN the channel may speak for the FIRST time, in MEASURED ROWS -- the
+    #: charged evaluations the run holds, whoever produced them, initial
+    #: population included. The cadence above says how often an evidence call
+    #: RECURS and cannot also say when the first one is allowed: read as "wait
+    #: for that many of the generator's own children" it made the channel
+    #: arrive two generations after the evidence did (W11 -- on the EDA venue
+    #: the prior landed at a median charge of 40 against a 43.5-charge target,
+    #: with the run's first 20 charges structurally invisible to it).
+    #:
+    #: ``0`` (the default) means AS SOON AS THE GATE CAN BE MET:
+    #: ``measurement_evidence.MIN_EVIDENCE_ROWS`` rows, the fewest from which a
+    #: determinable per-locus effect can be computed at all. Set it to a
+    #: venue's own legibility point to wait for one; set it equal to
+    #: ``generation_reauthor_every`` to restore the pure-cadence rule exactly.
+    generation_evidence_min_rows: int = 0
     #: How many measurement-conditioned re-authorings one run may pay for.
     generation_reauthorings: int = 0
     #: THE LOCUS-IMPORTANCE CHANNEL. On the same cadence, ask the model which
@@ -173,6 +188,11 @@ class AuthorshipConfig:
                 "authorship.generation_reauthor_every is a cadence in charged "
                 "evaluations and must be non-negative, got "
                 f"{self.generation_reauthor_every}")
+        if self.generation_evidence_min_rows < 0:
+            raise ValueError(
+                "authorship.generation_evidence_min_rows is the fewest "
+                "measured rows the evidence channel will author from and must "
+                f"be non-negative, got {self.generation_evidence_min_rows}")
         if self.generation_prior_max_weight_ratio < 1.0:
             raise ValueError(
                 "authorship.generation_prior_max_weight_ratio caps how far a "
@@ -393,6 +413,7 @@ def _build_generator(
         reauthor=(reauthor if conditioned
                   and config.generation_reauthorings > 0 else None),
         reauthor_every=config.generation_reauthor_every,
+        evidence_min_rows=config.generation_evidence_min_rows,
         max_reauthorings=config.generation_reauthorings,
         prior_author=(complete if conditioned
                       and config.generation_locus_prior else None),

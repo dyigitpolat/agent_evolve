@@ -28,6 +28,7 @@ from agent_evolve.core.problem import ObjectiveSpec
 from agent_evolve.infrastructure.authored_runtime import AuthoredRuntime
 from agent_evolve.policies.llm_generator import AuthoredGenerator
 from agent_evolve.policies.measurement_evidence import (
+    MIN_EVIDENCE_ROWS,
     WeightedProposal,
     admit_weighted_restriction,
     apply_weighted_restriction,
@@ -135,9 +136,12 @@ def test_off_draws_the_same_pools_as_a_generator_built_without_the_knobs():
 # ---------------------------------------------------------------- the cadence
 
 def test_the_cadence_is_charged_evaluations_and_it_is_what_it_says():
+    # `evidence_min_rows == reauthor_every` is the PURE-CADENCE rule: the
+    # first call waits for the same count every later one does. It is the
+    # pre-W11 behaviour, kept reachable as a declared configuration.
     seen = []
     gen = generator(reauthor=lambda a, e: seen.append(gen.telemetry.measured),
-                    reauthor_every=8, max_reauthorings=4)
+                    reauthor_every=8, evidence_min_rows=8, max_reauthorings=4)
     drive(gen, generations=6, want=4)          # 24 charged evaluations
     # A pool is drawn BEFORE the generation it feeds is measured, so the
     # ticks land at the propose calls that follow the 8th and 16th charge.
@@ -146,10 +150,87 @@ def test_the_cadence_is_charged_evaluations_and_it_is_what_it_says():
 
 def test_a_cadence_never_fires_before_the_archive_has_grown_by_it():
     seen = []
-    gen = generator(reauthor=lambda a, e: seen.append(1),
+    gen = generator(reauthor=lambda a, e: seen.append(1), evidence_min_rows=100,
                     reauthor_every=100, max_reauthorings=4)
     drive(gen, generations=6, want=4)
     assert seen == []
+
+
+# -------------------------------------- W11: the channel speaks when it CAN
+
+def test_the_first_call_waits_on_EVIDENCE_and_the_rest_on_the_cadence():
+    """The defect, stated as a rule: a cadence cannot also be a start gate.
+
+    `reauthor_every` says how often an evidence call recurs. Read as "wait
+    for that many of the generator's own children" it also delayed the FIRST
+    call past evidence the run already held -- W11, measured as a locus prior
+    authored at a median charge of 40 against a 43.5-charge target. The first
+    call now fires at `evidence_min_rows` rows (default: the fewest a
+    determinable effect can be computed from); every later one at the cadence.
+    """
+
+    seen = []
+    gen = generator(reauthor=lambda a, e: seen.append(len(gen._rows)),
+                    reauthor_every=8, max_reauthorings=4)
+    assert gen.evidence_min_rows == MIN_EVIDENCE_ROWS
+    drive(gen, generations=6, want=4)          # 24 charged evaluations
+    # First tick at the earliest propose holding >= 3 rows (there are 4 by
+    # then); the cadence governs from there: 4 -> 12 -> 20.
+    assert seen == [4, 12, 20]
+
+
+def test_a_cadence_larger_than_the_run_still_speaks_once_it_has_evidence():
+    seen = []
+    gen = generator(reauthor=lambda a, e: seen.append(1),
+                    reauthor_every=100, max_reauthorings=4)
+    drive(gen, generations=6, want=4)
+    assert seen == [1]          # once, on evidence -- and not again, on cadence
+
+
+def test_the_evidence_floor_is_honoured_and_nothing_fires_beneath_it():
+    seen = []
+    gen = generator(reauthor=lambda a, e: seen.append(len(gen._rows)),
+                    reauthor_every=1, evidence_min_rows=9, max_reauthorings=4)
+    drive(gen, generations=6, want=4)
+    assert seen and seen[0] >= 9        # never authored from fewer rows
+    assert seen[0] == 12                # the first propose that holds nine
+
+
+def test_a_negative_evidence_floor_is_refused():
+    with pytest.raises(ValueError):
+        generator(evidence_min_rows=-1)
+
+
+def test_off_stays_off_however_much_evidence_arrives():
+    seen = []
+    gen = generator(reauthor=lambda a, e: seen.append(1), reauthor_every=0,
+                    max_reauthorings=4)
+    drive(gen, generations=6, want=4)
+    assert seen == [] and gen.evidence_log == []
+
+
+def test_evidence_is_what_was_measured_and_attribution_is_what_it_produced():
+    """The seam the fix turns on: two clocks, and neither forges the other."""
+
+    gen = generator(reauthor=lambda a, e: None, reauthor_every=4,
+                    max_reauthorings=1)
+    for i in range(6):                       # measurements the run holds, that
+        gen.note_measured({"knob": DOMAINS["knob"][i % 4], "other": "p"},
+                          objectives={"cost": float(i)}, survived=(i == 0))
+    assert len(gen._rows) == 6               # ... this generator did not make
+    assert gen.telemetry.measured == 0       # so it is credited with none
+    assert gen.telemetry.survived == 0
+    gen.propose(template=TEMPLATE, candidate_model=Candidate, restriction=None,
+                archive=[], want=4, rng=random.Random(0), seed=1)
+    # The channel spoke off evidence the generator did not produce, and BOTH
+    # clocks are in the record: nothing here can be read as attribution.
+    assert gen.telemetry.reauthorings == 1
+    assert gen.evidence_log[-1]["at_rows"] == 6
+    assert gen.evidence_log[-1]["at_measured"] == 0
+    gen.record_measured({"knob": "a", "other": "q"}, survived=True,
+                        objectives={"cost": 0.0})
+    assert len(gen._rows) == 7 and gen.telemetry.measured == 1
+    assert gen.telemetry.survived == 1       # its own child, credited once
 
 
 def test_the_reauthoring_budget_binds():
@@ -503,3 +584,146 @@ def test_build_authorship_wires_the_channel_and_leaves_it_off_by_default():
     assert on.reauthor is not None and on.prior_author is not None
     assert on.reauthor_every == 8 and on.max_reauthorings == 2
     assert tuple(on.objectives) == tuple(SPECS)
+
+
+# ------------------------------ W11: the loop's own measurements are evidence
+
+class _CountingProblem:
+    """A two-locus problem whose evaluator is a pure, cheap lookup."""
+
+    candidate_model = Candidate
+    objectives = tuple(SPECS)
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def seeds(self):
+        return (dict(TEMPLATE),)
+
+    def validate(self, config):
+        from agent_evolve.core.problem import ValidationOutcome
+        for name, values in DOMAINS.items():
+            if config.get(name) not in values:
+                return ValidationOutcome(False, "structural", f"bad {name}")
+        return ValidationOutcome(True)
+
+    def materialize(self, config):
+        return (config["knob"], config["other"])
+
+    def evaluate(self, artifact):
+        self.calls += 1
+        # knob drives the cost monotonically in its declared order, so the
+        # evidence carries a determinable effect for the model to name.
+        return {"cost": float(DOMAINS["knob"].index(artifact[0]))}
+
+
+def _run_loop(gen, *, population_size=8, offspring=4, budget=20, seed=3):
+    from agent_evolve.session.genetic_loop import GeneticConfig, run_genetic_loop
+
+    problem = _CountingProblem()
+    run_genetic_loop(problem=problem, config=GeneticConfig(
+        seed=seed, population_size=population_size,
+        offspring_per_generation=offspring, generations=6,
+        evaluation_budget=budget, generator=gen))
+    return problem
+
+
+def test_the_initial_population_is_visible_to_the_first_prior():
+    """THE W11 PIN. The run's first charges are evidence, and arrive as such.
+
+    Before the fix the generator's evidence view held only what the generator
+    itself produced, so the initial population -- every charge the run had
+    made when the first pool is drawn -- was invisible, and no prior could be
+    authored until two generations of offspring had been measured. On the EDA
+    venue that put the prior at a median charge of 40.0 against a 43.5-charge
+    target, with the target already hit before the prior existed on 19 of 48
+    seeds. The prior must now be authorable off generation 0's measurements.
+    """
+
+    prompts = []
+    gen = generator(reauthor_every=10, max_priors=1,
+                    prior_author=lambda p: prompts.append(p) or
+                    '{"weight": {"knob": {"a": 4, "b": 2}}}')
+    _run_loop(gen, population_size=8, offspring=4, budget=20)
+
+    priors = [r for r in gen.evidence_log if r["kind"] == "locus_prior"]
+    assert len(priors) == 1 and priors[0]["accepted"] is True
+    first = priors[0]
+    # Authored off the initial population and nothing else: eight rows, none
+    # of them this generator's own child.
+    assert first["at_rows"] == 8 == first["rows_shown"]
+    assert first["at_measured"] == 0
+    assert gen.telemetry.priors_admitted == 1
+    # ... and the evidence really carried the initial population's numbers.
+    assert "measured so far: 8 configurations" in prompts[0]
+    assert "which parameter moves which cost" in prompts[0]
+
+
+def test_a_cadence_that_counts_only_children_is_what_made_the_prior_late():
+    """The same loop under the pre-W11 rule, so the fix's size is measured.
+
+    `evidence_min_rows == reauthor_every` restores the old start gate exactly.
+    The prior then waits for the cadence to be met in rows the generator
+    itself produced, which on this loop takes until offspring have been
+    measured -- strictly later, off strictly more charges.
+    """
+
+    def build(**kwargs):
+        seen = []
+        gen = generator(reauthor_every=10, max_priors=1,
+                        prior_author=lambda p: seen.append(p) or
+                        '{"weight": {"knob": {"a": 4, "b": 2}}}', **kwargs)
+        _run_loop(gen, population_size=8, offspring=4, budget=20)
+        return [r for r in gen.evidence_log if r["kind"] == "locus_prior"]
+
+    early = build()
+    late = build(evidence_min_rows=10)
+    assert early and late
+    assert early[0]["at_rows"] < late[0]["at_rows"]
+    assert early[0]["at_rows"] == 8 and late[0]["at_rows"] == 12
+
+
+def test_the_generator_is_still_credited_only_with_its_own_children():
+    """Evidence widened; attribution did not. The unwind rule still works."""
+
+    gen = generator(reauthor_every=10, max_priors=1, prior_unwind_batches=1,
+                    prior_author=lambda p:
+                    '{"weight": {"knob": {"c": 4, "d": 4}}}')
+    _run_loop(gen, population_size=8, offspring=4, budget=20)
+    # The eight initial-population rows are evidence, never survival credit.
+    assert gen.telemetry.measured == len(gen._rows) - 8
+    assert gen.telemetry.measured > 0
+    assert gen.telemetry.priors_admitted == 1
+
+
+def test_a_prior_authored_early_still_excludes_nothing():
+    """Every safety property survives the earlier tick, checked on the loop."""
+
+    gen = generator(reauthor_every=10, max_priors=1,
+                    prior_author=lambda p:
+                    '{"weight": {"knob": {"a": 8, "b": 8}}}')
+    problem = _run_loop(gen, population_size=8, offspring=4, budget=20)
+    assert gen.telemetry.priors_admitted == 1
+    assert gen.telemetry.priors_refused == 0
+    # Support is the DECLARED domain: nothing the schema allows was dropped.
+    prior = gen._prior
+    if prior is not None:
+        values, weights = dict(prior.weighted)["knob"]
+        assert list(values) == DOMAINS["knob"]
+        assert all(w > 0.0 for w in weights)
+    assert problem.calls <= 20
+
+
+@pytest.mark.parametrize("reply,counter", [
+    ("not json at all", "priors_refused"),
+    ('{"weight": {"nope": {"a": 3}}}', "priors_refused"),
+    ('{"weight": {"knob": {"a": 400}}}', "priors_refused"),
+    ('{"weight": {"knob": {"a": -1}}}', "priors_refused"),
+    ('{"weight": {}}', "priors_refused"),
+])
+def test_the_gate_still_refuses_garbage_at_the_earlier_tick(reply, counter):
+    gen = generator(reauthor_every=10, max_priors=1,
+                    prior_author=lambda p: reply)
+    _run_loop(gen, population_size=8, offspring=4, budget=20)
+    assert getattr(gen.telemetry, counter) == 1
+    assert gen.telemetry.priors_admitted == 0
