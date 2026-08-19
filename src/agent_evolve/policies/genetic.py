@@ -16,6 +16,7 @@ whole reason a genome differs from a paragraph of text.
 
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Protocol, Sequence
@@ -26,6 +27,7 @@ __all__ = [
     "read_locus",
     "write_locus",
     "locus_domain",
+    "locus_is_projected",
     "SamplingPrior",
     "DomainRestriction",
     "crossover",
@@ -165,19 +167,216 @@ def locus_domain(
     return restriction.narrow(locus, domain)
 
 
-def _declared_domain(candidate_model: Any, locus: Locus) -> tuple[Any, ...]:
-    """The schema's own domain for *locus*, before any narrowing."""
+#: Points a bounded numeric axis is projected onto when the schema says nothing
+#: else. Integers get 64: an axis like ``ge=0, le=1000`` keeps a tenth of a
+#: percent of resolution while its domain still renders in a prompt. Numbers get
+#: 16, which is the grid ``from_pymoo`` has quantized continuous decision
+#: variables onto since it shipped -- one resolution rule for the package, not
+#: two. Both are overridable per field (see :func:`_grid_override`).
+_INTEGER_GRID = 64
+_NUMBER_GRID = 16
+
+#: A per-field grid outside this range is not a search space: one point is a
+#: constant, and a domain nobody can render or enumerate cheaply is not a
+#: domain an operator can draw from.
+_GRID_MIN, _GRID_MAX = 2, 256
+
+#: Slack for reading multiples off a float bound, whose decimal literal in the
+#: schema (0.3) is not the binary value the arithmetic produces.
+_TOL = 1e-12
+
+
+def _quantum(value: float) -> float:
+    """A grid float rendered the way every reader will see it.
+
+    Ten significant digits: enough that no two points of a 256-point grid
+    collide, few enough that ``repr`` is stable, so a value in a prompt, a value
+    in a card and a value compared against a domain are the same string and the
+    same float.
+    """
+
+    return float(f"{value:.10g}")
+
+
+def _bound(node: Mapping[str, Any], key: str) -> float | None:
+    """A real numeric bound under *key*, or ``None``. ``True`` is not a bound."""
+
+    value = node.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(float(value)) else None
+
+
+def _grid_override(node: Mapping[str, Any]) -> int | None:
+    """The field's own point count, from ``{"agent_evolve": {"grid": N}}``.
+
+    Written by the problem author as
+    ``Field(json_schema_extra={"agent_evolve": {"grid": N}})``: the one place a
+    schema can say how finely *this* axis deserves to be searched.
+    """
+
+    extra = node.get("agent_evolve")
+    if isinstance(extra, Mapping):
+        wanted = extra.get("grid")
+        if isinstance(wanted, int) and not isinstance(wanted, bool):
+            return max(_GRID_MIN, min(_GRID_MAX, wanted))
+    return None
+
+
+def _spread(count: int, points: int) -> tuple[int, ...]:
+    """*points* indices spread over ``range(count)``, both extremes included.
+
+    Fewer values than points means every value: a projection never invents
+    resolution the range does not have.
+    """
+
+    if count <= points:
+        return tuple(range(count))
+    return tuple(dict.fromkeys(
+        round(i * (count - 1) / (points - 1)) for i in range(points)
+    ))
+
+
+def _multiple_indices(
+    lo: float, hi: float, step: float, *, open_lo: bool, open_hi: bool
+) -> tuple[int, int]:
+    """First and last multiple-of-*step* indices inside the interval."""
+
+    if isinstance(lo, int) and isinstance(hi, int) and isinstance(step, int):
+        first, last = -((-lo) // step), hi // step   # exact for ints of any size
+    else:
+        first = math.ceil(lo / step - _TOL)
+        last = math.floor(hi / step + _TOL)
+    if open_lo and first * step <= lo:
+        first += 1
+    if open_hi and last * step >= hi:
+        last -= 1
+    return first, last
+
+
+def _integer_domain(node: Mapping[str, Any], points: int) -> tuple[int, ...]:
+    """Every integer the bounds allow, or *points* of them evenly spaced.
+
+    ``exclusiveMinimum``/``exclusiveMaximum`` tighten by one, which is what they
+    mean on an integer axis. ``multipleOf`` restricts to multiples, so the
+    emitted values are ones the schema would actually accept.
+    """
+
+    lows: list[int] = []
+    highs: list[int] = []
+    closed_lo = _bound(node, "minimum")
+    if closed_lo is not None:
+        lows.append(math.ceil(closed_lo))
+    open_lo = _bound(node, "exclusiveMinimum")
+    if open_lo is not None:
+        lows.append(math.floor(open_lo) + 1)
+    closed_hi = _bound(node, "maximum")
+    if closed_hi is not None:
+        highs.append(math.floor(closed_hi))
+    open_hi = _bound(node, "exclusiveMaximum")
+    if open_hi is not None:
+        highs.append(math.ceil(open_hi) - 1)
+    if not lows or not highs:
+        return ()                           # unbounded on one side: no finite reading
+    lo, hi = max(lows), min(highs)
+    step = 1
+    multiple = _bound(node, "multipleOf")
+    if multiple is not None:
+        if multiple <= 0 or not float(multiple).is_integer():
+            return ()                       # no integer axis reading of this step
+        step = int(multiple)
+    first, last = _multiple_indices(lo, hi, step, open_lo=False, open_hi=False)
+    if first > last:
+        return ()                           # the bounds admit nothing
+    return tuple((first + i) * step for i in _spread(last - first + 1, points))
+
+
+def _number_domain(node: Mapping[str, Any], points: int) -> tuple[float, ...]:
+    """A *points*-point grid across a doubly bounded continuous axis.
+
+    Inclusive bounds put a point on each endpoint. An excluded endpoint is not
+    a legal value, so it becomes one more interval instead: an open interval of
+    ``points`` interior points sits on ``points + 1`` intervals.
+    """
+
+    lo, open_lo = _bound(node, "minimum"), False
+    tighter = _bound(node, "exclusiveMinimum")
+    if tighter is not None and (lo is None or tighter >= lo):
+        lo, open_lo = tighter, True
+    hi, open_hi = _bound(node, "maximum"), False
+    tighter = _bound(node, "exclusiveMaximum")
+    if tighter is not None and (hi is None or tighter <= hi):
+        hi, open_hi = tighter, True
+    if lo is None or hi is None or hi < lo:
+        return ()                           # one-sided or empty: nothing finite
+    multiple = _bound(node, "multipleOf")
+    if multiple is not None:
+        if multiple <= 0:
+            return ()
+        first, last = _multiple_indices(lo, hi, multiple,
+                                        open_lo=open_lo, open_hi=open_hi)
+        if first > last:
+            return ()
+        return tuple(dict.fromkeys(
+            _quantum((first + i) * multiple)
+            for i in _spread(last - first + 1, points)
+        ))
+    if lo == hi:
+        return () if (open_lo or open_hi) else (_quantum(lo),)
+    edges = points + int(open_lo) + int(open_hi)
+    start = 1 if open_lo else 0
+    return tuple(dict.fromkeys(
+        _quantum(lo + (hi - lo) * i / (edges - 1))
+        for i in range(start, start + points)
+    ))
+
+
+def _node_domain(
+    node: Mapping[str, Any], override: int | None
+) -> tuple[tuple[Any, ...], bool]:
+    """One schema node's finite domain, and whether it was projected.
+
+    Projected means "read off bounds": the schema declared a range, not a set of
+    values, and what comes back is a finite sample of that range. Enumerations,
+    booleans and constants are declared outright and are not projections.
+    """
+
+    if "enum" in node:
+        return tuple(node["enum"]), False
+    if "const" in node:
+        # A one-value domain is still a domain. Read as nothing, a Literal of
+        # length one freezes its locus and every reader calls it undeclared.
+        return (node["const"],), False
+    declared = node.get("type")
+    types = tuple(declared) if isinstance(declared, list) else (declared,)
+    if "boolean" in types:
+        # A boolean is a finite domain. Without this, a bool field has no
+        # declared values, mutate() leaves it alone, and a real design axis is
+        # silently frozen at whatever the seed happened to carry.
+        return (False, True), False
+    points = _grid_override(node) or override
+    if "integer" in types:
+        return _integer_domain(node, points or _INTEGER_GRID), True
+    if "number" in types:
+        return _number_domain(node, points or _NUMBER_GRID), True
+    return (), False
+
+
+def _declared_domain_detail(
+    candidate_model: Any, locus: Locus
+) -> tuple[tuple[Any, ...], bool]:
+    """The schema's own domain for *locus*, and whether it is a projection."""
 
     if candidate_model is None:
-        return ()
+        return (), False
     try:
         schema = candidate_model.model_json_schema()
     except Exception:                       # not a pydantic model
-        return ()
+        return (), False
     defs = schema.get("$defs", {}) or schema.get("definitions", {}) or {}
     node = (schema.get("properties", {}) or {}).get(locus.field)
     if node is None:
-        return ()
+        return (), False
 
     def resolve(n: Any) -> Any:
         seen = 0
@@ -196,20 +395,47 @@ def _declared_domain(candidate_model: Any, locus: Locus) -> tuple[Any, ...]:
         # field-keyed priors reason over. Indexed loci resolve above.
         node = resolve(node.get("items", {}))
     if not isinstance(node, dict):
-        return ()
-    if "enum" in node:
-        return tuple(node["enum"])
-    if node.get("type") == "boolean":
-        # A boolean is a finite domain. Without this, a bool field has no
-        # declared values, mutate() leaves it alone, and a real design axis is
-        # silently frozen at whatever the seed happened to carry.
-        return (False, True)
+        return (), False
+    override = _grid_override(node)         # a wrapper carries the field's own grid
+    domain, projected = _node_domain(node, override)
+    if domain:
+        return domain, projected
     for key in ("anyOf", "oneOf"):
         for branch in node.get(key, ()) or ():
             branch = resolve(branch)
             if isinstance(branch, dict) and "enum" in branch:
-                return tuple(branch["enum"])
-    return ()
+                return tuple(branch["enum"]), False
+    for key in ("anyOf", "oneOf"):
+        for branch in node.get(key, ()) or ():
+            branch = resolve(branch)
+            # A "null" branch is Optional's absence marker, not a value to
+            # sample: writing None where the problem declared a range is how a
+            # sampler produces candidates the problem never allowed.
+            if not isinstance(branch, dict) or branch.get("type") == "null":
+                continue
+            domain, projected = _node_domain(branch, override)
+            if domain:
+                return domain, projected
+    return (), False
+
+
+def _declared_domain(candidate_model: Any, locus: Locus) -> tuple[Any, ...]:
+    """The schema's own domain for *locus*, before any narrowing."""
+
+    return _declared_domain_detail(candidate_model, locus)[0]
+
+
+def locus_is_projected(candidate_model: Any, locus: Locus) -> bool:
+    """True when *locus*'s domain is a finite projection of a declared range.
+
+    A projected domain is searchable but lossy: the optimizer moves on the grid,
+    not the continuum. Reports that name domain sizes say so, because "16
+    values" means something different when the schema declared 16 values than
+    when it declared an interval.
+    """
+
+    domain, projected = _declared_domain_detail(candidate_model, locus)
+    return bool(domain) and projected
 
 
 def _draw(

@@ -2,9 +2,10 @@
 
 The toy problems here are the suite's existing ones: ``_CountOnes`` (declared
 finite domains, deterministic, counts its own evaluations) and ``Complete``
-(integer fields whose schema declares no finite set -- the undeclared-domain
-case). The one problem defined locally is the degenerate case the verdict
-exists for: an objective that never moves.
+(bounded integer fields, which since 2026-08-19 project onto a finite grid --
+see ``tests/test_numeric_domains.py``). Two problems are defined locally: the
+degenerate case the verdict exists for, an objective that never moves, and the
+undeclared-domain case, whose integers carry no bounds at all.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
+from pydantic import BaseModel
 
 from test_genetic_loop import _CountOnes
 from test_public_contract import Complete
@@ -25,6 +27,21 @@ class _Flat(_CountOnes):
     def evaluate(self, artifact):
         self.calls += 1
         return {"ones": 1.0, "tail": 0.0}
+
+
+class _Unbounded(Complete):
+    """Integers with no bounds at all: the undeclared-domain case.
+
+    Complete's own ``x``/``y`` are bounded and therefore projected as of
+    2026-08-19 (bounded numerics became searchable), so the undeclared case
+    needs a schema that declares nothing to read.
+    """
+
+    class Candidate(BaseModel):
+        x: int
+        y: int
+
+    candidate_model = Candidate
 
 
 # -- the report is populated, field by field --------------------------------
@@ -72,13 +89,25 @@ def test_report_fields_are_populated() -> None:
 
 
 def test_the_report_names_undeclared_domain_loci() -> None:
-    # Complete's candidate model bounds two integers without enumerating them,
+    # _Unbounded's candidate model declares two integers with no bounds at all,
     # so neither locus declares a finite domain; the probe cannot vary them and
     # must say so rather than invent values the problem never declared.
-    report = check(Complete(), 12, probe=12, seed=0)
+    report = check(_Unbounded(), 12, probe=12, seed=0)
     assert report.undeclared_loci == ("x", "y")
     assert all(not d.declared for d in report.loci)
     assert "declare no finite domain" in report.verdict
+
+
+def test_bounded_integer_loci_are_reported_as_searchable_projections() -> None:
+    # Changed 2026-08-19: a bounded range is a declaration. Complete bounds both
+    # integers to 0..9, so both are searchable -- and marked (projected), since
+    # the values are a finite reading of a range rather than an enumerated set.
+    report = check(Complete(), 12, probe=12, seed=0)
+    assert report.undeclared_loci == ()
+    assert all(d.declared and d.projected and d.domain_size == 10
+               for d in report.loci)
+    assert "x:10(projected)" in report.render()
+    assert "declare no finite domain" not in report.verdict
 
 
 # -- the no-headroom verdict ------------------------------------------------

@@ -16,7 +16,9 @@ field ``x{i}`` on a generated pydantic model, typed::
     g_j = xl_i + j * (xu_i - xl_i) / (k - 1)
 
 that is, ``k`` evenly spaced values *including both endpoints*, deduplicated
-(a variable with ``xl_i == xu_i`` collapses to its single legal value). The
+(a variable with ``xl_i == xu_i`` collapses to its single legal value, which
+``locus_domain`` reads as a one-value domain since ``const`` became readable on
+2026-08-19). The
 ``Literal`` grid serializes to a JSON-schema ``enum``, which is exactly what
 ``locus_domain`` reads -- so every variable is a mutable locus with a visible
 domain, and the uninformed random proposer draws only legal vectors. Grid
@@ -24,6 +26,15 @@ values are exact ``linspace`` floats; Python's ``repr`` round-trips them
 through JSON without drift, so schema, validation and evaluation all see the
 same numbers. The resolution cost is honest and stated: the adapter searches
 the ``k**n_var`` lattice, not the continuum -- raise ``grid_points`` to refine.
+
+``genetic._number_domain`` now projects a doubly bounded ``number`` field onto
+the same 16-point rule, and this adapter deliberately does *not* delegate to it:
+that projection rounds each point through ``%.10g`` so a value renders
+identically in a prompt, a card and a comparison, while ``linspace`` keeps the
+full binary float. The two grids therefore differ in their last digits, and
+these values are the adapter's declared enum -- the schema a swapped run
+validates against and the acceptance test measures. One shared rule is not worth
+silently moving every pymoo grid point.
 
 The rest of the mapping
 -----------------------

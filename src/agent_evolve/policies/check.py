@@ -5,7 +5,11 @@ problem, two questions have answers the problem itself can give:
 
 1. **What is the search space, actually?** How many heritable loci does a
    candidate carry, how many values does the schema declare at each, and which
-   loci declare none (those an uninformed sampler cannot vary at all)?
+   loci declare none (those an uninformed sampler cannot vary at all)? A locus
+   whose values are a finite projection of a declared *range* is marked
+   ``(projected)``: it is searchable, but on its grid rather than its
+   continuum, and a reader who cannot tell the two apart will over-read the
+   count.
 
 2. **Is there anything to win at this budget?** If the best value a broad
    uniform probe can find is within noise of what ``budget`` random draws are
@@ -53,7 +57,12 @@ from typing import Any, Mapping, Optional, Sequence
 
 from agent_evolve.contract import as_problem
 from agent_evolve.core.problem import normalize_objective_values
-from agent_evolve.policies.genetic import loci_of, locus_domain, uniform_candidate
+from agent_evolve.policies.genetic import (
+    loci_of,
+    locus_domain,
+    locus_is_projected,
+    uniform_candidate,
+)
 
 __all__ = [
     "check",
@@ -75,6 +84,11 @@ class LocusDomain:
 
     locus: str
     domain_size: int  #: 0 means the schema declares no finite set here.
+    #: True when the values are a finite projection of a declared *range*
+    #: rather than a set the schema enumerated. Such a locus is searchable, but
+    #: only on its grid: the report says so instead of letting a reader mistake
+    #: a projected 16 for an enumerated 16.
+    projected: bool = False
 
     @property
     def declared(self) -> bool:
@@ -149,7 +163,9 @@ class CheckReport:
         lines.append(f"  search space  ({self.locus_count} loci)")
         shown = self.loci[:24]
         entries = " ".join(
-            f"{d.locus}:{d.domain_size if d.declared else '?'}" for d in shown
+            f"{d.locus}:{d.domain_size}(projected)" if d.declared and d.projected
+            else f"{d.locus}:{d.domain_size if d.declared else '?'}"
+            for d in shown
         )
         tail = f"  (+{len(self.loci) - len(shown)} more)" if len(self.loci) > len(shown) else ""
         for row in textwrap.wrap(entries + tail, width=74) or ["(no loci)"]:
@@ -332,7 +348,11 @@ def check(
 
     loci = loci_of(template)
     domains = tuple(
-        LocusDomain(locus=str(locus), domain_size=len(locus_domain(model, locus)))
+        LocusDomain(
+            locus=str(locus),
+            domain_size=len(locus_domain(model, locus)),
+            projected=locus_is_projected(model, locus),
+        )
         for locus in loci
     )
     undeclared = tuple(d.locus for d in domains if not d.declared)
