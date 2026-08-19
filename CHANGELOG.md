@@ -1,5 +1,125 @@
 # Changelog
 
+## 0.5.0 — unreleased
+
+Two defects the end-to-end evaluation row found and the test suite could not:
+the package could not sell its own measured result, and it could not search a
+bounded number. Both were written down in `PACKAGING_TODO.md` §6 as known and
+unfixed. Both are fixed here, and the second one moves the substrate under the
+search — which is stated rather than absorbed.
+
+### Fixed — the mechanisms that measured could only be bought with the one that did not
+
+`optimize()` built the completion seam *inside* the per-offspring chooser's own
+branch. So `proposer="llm"` handed you the chooser whether or not you wanted it,
+and `proposer="random"` left `complete=None`, which silently disabled every
+authoring seam. The consequence is worth stating plainly: **the configuration
+that produced this project's end-to-end results was not reachable from the
+public API.** Not undocumented — unreachable.
+
+The per-offspring chooser is the one mechanism here that has never earned its
+price: **ten sealed null verdicts**, Θ(offspring) model calls rather than one,
+and **61% of the six-arm ablation's whole ledger consumed for 0.94×** the speed
+of doing nothing. It is now a separate parameter, `chooser`, defaulting to
+`"off"` — the random control it never beat. `chooser="llm"` still buys it, and
+asking for it on a run that makes no model call is refused by name rather than
+quietly ignored.
+
+What `proposer="llm"` purchases instead is the configuration the ablations
+picked:
+
+- **model-proposed initialization** — the six-arm ablation's strongest arm (the
+  A4 seat): **11× fewer evaluations to target, better on 40 of 40 paired
+  seeds**, for **one** call;
+- **model-authored surrogate screening** — the sealed default, unchanged, still
+  admitted only when it out-validates the shipped rules;
+- at `budget >= 48`, a **crossed screen** (auto-sized `min(16, max(8, budget //
+  6))`; the ablation screened at 15 evaluations of 96) read by a
+  **model-weighted graded prior** — the ablation's guidance arm, the A5 seat,
+  4.60×.
+
+Below budget 48 the screen is skipped and the prior stays the rule form. That is
+the seat's precondition rather than a rounded ratio: the prior only ever acts on
+a screen's evidence, so the model prior is bought exactly when a screen will
+run, and announcing a model prior beside `structure_budget=0` would be a promise
+the run never cashes.
+
+`prior` and `structure_budget` therefore default to an `"auto"` sentinel instead
+of to literals, resolved after the seam is either built or comes back empty —
+because what the sentinels should mean depends on what the run can actually do,
+not on what the caller hoped for. Without a model call they resolve to `"rule"`
+and `0`, which are the literal pre-sentinel defaults: the credential-free path
+draws the same candidates in the same order and the byte-fossil stream does not
+move. That was verified, not assumed. `tests/test_headline_defaults.py`.
+
+### Fixed — a bounded number was not a search space
+
+`policies.genetic._declared_domain` returned `()` for any field that was not a
+finite enum or a bool, so `uniform_candidate` and `mutate` left the locus frozen
+at whatever the seed happened to carry, and nothing said so. Measured on a
+hyperparameter benchmark: **12 of 13 axes identical across 64 draws.** An entire
+class of problems could be handed to this optimizer and get back a run that
+varied almost nothing.
+
+Bounded numeric loci now project onto a finite domain:
+
+- **integers** — every value when the span is at most 64, otherwise 64 points
+  evenly spread with both extremes kept. `exclusiveMinimum`/`exclusiveMaximum`
+  tighten by one, which is what they mean on an integer axis.
+- **floats** — a 16-point grid with a point on each inclusive endpoint. Sixteen
+  because that is the resolution `from_pymoo` has quantized continuous decision
+  variables onto since it shipped: one resolution rule for the package rather
+  than two. An excluded endpoint is not a legal value, so it is not emitted.
+- **`multipleOf`** restricts to multiples, so every value the projection emits
+  is one the schema would actually accept.
+- **`anyOf`/`oneOf`** are scanned for the first branch with such a reading, with
+  the `null` branch skipped — `Optional[int]` with bounds is searchable, and no
+  sampler writes `None` where the problem declared a range.
+- **`const` is read as a one-value domain.** It was ignored, so a single-valued
+  field — which pydantic renders as `{"const": ...}` rather than a one-element
+  `enum` — read as undeclared to every reader in the package.
+- **A per-field override**, `Field(json_schema_extra={"agent_evolve": {"grid":
+  N}})`, clamped to `[2, 256]`: below two is a constant, and above 256 is not a
+  domain an operator can draw from or a prompt can render.
+
+`diagnose` names such an axis as `inline_threshold:64(projected)` rather than
+`inline_threshold:?`, because "64 values" means something different when the
+schema declared 64 values than when it declared an interval. A locus with no
+finite reading — an open `str`, a one-sided bound — is still left alone, and
+`diagnose` still names those.
+
+**This changes search behaviour on any venue with a numeric locus.** The shipped
+`build_flags` example now actually varies `inline_threshold`: at the same
+40-evaluation budget its front grew from 6 rows to 11. The `knapsack` example is
+no longer the honest-negative for undeclared domains — its selection locus
+projects to 10 values and `diagnose` reports `undeclared domains: none`.
+
+**Every sealed row measured to date was measured on the 0.4 substrate and
+remains quotable as such**, from branch `release/v0.4-sweep`, which preserves
+it. A row measured on 0.5.0 is a row measured on a different search space, and
+the two are not interchangeable. `PACKAGING_TODO.md`'s 2026-08-18 deferral of
+exactly this fix — deferred on the ICLR deadline, explicitly not on the merits —
+is **superseded by the owner's 2026-08-19 direction** to develop heavily. The
+byte-fossil test passes unmodified: its venue is enum-only, so nothing it pins
+can move. `tests/test_numeric_domains.py`.
+
+### Added
+
+- **Authorship preset `"guided"`** = `{surrogate: "llm", initialization:
+  "llm"}` — what `authorship="auto"` resolves to on a model run, named so a
+  campaign can *state* its configuration instead of inheriting it. The two seams
+  the six-arm ablation and the sealed luna-clear row measured as winners, and
+  neither of the per-decision seams that did not.
+- **`run --chooser {off,llm}`**, whose `--help` carries the same ten sealed null
+  verdicts the default rests on, so nobody has to read this file to find out why
+  it is off.
+- **The `"auto"` sentinels are reachable from the CLI**: `--structure-budget`
+  takes `auto` or an evaluation count, `--prior` takes `auto` beside the four
+  named forms. The CLI parses the sentinel and does not resolve it — a second
+  copy of the sizing rule there could drift from the one the library announces.
+  Every resolution is announced through `on_progress`; offline both resolve to
+  the pre-sentinel literals, so the credential-free stream stays byte-identical.
+
 ## 0.4.0 — unreleased (the release cut)
 
 The cut that makes the package installable, swappable and honest about its own

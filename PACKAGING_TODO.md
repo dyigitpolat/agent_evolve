@@ -231,3 +231,85 @@ evaluations against uniform's 1.25%), it is working from a stale picture. The
 seam that would fix this (`reauthor_every` / `evidence_min_rows` in
 `policies/llm_generator.py`) is landed and **off by default**; making it earn
 its place is the clearest open research direction.
+
+---
+
+## State update 2026-08-19 (W0) — append-only
+
+Sections above are left as written; the entries below say what moved. Substrate
+is now `0.5.0` (`agent_evolve.__version__`, single-sourced; editable install
+re-synced, `tests/test_packaging_metadata.py` green).
+
+### §6 — all three defects FIXED
+
+- **FIXED — `api.optimize` cannot sell the working mechanisms without the worst
+  one.** The completion seam is now built once for the run instead of inside the
+  chooser's branch, and the per-offspring chooser moves to its own parameter,
+  `chooser`, defaulting to `"off"`. `proposer="llm"` now resolves to the
+  measured stack — model-proposed initialization (A4: 11× fewer evaluations to
+  target, 40 of 40 paired seeds, one call) + the sealed authored surrogate +, at
+  `budget >= 48`, an auto-sized crossed screen read by the model-weighted graded
+  prior (A5, 4.60×). `prior` and `structure_budget` become `"auto"` sentinels
+  that resolve to the literal old defaults (`"rule"`, `0`) whenever no model
+  call is possible, so the credential-free stream is unchanged — verified
+  against the byte fossil, not asserted. `chooser="llm"` still reaches the
+  mechanism; on a run that makes no model call it is refused by name.
+  `tests/test_headline_defaults.py`, CLI `run --chooser {off,llm}`, authorship
+  preset `"guided"`.
+- **FIXED — continuous parameters cannot be searched at all.**
+  `policies.genetic._declared_domain` now projects bounded numeric loci onto
+  finite domains: integers enumerated when the span is ≤ 64 and otherwise spread
+  over a 64-point grid, doubly bounded floats onto a 16-point inclusive grid
+  (the resolution `from_pymoo` has always used — note the adapter deliberately
+  does *not* delegate to the new code: its grid is `linspace`'s full binary
+  float, the projection's is rounded through `%.10g` so one value renders
+  identically in a prompt, a card and a comparison, and moving every pymoo grid
+  point to share one rule was judged not worth it), `multipleOf` honoured,
+  exclusive bounds excluded, `anyOf`/`oneOf` scanned for the first such branch
+  with the `null` branch skipped, and a per-field override
+  `Field(json_schema_extra={"agent_evolve": {"grid": N}})` clamped to `[2, 256]`.
+  `locus_is_projected` lets a report distinguish a projection from a declared
+  set; `diagnose` prints `inline_threshold:64(projected)`.
+  `tests/test_numeric_domains.py`.
+- **FIXED — a single-valued field renders as `{"const": ...}` and the reader
+  ignored it.** `_node_domain` reads `const` as a one-value domain, so such a
+  field is declared rather than undeclared to every reader in the package —
+  including the `xl_i == xu_i` collapse `from_pymoo` produces.
+
+### Obsolete characterizations in the sections above
+
+- **"the knapsack example searches nothing"** (carried in §5's neighbourhood and
+  restated in the 2026-08-18 deferral) is **obsolete**. Its `selection` locus
+  declares `ge=0, le=9`, which now projects to 10 values; `diagnose` reports
+  `selection[0]:10(projected)` and `undeclared domains: none`, and the probe
+  varies it. The example remains an honest negative, for the real reason rather
+  than the mechanical one: 40 random draws are expected to reach the same best
+  value (150) and the same best weight (5) the probe found, so the verdict is
+  still no-headroom.
+- The README's `build_flags` and `diagnose` transcripts were re-run and replaced
+  rather than edited: the front grew from 6 rows to 11 at the same 40-evaluation
+  budget, and the verdict's "1 of 6 loci declare no finite domain" footnote is
+  gone because there are none.
+
+### The 2026-08-18 DEFERRAL is superseded
+
+The open item **"Integer loci with `ge`/`le` bounds declare no finite domain …
+DEFERRED UNTIL AFTER SUBMISSION, by the owner, 2026-08-18"** is **superseded on
+2026-08-19 by the owner's direction to develop heavily.** The deferral's own
+reasoning was the deadline and explicitly not the merits, so the reversal needs
+no new argument about the merits — only a place to stand for the rows already
+sealed.
+
+That place is **branch `release/v0.4-sweep`** (at `4d0b7b0`,
+`__version__ = "0.4.0"`), which preserves the 0.4 substrate. Every sealed row
+measured to date was measured there and remains quotable as such; a row measured
+on 0.5.0 is a row measured on a different search space, and the two are not
+interchangeable. **That branch is local-only today** — `origin` carries `main`
+alone — so the preservation is real in this clone and not yet in any published
+one. Pushing it is the owner's action, and it is a precondition for the paper
+citing the substrate a sealed row was measured on. The deferral's own closing
+instruction still binds and is now the open work: **re-run the affected sealed
+cells on 0.5.0 and disclose any number that moves rather than absorbing it.**
+The byte-fossil test passes unmodified — its venue is enum-only, so nothing it
+pins can move — which bounds the exposure to venues with a numeric locus but
+does not measure it.

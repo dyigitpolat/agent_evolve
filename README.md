@@ -51,32 +51,50 @@ and the same evaluator is the control every number above is measured against.
 ```console
 $ python examples/build_flags/run.py
 generation 0: 7 evaluated, population 7
-generation 1: 8 evaluated, 13 of 40 budget used
-generation 2: 7 evaluated, 18 of 40 budget used
+generation 1: 6 evaluated, 13 of 40 budget used
+generation 2: 6 evaluated, 17 of 40 budget used
 generation 3: 6 evaluated, 22 of 40 budget used
-generation 4: 6 evaluated, 27 of 40 budget used
-generation 5: 8 evaluated, 32 of 40 budget used
-generation 6: 8 evaluated, 37 of 40 budget used
-generation 7: 3 evaluated, 37 of 40 budget used
-generation 8: 3 evaluated, 39 of 40 budget used
+generation 4: 7 evaluated, 28 of 40 budget used
+generation 5: 8 evaluated, 34 of 40 budget used
+generation 6: 6 evaluated, 38 of 40 budget used
+generation 7: 2 evaluated, 39 of 40 budget used
+generation 8: 0 evaluated, 39 of 40 budget used
 generation 9: 1 evaluated, 39 of 40 budget used
-generation 10: 1 evaluated, 40 of 40 budget used
-budget exhausted after 40 evaluations; stopping at gen 11
+generation 10: 0 evaluated, 39 of 40 budget used
+generation 11: 0 evaluated, 39 of 40 budget used
+generation 12: 1 evaluated, 40 of 40 budget used
+budget exhausted after 40 evaluations; stopping at gen 13
 
 evaluations  40
-pareto front 6
+pareto front 11
 
  runtime_ms   binary_kb  configuration
-     642.19      529.93  O3 avx512 lto=full unroll=1 fast=1 inline=75
-     668.69      464.73  O3 avx512 lto=full unroll=0 fast=1 inline=75
-     727.18      447.42  O3 avx2 lto=full unroll=0 fast=1 inline=75
-     733.15      382.89  O2 avx512 lto=full unroll=0 fast=1 inline=75
-     818.84      256.88  Os avx512 lto=full unroll=0 fast=1 inline=75
-     956.22      231.09  Os sse4 lto=full unroll=0 fast=1 inline=75
+     604.49      648.82  Ofast avx512 lto=full unroll=0 fast=1 inline=873
+     655.01      511.13  Ofast avx2 lto=full unroll=1 fast=1 inline=32
+     702.86      510.29  Ofast avx2 lto=none unroll=0 fast=1 inline=32
+     727.10      480.83  Ofast sse4 lto=thin unroll=0 fast=1 inline=190
+     757.49      430.52  Ofast none lto=full unroll=0 fast=1 inline=190
+     795.89      285.59  Os avx2 lto=full unroll=1 fast=1 inline=190
+     802.25      270.26  Os avx2 lto=full unroll=1 fast=1 inline=75
+     841.13      252.94  Os avx2 lto=full unroll=0 fast=1 inline=190
+     850.47      239.84  Os avx2 lto=full unroll=0 fast=1 inline=75
+    1016.59      222.10  Os none lto=full unroll=0 fast=1 inline=75
+    1027.03      216.10  Os none lto=full unroll=0 fast=0 inline=75
 ```
 
 That is the real loop, on the uninformed sampler, for nothing. `budget` counts
-artifacts measured and it is a hard cap: say 40 and you are billed for 40.
+artifacts measured and it is a hard cap: say 40 and you are billed for 40. The
+generations that evaluate 0 are `validate` doing its work — every child was
+rejected before anything was built, and a rejection is not an artifact. Where a
+generation evaluates more than the budget moves (generation 7 evaluates 2 and
+charges 1), the difference is `materialize` recognising an artifact already
+measured.
+
+`inline_threshold` is a bounded integer rather than an enumeration, and the
+front above moves along it — 32, 75, 190, 873. Until 0.5.0 it did not: bounded
+numeric loci declared no finite domain, so the operators left them frozen. At
+the same 40-evaluation budget this front held 6 rows, every one of them at
+`inline=75`.
 
 ## Before you spend anything: ask whether *any* optimizer can win here
 
@@ -90,30 +108,37 @@ agent_evolve diagnose: examples.build_flags.problem_def:problem
 
 problem check: BuildFlags
   budget assessed  40 evaluations
-  probe spent      120 draws, 75 evaluated  (failure rate 38%)
+  probe spent      120 draws, 73 evaluated  (failure rate 39%)
 
   search space  (6 loci)
     opt_level:6 vectorize:4 link_time:3 unroll_loops:2 fast_math:2
-    inline_threshold:?
-    undeclared domains: inline_threshold
+    inline_threshold:64(projected)
+    undeclared domains: none
   ...
   headroom at budget 40
-    runtime_ms (min)  best of probe 659.32  expected best of 40 random 671.017 +/- 14.0221  headroom 11.6974  [below noise]
-    binary_kb (min)  best of probe 274.88  expected best of 40 random 285.331 +/- 12.7832  headroom 10.451  [below noise]
+    runtime_ms (min)  best of probe 618.31  expected best of 40 random 625.113 +/- 13.2479  headroom 6.80339  [below noise]
+    binary_kb (min)  best of probe 232  expected best of 40 random 240.515 +/- 14.3874  headroom 8.51526  [below noise]
 
   verdict
     The best value the probe found on every objective is within noise of
     what 40 random draws are expected to reach: no optimizer can demonstrate
     an advantage here at this budget. Raise the budget, or reshape the
-    search space, before crediting any optimizer with a win. Note: 1 of 6
-    loci declare no finite domain (inline_threshold), so the probe could not
-    vary them and any headroom along those axes is invisible to this check.
+    search space, before crediting any optimizer with a win.
 ```
 
 Note what it just did: it returned a **no-headroom verdict on our own shipped
 example** rather than a win. That is the same arbitration as the table at the
 top, one level up — a tool that will tell you not to use it is the only kind
 whose recommendation means anything.
+
+The verdict got *harder* to dismiss in 0.5.0, not easier. It used to arrive with
+a footnote — one of the six loci declared no finite domain, so the probe could
+not vary `inline_threshold` and any headroom along that axis was invisible to
+the check. That axis is now projected onto 64 points and the probe does vary it;
+`undeclared domains: none`. The verdict is the same, and it is now a statement
+about the whole space rather than about five sixths of it. `64(projected)` marks
+an axis read off bounds rather than declared as a set — searchable, but on the
+grid rather than the continuum.
 
 When `diagnose` says there *is* headroom, `agent_evolve check` is the next
 question: does a model beat uninformed sampling on your problem, at the same
@@ -255,10 +280,32 @@ paid for twice. Put anything cheap and deterministic there and keep `evaluate`
 for the expensive part.
 
 **Declare your domains in the schema.** Anything that reads it — including the
-baseline — then draws only legal candidates. A locus with no finite declared
-domain (`int` with `ge`/`le` bounds, an open `str`) is one the operators leave
-alone; `diagnose` names those explicitly, as it does above, because a search
-space that cannot be varied is the commonest reason a run goes nowhere.
+baseline — then draws only legal candidates.
+
+**A bounded number is a domain.** Since 0.5.0, `workers: int = Field(..., ge=1,
+le=64)` above is a searchable axis: bounded integers are enumerated outright
+when the span is at most **64** and projected onto 64 evenly spread points
+otherwise, and a doubly bounded `float` becomes a **16**-point grid with a point
+on each inclusive endpoint. `multipleOf` is honoured, so every value the
+projection emits is one the schema would accept, and an excluded endpoint is
+never emitted. If an axis deserves a different resolution, say so on the field:
+
+```python
+inline_threshold: int = Field(..., ge=0, le=1000,
+                              json_schema_extra={"agent_evolve": {"grid": 16}})
+# 16 points: 0, 67, 133, 200, ..., 933, 1000
+```
+
+The override is clamped to `[2, 256]` — one point is a constant, and a domain
+nobody can enumerate cheaply is not one an operator can draw from. `diagnose` marks a
+projected axis as `inline_threshold:64(projected)`, because *64 values* means
+something different when the schema declared 64 values than when it declared an
+interval: the optimizer moves on the grid, not on the continuum.
+
+A locus with **no finite reading** — an open `str`, a bound on only one side —
+is still one the operators leave alone, and `diagnose` still names those
+explicitly under `undeclared domains`, because a search space that cannot be
+varied is the commonest reason a run goes nowhere.
 
 Problems written against the older two-method contract (`objectives` and
 `evaluate`) keep working unchanged: `as_problem` adapts them with identity
@@ -273,6 +320,26 @@ optimize(problem, budget=40)                      # auto: llm if a key exists, e
 ```
 
 `auto` says out loud which one it picked.
+
+**What `proposer="llm"` buys is the configuration the ablations picked.**
+Model-proposed initialization — the six-arm ablation's strongest arm, at 11×
+fewer evaluations to target, better on **40 of 40** paired seeds, for **one**
+call. Model-authored surrogate screening — the shipped default, unchanged, and
+still admitted only when it out-validates the rules, which is the arbitration
+the first table describes rather than a win claim. And at `budget >= 48`, a
+crossed screen sized from the budget, read by a model-weighted graded prior:
+the ablation's guidance arm, 4.60×. Below 48 the screen is skipped and the
+prior stays the rule form, because the prior only ever acts on a screen's
+evidence. Every one of those resolutions is announced through `on_progress`
+rather than taken silently, and each is overridable by name (`prior=`,
+`structure_budget=`, `authorship=`).
+
+**What it does not buy is the per-offspring chooser**, which is `chooser="off"`
+by default: a model call per offspring returned **ten sealed null verdicts** and
+consumed 61% of that ablation's whole ledger for **0.94×** the speed of doing
+nothing. `chooser="llm"` still buys it — the negative result is published, not
+hidden, and the mechanism is reachable — and asking for it on a run that makes
+no model call is refused by name rather than quietly ignored.
 
 ## What is measured, and what is not
 
@@ -319,8 +386,10 @@ for venue validity, an axis that read null — are published rather than omitted
   do not quote them across them.
 - **The ladders rest on one venue family.**
 - **Model guidance of *operator choice* did not work.** Eight mechanisms, eight
-  sealed verdicts, guided at the unguided median. It is in the product only as
-  an arbitrated option that has to earn its way in like everything else.
+  sealed verdicts, guided at the unguided median. Since 0.5.0 it is **off by
+  default** and reachable only by asking for it by name (`chooser="llm"`): a
+  negative result belongs in the product as a switch nobody is billed for, not
+  as a default.
 - **Two of our own published sentences are withdrawn**, with the defect in each
   stated in the paper's discussion. We do not re-assert them from the archive.
 
@@ -407,6 +476,7 @@ agent_evolve check    PROBLEM [--budget N] [--baseline-only]
 agent_evolve run      PROBLEM [--budget N] [--proposer auto|llm|random]
                               [--strategy auto|genetic|authoring]
                               [--authorship ...] [--prior ...] [--effort ...]
+                              [--chooser off|llm] [--structure-budget auto|N]
                               [--seal PATH] [--journal PATH] [--json]
 ```
 
@@ -419,7 +489,7 @@ document — `best`, `pareto_front`, `evaluations`, `history`, `telemetry`,
 | Example | Credentials | What it shows |
 | --- | --- | --- |
 | `examples/build_flags/` | none | The regime this tool suits: categorical, constrained, expensive evaluator |
-| `examples/knapsack/` | none | The five obligations, shortest possible. Also an honest negative: its only locus declares no finite domain, and `diagnose` refuses to credit any optimizer on it |
+| `examples/knapsack/` | none | The five obligations, shortest possible. Still an honest negative, on better grounds since 0.5.0: its selection locus now projects (`selection[0]:10(projected)`, `undeclared domains: none`) and the probe does vary it, and `diagnose` still refuses to credit any optimizer — 40 random draws are expected to reach the same best value (150) and the same best weight (5) the probe found |
 | `examples/pymoo_swap/` | none (needs `[pymoo]`) | The NSGA-II swap, as two files and a six-line diff |
 
 ## Tests
