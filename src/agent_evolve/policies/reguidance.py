@@ -336,8 +336,10 @@ class Reguidance:
         """Adopt whatever prior the loop already holds, once.
 
         A hard restriction is the 0/1 special case of the graded form, so it
-        seeds as such and its exclusions survive the first revision unchanged
-        (damping keeps zeros at zero). ``None`` seeds the uniform table.
+        seeds as such. Its exclusions persist through any revision that stays
+        SILENT about them (damping keeps an untouched zero at zero) and regain
+        mass exactly when a reply weights them -- ``_damp`` states why that
+        direction is the deliberate one. ``None`` seeds the uniform table.
         """
 
         if self._seeded:
