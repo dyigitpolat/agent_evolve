@@ -197,3 +197,37 @@ transcripts are in `papers/agent_evolve_iclr_2027/V6_RELEASE.md`.
       numbers with their wave names, but the archive itself is deliberately not
       distributed. A `docs/measurements.md` vendored snapshot is still the
       cleanest answer for a standalone GitHub release.
+
+## 6. Known defects found by measurement, 2026-08-19 — not fixed
+
+These were found by the end-to-end evaluation row, not by the test suite, and
+each one is a real limit on what the package can currently do. They are listed
+here because the next person will hit them.
+
+- [ ] **`api.optimize` cannot sell the working mechanisms without the worst
+      one.** `proposer="auto"` builds the completion seam *and* the per-offspring
+      chooser; `proposer="random"` leaves `complete=None`, which silently
+      disables the authoring seams. The authoring jobs are where the measured
+      wins are; the per-offspring chooser has ten null verdicts and costs
+      107–171x the run it advises. **No drop-in user can currently run the
+      configuration that produced this project's end-to-end results.** One-flag
+      fix; it is the single most valuable thing to do here.
+- [ ] **Continuous parameters cannot be searched at all.**
+      `policies.genetic._declared_domain` returns `()` for any field that is not
+      a finite enum or bool, so `uniform_candidate` and `mutate` leave it
+      frozen. Measured: 12 of 13 axes on a hyperparameter benchmark were
+      identical across 64 draws. This blocks an entire class of problems, and
+      the failure is silent. Needs either a finite projection or a bounded
+      perturbation.
+- [ ] **A single-valued field renders as `{"const": ...}` rather than
+      `{"enum": [...]}`,** and the same reader ignores `const`. Harmless where
+      there is nothing to search, but it is the same one-line gap as above.
+
+**A measured direction, not a defect.** Guidance is authored once at the start
+and nothing refreshes it against what the run subsequently measures. On the one
+live physical simulator tested, the guided stack is the best arm at 20, 40 and
+80 evaluations and the worst by 160 — it is not wasting budget (zero failed
+evaluations against uniform's 1.25%), it is working from a stale picture. The
+seam that would fix this (`reauthor_every` / `evidence_min_rows` in
+`policies/llm_generator.py`) is landed and **off by default**; making it earn
+its place is the clearest open research direction.
