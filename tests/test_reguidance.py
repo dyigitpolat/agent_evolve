@@ -324,6 +324,40 @@ def test_a_revision_that_produced_no_rank_zero_row_is_reverted_first():
     )
 
 
+def test_a_rank_zero_row_that_moves_no_front_member_is_not_enough():
+    """The 20370102 shape: revisions landing beside the front, never past it.
+
+    On three objectives nearly every fresh point is non-dominated, so the
+    first reading of the bet (some post-event row is rank-0) admitted 23
+    revisions and reverted 0 across the first live venue's runs while one of
+    them sat flat for 120 charges. The bet is strict domination of a
+    pre-event front member: the tilted prior must move the front, not merely
+    land beside it. (2026-08-19, W1 pilot.)
+    """
+
+    replies = iter([
+        _reply({"mode": (["a", "b", "c"], [4, 1, 1])}),   # installs
+        _reply({"mode": (["a", "b", "c"], [1, 4, 1])}),   # after revert, anew
+        _reply({"mode": (["a", "b", "c"], [1, 1, 4])}),   # kept: front moved
+    ])
+    policy = _policy(lambda _prompt: next(replies), every=1, min_rows=1)
+
+    _revise(policy, charges=4)
+    beside = ROWS + _rows(([1] * GENOME, "b", 9, 1))   # rank-0; dominates nothing
+    _revise(policy, rows=beside, charges=8, gen=2)
+    assert policy.telemetry.revisions_reverted == 1, (
+        "a revision whose window merely landed BESIDE the front survived"
+    )
+
+    past = beside + _rows(([1] * GENOME, "c", 9, 0))   # dominates the (8, 0) member
+    _revise(policy, rows=past, charges=12, gen=3)
+    assert policy.telemetry.revisions_admitted == 3
+    assert policy.telemetry.revisions_reverted == 1, (
+        "a revision whose window dominated a pre-event front member was "
+        "reverted anyway"
+    )
+
+
 # --- u8: immigrants ---------------------------------------------------------
 
 def test_immigrants_are_validated_capped_and_reach_the_next_generation():

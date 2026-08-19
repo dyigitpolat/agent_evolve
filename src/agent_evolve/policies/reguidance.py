@@ -362,13 +362,20 @@ class Reguidance:
         specs: Sequence[ObjectiveSpec],
         note: Dict[str, Any],
     ) -> bool:
-        """Undo the last revision unless something it drew is rank-0 now.
+        """Undo the last revision unless its window IMPROVED the front.
 
         The claim a revision makes is narrow and therefore checkable: draws
         from the tilted prior are worth more than draws from the one it
-        replaced. Rank-0 in the pooled rows is the run's own weight-free
-        verdict on "worth more", and the rows measured after the event are
-        exactly the ones the revision is responsible for.
+        replaced. The first reading of "worth more" -- some post-event row is
+        rank-0 in the pooled rows -- was measured impotent on the first live
+        venue it met: across six revision-carrying runs on a three-objective
+        simulator it admitted 23 revisions and reverted 0, because on three
+        objectives almost every fresh point is non-dominated, and a run whose
+        revisions had locked it flat for 120 charges kept every one of them
+        (W1 pilot, seed 20370102). The bet is now the loop's own unwind
+        semantics: the revision stands only if some row measured after the
+        event STRICTLY DOMINATES a member of the pre-event front -- the
+        tilted prior must move the front, not merely land beside it.
         """
 
         pending = self._pending
@@ -376,8 +383,13 @@ class Reguidance:
             return False
         self._pending = None
         cut = int(pending["rows_at_event"])
-        front = _front_indices(rows, specs)
-        if any(index >= cut for index in front):
+        before = [dict(row[1]) for row in rows[:cut]]
+        front_before = [before[index]
+                        for index in _front_indices(rows[:cut], specs)]
+        oriented = list(specs)
+        if any(dominates(dict(objectives), member, oriented)
+               for _config, objectives in rows[cut:]
+               for member in front_before):
             return False
         self._installed = {k: (tuple(v[0]), tuple(v[1]))
                            for k, v in dict(pending["weights"]).items()}
