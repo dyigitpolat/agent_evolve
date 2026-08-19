@@ -83,7 +83,12 @@ def test_the_genetic_llm_run_consults_the_chooser(monkeypatch) -> None:
         "agent_evolve.integrations.completion.completion_for",
         _canned_completion_for,
     )
-    result = optimize(_Seeded(), budget=16, seed=5, proposer="llm")
+    # 2026-08-19: the per-offspring chooser became opt-in (`chooser="llm"`).
+    # Ten sealed null verdicts at 107-171x the cost of the run it advises, so
+    # a model run no longer buys it by default; the wiring under test here is
+    # unchanged, and asking for it by name is now how it is reached.
+    result = optimize(_Seeded(), budget=16, seed=5, proposer="llm",
+                      chooser="llm")
 
     assert result.telemetry is not None
     rows = [m for m in result.telemetry.mechanisms if m.mechanism == "chooser"]

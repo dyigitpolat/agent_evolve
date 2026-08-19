@@ -38,6 +38,11 @@ PRESETS: Mapping[str, Mapping[str, str]] = {
     # where candidates come from, and the variance-guarded authored surrogate
     # decides which of them are worth measuring.
     "generative": {"generation": "llm", "surrogate": "llm"},
+    # What `authorship="auto"` resolves to when a model call is possible, named
+    # so a campaign can state it instead of inheriting it: the two seams the
+    # six-arm ablation and the sealed luna-clear row measured as winners, and
+    # neither of the per-decision seams that did not.
+    "guided": {"surrogate": "llm", "initialization": "llm"},
     "full": {"surrogate": "llm", "operators": "llm", "initialization": "llm"},
 }
 

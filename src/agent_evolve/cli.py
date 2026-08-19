@@ -39,6 +39,26 @@ def _authorship_presets() -> tuple:
     return tuple(PRESETS)
 
 
+def _structure_budget_arg(value: str) -> Any:
+    """``auto`` or an evaluation count; the sentinel is resolved by the API.
+
+    argparse converts a string default through ``type``, so a plain ``int``
+    type would try to parse the sentinel itself. Resolving it here instead
+    would put a second copy of the sizing rule in the CLI, where it could
+    drift from the one the library announces.
+    """
+
+    if value == "auto":
+        return "auto"
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "--structure-budget takes 'auto' or an evaluation count, got "
+            f"{value!r}"
+        ) from None
+
+
 def _load_problem(spec: str) -> Any:
     """Import ``module:attribute`` and return the problem object."""
     if ":" not in spec:
@@ -249,6 +269,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         seal=args.seal,
         structure_budget=args.structure_budget,
         prior=args.prior,
+        chooser=args.chooser,
         effort=args.effort,
         journal=args.journal,
         authorship=args.authorship,
@@ -358,19 +379,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ),
     )
     run.add_argument(
-        "--structure-budget", type=int, default=0, dest="structure_budget",
+        "--structure-budget", type=_structure_budget_arg, default="auto",
+        dest="structure_budget",
         help=(
             "evaluations to spend on a crossed screen before the population; "
-            "charged against --budget, not free"
+            "charged against --budget, not free. 'auto' (default) skips it "
+            "below a budget of 48 and sizes it from the budget above that"
         ),
     )
     run.add_argument(
         "--prior",
-        default="rule",
-        choices=("rule", "rule-weighted", "llm", "llm-weighted"),
+        default="auto",
+        choices=("auto", "rule", "rule-weighted", "llm", "llm-weighted"),
         help=(
             "who turns the screen into a sampling prior; the llm forms fall "
-            "back to their rule comparator, out loud, without a credential"
+            "back to their rule comparator, out loud, without a credential. "
+            "'auto' (default) is 'rule' offline and 'llm-weighted' on a model "
+            "run, announced either way"
+        ),
+    )
+    run.add_argument(
+        "--chooser",
+        default="off",
+        choices=("off", "llm"),
+        help=(
+            "who picks parents and cut points. 'llm' spends one model call per "
+            "offspring; it returned ten sealed null verdicts at 107-171x the "
+            "cost of the run it advises, and consumed 61%% of the six-arm "
+            "ablation's ledger for 0.94x the speed of doing nothing. 'off' "
+            "(default) is the random control it never beat"
         ),
     )
     run.add_argument(
@@ -393,7 +430,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "out-validate the rules); 'operators[-llm]' runs variation arms "
             "under survival credit; 'generation-llm' lets the model write the "
             "sampler every candidate is drawn from, 'generative' puts that "
-            "sampler under the authored screen; 'full' is surrogate + "
+            "sampler under the authored screen; 'guided' is what 'auto' "
+            "resolves to on a model run (authored surrogate + model-proposed "
+            "initialization, the two measured winners); 'full' is surrogate + "
             "operators + init, model-authored"
         ),
     )

@@ -176,6 +176,71 @@ def _resolve_strategy(strategy: str, has_seeds: bool, announce) -> str:
     return "authoring"
 
 
+def _check_structure_budget(structure_budget: int, budget: int) -> None:
+    """The screen is charged against the search it informs, so it must fit."""
+
+    if structure_budget >= budget:
+        raise ValueError(
+            f"structure_budget ({structure_budget}) must leave room inside the "
+            f"budget ({budget}): the screen is charged against the same budget "
+            "as the search it informs"
+        )
+
+
+def _resolve_guidance(
+    prior: Any,
+    structure_budget: Any,
+    *,
+    budget: int,
+    model_calls: bool,
+    announce: Callable[[str], None],
+) -> tuple[str, int]:
+    """Turn the ``"auto"`` sentinels into the stack the measurements bought.
+
+    Two rules, and which one applies is decided by whether a model call is
+    actually possible -- not by what the caller hoped for.
+
+    Without a model call the sentinels resolve to ``"rule"`` and ``0``, which
+    are the literal pre-sentinel defaults: the credential-free path draws the
+    same candidates in the same order, and the fossil stream cannot move.
+
+    With one, the screen is sized from the budget and ``prior`` becomes
+    ``"llm-weighted"`` exactly when that screen will run. Below 48 evaluations
+    both stay off: the six-arm ablation screened at 15 evaluations of 96, at a
+    small budget that share buys less than the initialization seam alone (the
+    measured winner there), and the prior seat only ever acts on a screen's
+    evidence.
+    """
+
+    if not model_calls:
+        return ("rule" if prior == "auto" else prior,
+                0 if structure_budget == "auto" else structure_budget)
+    if structure_budget == "auto":
+        structure_budget = 0 if budget < 48 else min(16, max(8, budget // 6))
+        if structure_budget:
+            announce(
+                f"structure_budget={structure_budget} by default at budget "
+                f"{budget}: the six-arm ablation screened at 15 evaluations of "
+                "96, and the screen is charged against the same budget. Below "
+                "48 it is skipped. Pass structure_budget=0 to skip it here."
+            )
+    if prior == "auto":
+        # The prior seat only acts on a screen's evidence, so the model form
+        # is bought exactly when a screen will run. Announcing a model prior
+        # beside structure_budget=0 would be a promise the run never cashes.
+        if structure_budget:
+            prior = "llm-weighted"
+            announce(
+                "prior='llm-weighted' by default on a model run: the model "
+                "reads the crossed screen and the screen's own statistics "
+                "carry the weights (the six-arm ablation's guidance arm). "
+                "Pass prior='rule' for the credential-free comparator."
+            )
+        else:
+            prior = "rule"
+    return prior, structure_budget
+
+
 def optimize(
     problem: Any,
     *,
@@ -186,8 +251,9 @@ def optimize(
     seed: Optional[int] = None,
     seal: Optional[str] = None,
     on_progress: Optional[Callable[[str], None]] = None,
-    structure_budget: int = 0,
-    prior: str = "rule",
+    structure_budget: int | str = "auto",
+    prior: str = "auto",
+    chooser: str = "off",
     effort: Optional[str] = None,
     journal: Any = None,
     authorship: Any = "auto",
@@ -202,9 +268,23 @@ def optimize(
     *structure_budget* spends that many evaluations -- charged against the same
     *budget* -- on a crossed screen before the population is built; *prior*
     names who turns the screen into a sampling prior: the credential-free
-    ``"rule"`` (default) or ``"rule-weighted"``, or their model-backed forms
-    ``"llm"`` / ``"llm-weighted"``, which fall back to the rule comparator, out
-    loud, when no model call is possible.
+    ``"rule"`` or ``"rule-weighted"``, or their model-backed forms ``"llm"`` /
+    ``"llm-weighted"``, which fall back to the rule comparator, out loud, when
+    no model call is possible. Both default to ``"auto"``, which resolves
+    against what the run can actually do: without a model call, to ``"rule"``
+    and ``0`` -- the literal pre-sentinel defaults, so the credential-free path
+    stays byte-identical -- and with one, to ``"llm-weighted"`` and a screen
+    sized from the budget, announced through *on_progress* rather than picked
+    silently.
+
+    *chooser* names who picks parents and cut points inside a generation, and
+    defaults to ``"off"``. ``"llm"`` buys the per-offspring chooser, which is
+    the one mechanism here that has never earned its price: ten sealed null
+    verdicts, Theta(offspring) model calls rather than one, and 61% of the
+    six-arm ablation's whole ledger consumed for 0.94x the speed of doing
+    nothing. ``"off"`` runs the random control it never beat. It needs a run
+    that makes model calls; asking for it on a run that cannot is refused
+    rather than ignored.
 
     *effort* pins the model's reasoning effort on every completion call, and
     *journal* (a callable, or a path to a JSONL file) receives one record per
@@ -220,20 +300,19 @@ def optimize(
     """
     if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
         raise ValueError(f"budget must be a positive integer, got {budget!r}")
-    if (not isinstance(structure_budget, int) or isinstance(structure_budget, bool)
-            or structure_budget < 0):
+    if structure_budget != "auto":
+        if (not isinstance(structure_budget, int)
+                or isinstance(structure_budget, bool) or structure_budget < 0):
+            raise ValueError(
+                f"structure_budget must be 'auto' or a non-negative integer, "
+                f"got {structure_budget!r}"
+            )
+        _check_structure_budget(structure_budget, budget)
+    if prior != "auto" and prior not in _PRIORS:
         raise ValueError(
-            f"structure_budget must be a non-negative integer, got "
-            f"{structure_budget!r}"
-        )
-    if structure_budget >= budget:
-        raise ValueError(
-            f"structure_budget ({structure_budget}) must leave room inside the "
-            f"budget ({budget}): the screen is charged against the same budget "
-            "as the search it informs"
-        )
-    if prior not in _PRIORS:
-        raise ValueError(f"prior must be one of {sorted(_PRIORS)}, got {prior!r}")
+            f"prior must be 'auto' or one of {sorted(_PRIORS)}, got {prior!r}")
+    if chooser not in ("off", "llm"):
+        raise ValueError(f"chooser must be 'off' or 'llm', got {chooser!r}")
     if effort is not None and not isinstance(effort, str):
         raise ValueError(
             f"effort must be a provider effort level as a string, got {effort!r}"
@@ -263,6 +342,15 @@ def optimize(
     # skipping validation on one path is how an invalid argument becomes a
     # silent no-op.
     kind = _resolve_proposer(proposer, announce)
+    if chooser == "llm" and kind != "llm":
+        # A chooser that cannot call a model is a chooser that never chooses,
+        # and the run would look exactly like the one that never asked for it.
+        raise ValueError(
+            f"chooser='llm' asks a model to pick parents and cut points, and "
+            f"this run resolved to the {kind!r} proposer, which makes no model "
+            "call. Pass proposer='llm' with a provider credential, or drop "
+            "chooser= to keep the random control."
+        )
 
     seeds = tuple(dict(c) for c in bound.seeds())
     chosen = _resolve_strategy(strategy, bool(seeds), announce)
@@ -278,9 +366,13 @@ def optimize(
             "to seal a generative run, or drop seal=."
         )
     if chosen != "genetic":
+        # The sentinels are read as "not asked for": ``auto`` is this package
+        # choosing, and refusing a run over a choice the caller never made
+        # would be the package arguing with itself.
         engaged = [name for name, on in (
-            ("structure_budget", structure_budget != 0),
-            ("prior", prior != "rule"),
+            ("structure_budget", structure_budget not in ("auto", 0)),
+            ("prior", prior not in ("auto", "rule")),
+            ("chooser", chooser == "llm"),
             ("effort", effort is not None),
             ("journal", journal is not None),
             ("authorship", authorship_config is not None
@@ -319,18 +411,18 @@ def optimize(
                 journal_handle.flush()
 
         try:
-            chooser = None
+            chooser_policy = None
             complete = None
             # Provider usage is measured from the completion seam's own
             # journal, never declared: zero means "counted and none occurred".
             usage_ledger = {"calls": 0, "input": 0, "output": 0, "tokens_known": True}
             if kind == "llm":
-                # Guided operator choice: the model picks parents and cut
-                # points, reasoning over the accumulated search state. It
-                # cannot author a candidate -- OperatorChoice has no field
-                # that could hold one.
+                # The completion seam is built for the whole run, not for one
+                # consumer. It used to be constructed inside the chooser's own
+                # branch, which meant the seams that measured well -- authored
+                # initialization, the weighted prior -- could only be bought
+                # together with the one that measured null.
                 from agent_evolve.integrations.completion import completion_for
-                from agent_evolve.policies.llm_chooser import llm_chooser
 
                 def _record_usage(record: dict) -> None:
                     usage_ledger["calls"] += 1
@@ -361,9 +453,21 @@ def optimize(
                 complete = completion_for(route, settings,
                                           journal=_record_usage, effort=effort,
                                           max_output_tokens=cap)
-                if complete is not None:
+            if chooser == "llm":
+                if complete is None:
+                    announce(
+                        "chooser='llm' needs a model call and none is "
+                        "available; operator choices stay random."
+                    )
+                else:
+                    # Guided operator choice: the model picks parents and cut
+                    # points, reasoning over the accumulated search state. It
+                    # cannot author a candidate -- OperatorChoice has no field
+                    # that could hold one. Opt-in, because it is the one seam
+                    # here with ten sealed null verdicts against it.
+                    from agent_evolve.policies.llm_chooser import llm_chooser
                     from agent_evolve.policies.semantics import domain_card
-                    chooser = llm_chooser(
+                    chooser_policy = llm_chooser(
                         complete, objectives=list(bound.objectives), budget=budget,
                         domain_context=domain_card(bound),
                         on_shortfall=lambda got, want: announce(
@@ -375,6 +479,14 @@ def optimize(
                     "effort pins model reasoning, and this run makes no model "
                     "calls, so it has no effect here."
                 )
+
+            # Resolved here and not earlier: what the sentinels mean depends on
+            # whether a model call is actually possible, which is not known
+            # until the seam above has either been built or come back empty.
+            prior, structure_budget = _resolve_guidance(
+                prior, structure_budget, budget=budget,
+                model_calls=complete is not None, announce=announce)
+            _check_structure_budget(structure_budget, budget)
 
             prior_proposer: Any = None
             if prior == "rule-weighted":
@@ -408,10 +520,14 @@ def optimize(
 
             if authorship_config is None:
                 if complete is not None:
-                    authorship_config = AuthorshipConfig(surrogate="llm")
+                    authorship_config = AuthorshipConfig(surrogate="llm",
+                                                         initialization="llm")
                     announce(
                         "authorship: model-authored surrogate screening is ON "
-                        "(the sealed luna-clear row held); pass "
+                        "(the sealed luna-clear row held), and model-proposed "
+                        "initialization is ON -- the six-arm ablation's "
+                        "strongest arm, at 11x fewer evaluations to target, "
+                        "better on 40 of 40 paired seeds, for one call; pass "
                         "authorship='off' to disable.")
                 else:
                     authorship_config = AuthorshipConfig()
@@ -455,7 +571,7 @@ def optimize(
                     initial_proposals=policies.initial_proposals,
                     generator=policies.generator,
                 ),
-                chooser=chooser,
+                chooser=chooser_policy,
                 log=announce,
             )
             # Authoring that produced no policy object still produced
