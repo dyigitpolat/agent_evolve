@@ -546,7 +546,8 @@ def optimize(
                 schema_text=domain_card(bound), seed=seed, announce=announce,
                 candidate_model=getattr(bound, "candidate_model", None),
                 init_template=(dict(seeds[0]) if seeds else None),
-                init_k=max(0, pop - len(seeds)))
+                init_k=max(0, pop - len(seeds)),
+                budget=budget, population_size=pop)
 
             cache = EvaluationCache()
             cache.budget = budget
@@ -570,6 +571,7 @@ def optimize(
                     portfolio=policies.portfolio,
                     initial_proposals=policies.initial_proposals,
                     generator=policies.generator,
+                    reguidance=policies.reguidance,
                 ),
                 chooser=chooser_policy,
                 log=announce,
@@ -578,7 +580,8 @@ def optimize(
             # counters, and the loop can only harvest what it was handed.
             # These are the seams whose failure leaves nothing behind.
             orphaned = tuple(note for note in (policies.init_author,
-                                               policies.generator_author)
+                                               policies.generator_author,
+                                               policies.reguidance_author)
                              if note is not None)
             if orphaned and result.telemetry is not None:
                 from agent_evolve.core.telemetry import harvest_telemetry

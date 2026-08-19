@@ -21,6 +21,7 @@ _SURROGATE = ("off", "rule", "llm")
 _OPERATORS = ("off", "rule", "llm")
 _INITIALIZATION = ("off", "llm")
 _GENERATION = ("off", "llm")
+_ADAPTATION = ("off", "llm")
 
 #: The named compositions, as field settings. A table rather than a method
 #: body so that everything downstream -- the CLI's ``--authorship`` choices,
@@ -43,6 +44,11 @@ PRESETS: Mapping[str, Mapping[str, str]] = {
     # six-arm ablation and the sealed luna-clear row measured as winners, and
     # neither of the per-decision seams that did not.
     "guided": {"surrogate": "llm", "initialization": "llm"},
+    # `guided`, plus the one channel that reads what the run MEASURED: the
+    # graded prior is revised on a declared cadence instead of being authored
+    # once at t = 0 and held for the whole budget.
+    "adaptive": {"surrogate": "llm", "initialization": "llm",
+                 "adaptation": "llm"},
     "full": {"surrogate": "llm", "operators": "llm", "initialization": "llm"},
 }
 
@@ -165,6 +171,40 @@ class AuthorshipConfig:
     #: exclusion.
     generation_locus_priors: int = 1
     generation_prior_max_weight_ratio: float = 8.0
+    #: MEASUREMENT-CONDITIONED REVISION OF THE SAMPLING PRIOR. ``"off"`` is
+    #: the static-prior seam every sealed row ran: whatever prior the run
+    #: installs before it measures anything is held for the whole budget.
+    #: ``"llm"`` buys the other clock -- on the cadence below, one call reads
+    #: the run's measured trace and the weights in force and returns a
+    #: revision, which is damped into them rather than replacing them. It
+    #: revises the CLASSICAL breeding path's prior, which is what
+    #: initialization and mutation both draw through; it is not the
+    #: sampler-re-authoring channel, which lost to its shuffled-evidence
+    #: control.
+    adaptation: str = "off"
+    #: The cadence, in CHARGED evaluations. ``0`` resolves from the run's own
+    #: shape in :func:`build_authorship` (a couple of generations, or a sixth
+    #: of the budget, whichever is larger) and the resolved value is
+    #: announced, so a campaign can state it instead of inheriting it.
+    adapt_every: int = 0
+    #: How many revisions one run may pay for.
+    adapt_max: int = 4
+    #: How many complete configurations a revision call may also return, each
+    #: validated value-by-value like an authored initial member. ``0`` -- the
+    #: default -- runs revision alone: immigrants are a separately flagged
+    #: second cell, because two mechanisms bought together measure one number.
+    adapt_immigrants: int = 0
+    #: How far a reply moves the installed weights. ``0.5`` mixes them evenly;
+    #: ``1.0`` installs the reply as written (an ablation arm, not a default)
+    #: and ``0.0`` is the no-op arm. Below 1 no revision can introduce an
+    #: exclusion, which is what bounds a wrong revision to wasted draws.
+    adapt_damping: float = 0.5
+    #: The CONTROL seam, declared: it receives the rows this run measured and
+    #: returns the rows the model is shown. Identity (None) is the product; a
+    #: view returning another run's rows -- same count, same shape, same cost
+    #: -- is the shuffled-evidence control, buildable without editing the
+    #: product.
+    adapt_evidence_view: Any = None
     limits: RuntimeLimits = field(default_factory=RuntimeLimits)
 
     def __post_init__(self) -> None:
@@ -188,6 +228,38 @@ class AuthorshipConfig:
                 f"authorship.generation must be one of {_GENERATION}, got "
                 f"{self.generation!r}"
             )
+        if self.adaptation not in _ADAPTATION:
+            raise ValueError(
+                f"authorship.adaptation must be one of {_ADAPTATION}, got "
+                f"{self.adaptation!r}"
+            )
+        if self.adapt_every < 0 or self.adapt_max < 0 or self.adapt_immigrants < 0:
+            raise ValueError(
+                "authorship.adapt_every (a cadence in charged evaluations), "
+                "adapt_max and adapt_immigrants are counts and must be "
+                f"non-negative, got {self.adapt_every}, {self.adapt_max}, "
+                f"{self.adapt_immigrants}")
+        if not 0.0 <= self.adapt_damping <= 1.0:
+            raise ValueError(
+                "authorship.adapt_damping mixes a revision into the installed "
+                f"weights and must lie in [0, 1], got {self.adapt_damping}")
+        if self.adaptation == "off":
+            # A knob the run would silently ignore is a silent no-op: the
+            # cadence would be read by nothing and the campaign would report a
+            # setting it never bought.
+            asked = [name for name, value, default in (
+                ("adapt_every", self.adapt_every, 0),
+                ("adapt_max", self.adapt_max, 4),
+                ("adapt_immigrants", self.adapt_immigrants, 0),
+                ("adapt_damping", self.adapt_damping, 0.5),
+                ("adapt_evidence_view", self.adapt_evidence_view, None),
+            ) if value != default]
+            if asked:
+                raise ValueError(
+                    f"authorship.{', '.join(asked)} configure(s) the "
+                    "measurement-conditioned revision channel and this run "
+                    "has authorship.adaptation='off'; set adaptation='llm' or "
+                    "drop the setting")
         if self.generation_reauthor_every < 0:
             raise ValueError(
                 "authorship.generation_reauthor_every is a cadence in charged "
@@ -227,7 +299,8 @@ class AuthorshipConfig:
     @property
     def engaged(self) -> bool:
         return (self.surrogate != "off" or self.operators != "off"
-                or self.initialization != "off" or self.generation != "off")
+                or self.initialization != "off" or self.generation != "off"
+                or self.adaptation != "off")
 
     @classmethod
     def preset(cls, name: str) -> "AuthorshipConfig":
@@ -253,6 +326,13 @@ class AuthorshipPolicies:
     #: model failed to author a sampler" would be indistinguishable from
     #: "nobody asked". When a generator exists it carries its own note.
     generator_author: Optional[Any] = None
+    #: The measurement-conditioned revision policy the loop consults once per
+    #: generation; None when adaptation is off.
+    reguidance: Optional[Any] = None
+    #: Set only when adaptation was asked for and no policy could be built --
+    #: the same counters-need-a-home pattern as ``generator_author``. A live
+    #: policy carries its own counters.
+    reguidance_author: Optional[Any] = None
 
 
 def build_authorship(
@@ -266,6 +346,8 @@ def build_authorship(
     candidate_model: Any = None,
     init_template: Any = None,
     init_k: int = 0,
+    budget: Optional[int] = None,
+    population_size: Optional[int] = None,
 ) -> AuthorshipPolicies:
     """The policy objects for *config*; fields are ``None`` where nothing is on.
 
@@ -284,6 +366,9 @@ def build_authorship(
     generator, generator_note = _build_generator(
         config, complete, objectives, schema_text, say,
         candidate_model, init_template)
+    reguidance, reguidance_note = _build_reguidance(
+        config, complete, objectives, schema_text, say, candidate_model,
+        init_template, budget, population_size)
     return AuthorshipPolicies(
         screening=_build_screening(config, complete, objectives,
                                    schema_text, say),
@@ -293,7 +378,78 @@ def build_authorship(
         init_author=init_note,
         generator=generator,
         generator_author=generator_note,
+        reguidance=reguidance,
+        reguidance_author=reguidance_note,
     )
+
+
+def _build_reguidance(
+    config: AuthorshipConfig,
+    complete: Any,
+    objectives: Sequence[Any],
+    schema_text: str,
+    say: Callable[[str], None],
+    candidate_model: Any,
+    template: Any,
+    budget: Optional[int],
+    population_size: Optional[int],
+) -> tuple:
+    """``(policy, orphaned_note)``; both ``None`` when adaptation is off.
+
+    The cadence is DECLARED, and when the caller declares ``0`` it is resolved
+    here from the run's own shape and announced: a couple of generations of
+    offspring, or a sixth of the budget, whichever is larger, so a short run
+    still gets its first revision after the trace says something and a long
+    one gets several. A campaign that wants a different clock states it.
+    """
+
+    if config.adaptation == "off":
+        return None, None
+    from agent_evolve.policies.reguidance import Reguidance, ReguidanceTelemetry
+
+    telemetry = ReguidanceTelemetry()
+    note = SimpleNamespace(telemetry=telemetry, mechanism="reguidance",
+                           authored_by="llm")
+    if complete is None:
+        say("authorship.adaptation='llm' needs a model call and none is "
+            "available; the sampling prior stays as it was installed.")
+        return None, note
+    if not template:
+        say("authorship.adaptation='llm' received no candidate template, so "
+            "there are no declared domains to re-weight; the sampling prior "
+            "stays as it was installed.")
+        return None, note
+    if config.generation != "off":
+        # Allowed, and announced: the authored sampler draws from lists the
+        # harness hands it, and a graded prior reaches it as a narrowed
+        # DOMAIN, not as weights.
+        say("authorship.adaptation revises the weighted sampling prior the "
+            "breeding path draws through; an authored sampler "
+            "(authorship.generation='llm') reads narrowed domains, not "
+            "weights.")
+
+    every = (config.adapt_every if config.adapt_every > 0
+             else (max(2 * (population_size or 8), (budget or 0) // 6) or 16))
+    say(f"authorship.adaptation='llm': the sampling prior is revised every "
+        f"{every} charged evaluations, at most {config.adapt_max} times, "
+        f"damped at {config.adapt_damping:g}"
+        + (f", with up to {config.adapt_immigrants} immigrant "
+           "configuration(s) per revision." if config.adapt_immigrants
+           else "."))
+    return Reguidance(
+        complete,
+        objectives=list(objectives),
+        candidate_model=candidate_model,
+        template=dict(template),
+        domain_context=schema_text,
+        every=int(every),
+        max_events=config.adapt_max,
+        immigrants=config.adapt_immigrants,
+        damping=config.adapt_damping,
+        max_weight_ratio=8.0,
+        evidence_view=config.adapt_evidence_view,
+        telemetry=telemetry,
+    ), None
 
 
 def _build_initialization(config, complete, schema_text, say,

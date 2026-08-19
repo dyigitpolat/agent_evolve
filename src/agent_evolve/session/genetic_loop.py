@@ -147,6 +147,18 @@ class GeneticConfig:
     #: A hard ceiling on proxy evaluations for the whole run. None -- no
     #: ceiling. A consumer that exhausts it degrades to "no proxy".
     proxy_ceiling: Optional[int] = None
+    #: MEASUREMENT-CONDITIONED REVISION of the sampling prior (a
+    #: policies.reguidance.Reguidance). Once per generation the policy is
+    #: asked whether its declared cadence has come round; when it has, one
+    #: model call reads what the run measured and returns a re-weighted prior
+    #: -- damped into the one in force, so a revision can tilt the draws and
+    #: cannot exclude anything -- plus, when it is bought, a few complete
+    #: configurations to measure next. None -- the default -- is
+    #: byte-identical to the pre-seam loop: no call fires and no counter
+    #: moves. The prior it revises is the same one initialization and
+    #: mutation already consult, so one revision reshapes every subsequent
+    #: draw with no further calls.
+    reguidance: Any = None
 
 
 def domination_rank(
@@ -451,6 +463,10 @@ def run_genetic_loop(
                       {_default_candidate_key(c) for c, _o in population})
 
     pick = chooser or random_chooser(rng, n_loci)
+    # Guidance picks the revision channel returned last generation. They are
+    # authored members, like the initial proposals, so they wait for a
+    # generation of their own rather than displacing offspring already built.
+    immigrants: List[Config] = []
     # Pool extras draw from their own stream: the main stream must spend
     # exactly the same draws whether or not screening is on, or "off" stops
     # being byte-identical to the pre-screening seam.
@@ -593,6 +609,18 @@ def run_genetic_loop(
                         "partial": bool(report.partial),
                     }
 
+        # --- immigrants: authored members, ahead of the offspring -----------
+        # They bypass the screen exactly as the initial proposals do: the
+        # screen orders what the loop CONSTRUCTED, and a member the model
+        # authored from the run's measurements is a guidance pick whose bet is
+        # settled by the evaluator, not by a surrogate.
+        injected = 0
+        if immigrants:
+            kids = [dict(member) for member in immigrants] + list(kids)
+            kids = kids[:want]
+            injected = min(len(immigrants), len(kids))
+            immigrants = []
+
         valid = measure(kids, gen)
         # Survivors compete against this generation's offspring on equal terms;
         # both carry their own objectives, so the rank is recomputed over the
@@ -644,9 +672,33 @@ def run_genetic_loop(
                 log(f"generation {gen}: the prior stopped paying; restriction "
                     "dropped for the remainder")
 
+        # --- the prior is also REVISABLE ------------------------------------
+        # The unwind above can only drop a prior; it cannot correct one. A
+        # prior authored before the run measured anything is right about the
+        # rows it was authored from and says nothing about the rows that came
+        # after, so the channel that reads those rows runs here, after
+        # survival, on its own declared cadence.
+        reguide_note: Optional[Dict[str, Any]] = None
+        if config.reguidance is not None:
+            outcome = config.reguidance.maybe_revise(
+                rows=list(state.evaluated), population=list(population),
+                specs=specs, restriction=restriction, charges=spent(), gen=gen)
+            if outcome.restriction is not None:
+                restriction = outcome.restriction
+            if outcome.immigrants:
+                immigrants = [dict(member) for member in outcome.immigrants]
+            reguide_note = outcome.note
+            if reguide_note is not None:
+                log(f"generation {gen}: the sampling prior was revisited at "
+                    f"{spent()} charged evaluations")
+
         entry = {"gen": gen, "valid_count": len(valid),
                  "pop": len(population),
                  "choices_filled_at_random": filled}
+        if reguide_note is not None:
+            entry["reguide"] = reguide_note
+        if injected:
+            entry["reguide_immigrants"] = injected
         if screen_note is not None:
             entry["screen"] = screen_note
         if config.generator is not None:
@@ -684,7 +736,7 @@ def run_genetic_loop(
          getattr(config.screening, "author", None),
          config.portfolio, getattr(config.portfolio, "author", None),
          config.generator, getattr(config.generator, "author", None),
-         proxy_source),
+         config.reguidance, proxy_source),
         real_evaluations=spent(), virtual_evaluations=virtual,
         proxy_evaluations=proxy_evaluations,
     ))
