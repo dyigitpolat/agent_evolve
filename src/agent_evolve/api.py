@@ -453,6 +453,21 @@ def optimize(
                 complete = completion_for(route, settings,
                                           journal=_record_usage, effort=effort,
                                           max_output_tokens=cap)
+                if complete is None:
+                    # The caller asked for a model BY NAME and no credential
+                    # can honour it. Falling back to the classical path here
+                    # ran to completion and said nothing -- a run launched to
+                    # measure a model measured the control instead, and the
+                    # only trace was `calls: 0`. Found by the release CI's
+                    # stranger job, 2026-08-20.
+                    raise RuntimeError(
+                        "proposer='llm' was asked for by name, but no "
+                        "provider credential is configured, so no model can "
+                        "be called. Set OPENROUTER_API_KEY (or "
+                        "AGENTEVOLVE_DOTENV naming a file that does), or run "
+                        "with proposer='random', which needs nothing -- or "
+                        "proposer='auto', which chooses it out loud."
+                    )
             if chooser == "llm":
                 if complete is None:
                     announce(

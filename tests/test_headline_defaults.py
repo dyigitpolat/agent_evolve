@@ -272,3 +272,18 @@ def test_the_guided_preset_names_the_default_purchase():
     assert config.surrogate == "llm"
     assert config.initialization == "llm"
     assert config.operators == "off" and config.generation == "off"
+
+
+def test_an_explicit_llm_request_with_no_credential_is_refused_by_name(monkeypatch):
+    """2026-08-20: found by the release CI's stranger job. proposer='llm' with
+    no credential ran the classical path to completion and said nothing -- a
+    run launched to measure a model measured the control, and the only trace
+    was calls: 0. An explicit request that cannot be honoured refuses loudly
+    and names both ways out."""
+
+    import agent_evolve.integrations.completion as seam
+
+    monkeypatch.setattr(seam, "completion_for",
+                        lambda *args, **kwargs: None)
+    with pytest.raises(RuntimeError, match="proposer='random'"):
+        optimize(_Problem(), budget=16, seed=6, proposer="llm")
