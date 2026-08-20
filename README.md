@@ -358,9 +358,11 @@ replies with a revised weighted prior for the breeding path. It exists because
 guidance is otherwise authored before the first evaluation and never refreshed
 against anything. It is bounded rather than trusted — an admitted reply is
 *damped* into the installed weights rather than replacing them, so no revision
-can introduce an exclusion; a reply that would zero a value some measured
-front member holds is refused whole; and a revision whose following window does
-not improve the front is reverted before the next one is considered.
+can introduce an exclusion; a reply that *explicitly* zeroes a value some
+measured front member holds is refused whole (a value it merely omits is
+damped, not excluded, which is what the mixture is for); and a revision whose
+following window does not improve the front is reverted before the next one is
+considered.
 **It is UNDER MEASUREMENT, and nothing here is a result.** It is off in every
 default and stays out of `authorship="auto"` until its first measured row lands,
 because every default in this package comes from one.

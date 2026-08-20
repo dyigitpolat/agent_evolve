@@ -13,10 +13,12 @@ gaining a fraction of what its early half gained).
 This module is the other clock. At a DECLARED cadence in charged evaluations,
 one model call reads the domain card, the run's own measured-evidence
 rendering (:mod:`agent_evolve.policies.measurement_evidence`) and the weights
-currently installed, and replies with a revised graded prior -- optionally
-with a few complete configurations worth measuring next. The reply is admitted
-or refused WHOLE and then step-damped into the installed weights, so a
-revision is a tilt and never a replacement.
+currently installed, and replies with a revised graded prior -- and, where the
+run bought that channel, with the complete configurations it was REQUIRED to
+propose beside it. The prior half is admitted or refused WHOLE and then
+step-damped into the installed weights, so a revision is a tilt and never a
+replacement; the proposals beside it are validated one at a time, and a short
+list is counted rather than fatal.
 
 The evidence is a BUNDLE of two renderings, and the second one is why this
 channel was rebuilt. ``render_measurement_evidence`` supplies the front, the
@@ -44,6 +46,21 @@ cap: a convex combination of two vectors whose max/min ratio is at most ``r``
 has ratio at most ``r`` (the mediant inequality), so admitting proposals under
 ``max_weight_ratio`` bounds every installed prior at that ratio forever.
 
+The admission gate is narrow because of that, and deliberately so. A value the
+reply leaves OUT of a parameter it names is not a zero -- the mixture leaves it
+``(1 - a)`` of the share it held -- so ``excludes_front`` fires only on an
+EXPLICIT zero weight for a value some rank-0 configuration holds. Reading
+silence as exclusion made the SEMANTICS the binding constraint on this channel
+rather than the model: 10 of 11 live refusals were ``excludes_front`` on
+subset replies; on the losing taped pair the late revisions were refused
+exactly where the oracle's hindsight alignment peaked (delta loglik 2.55 at
+k = 2); and the oracle's OWN replies -- authored with the winning run's front
+in hand -- were refused at the late checkpoints of BOTH studies (s101 at
+k = 3; s105 at k = 2 and k = 3). A rule that refuses hindsight is measuring
+itself. The rule is stated as the condition it rests on rather than assumed:
+at ``a = 1`` there is no mixture, an omission really does become a zero, and
+the gate reads silence the old way because nothing else is left to.
+
 *A revision is a bet, and a bet is checked.* Each event records the weights it
 replaced and where the trace stood. At the next checkpoint, if nothing
 measured since is rank-0 in the pooled rows, the weights revert to the
@@ -57,10 +74,10 @@ without editing the product. Every event journals the digest of the rendered
 evidence, so no run can imply it reasoned over its own measurements when it
 did not. ``gate_reads_view`` names which of those two row sets the front check
 reads, and its default is the product's safety stance: the gate that protects
-a LIVE run reads REALITY, so no revision can zero a value that some
-configuration this run actually measured onto the front, whatever the prompt
-happened to show. A CONTROL arm sets it ``True``, because a control whose
-prompt reads donor rows while its gate reads this run's front accrues
+a LIVE run reads REALITY, so no revision can write a zero onto a value that
+some configuration this run actually measured onto the front, whatever the
+prompt happened to show. A CONTROL arm sets it ``True``, because a control
+whose prompt reads donor rows while its gate reads this run's front accrues
 ``excludes_front`` refusals the arm it controls never meets, and its refusal
 rate stops being comparable (W1 pilot, seed 20370103: two of four revisions
 refused on the shuffled arm alone, on evidence that named no front value).
@@ -94,7 +111,8 @@ from agent_evolve.policies.measurement_evidence import (
 from agent_evolve.policies.weighted_prior import WeightedRestriction
 
 __all__ = ["ReguidanceTelemetry", "ReguidanceOutcome", "Reguidance", "PROMPT",
-           "IMMIGRANTS_CLAUSE", "ELITE_TABLE_TITLE", "EVIDENCE_VERSION"]
+           "IMMIGRANTS_CLAUSE", "ELITE_TABLE_TITLE", "EVIDENCE_VERSION",
+           "MECHANISM_VERSION", "TILT_CAP"]
 
 Config = Dict[str, Any]
 #: field -> (values, weights), the installed overlay's one representation.
@@ -112,6 +130,18 @@ class ReguidanceTelemetry:
     immigrants_proposed: int = 0
     immigrants_accepted: int = 0
     immigrants_rejected: int = 0
+    #: Members the reply OWED and did not write, summed over the events of a
+    #: run that bought the channel: the required-k clause's compliance meter.
+    #: A shortfall costs the reply nothing else -- the prior half of the same
+    #: reply is judged on its own -- so this is the only place the ask's
+    #: answer rate is visible.
+    immigrants_shortfall: int = 0
+    #: Parameters named in ``"weights"``, summed over every reply that came
+    #: back, admitted or refused. Divided by the events that carry a breadth
+    #: it is the mean tilt; the per-event ``tilt_breadth`` carries the median
+    #: a campaign actually reads. Counted, never capped: the focused-tilt ask
+    #: is an ask, and a second refusal mode would be a throttle.
+    breadth_total: int = 0
     errors: int = 0
     #: One record per event: the cadence position it fired at, the digest of
     #: the evidence the model was shown, the verdict, and what changed.
@@ -126,6 +156,8 @@ class ReguidanceTelemetry:
             "immigrants_proposed": self.immigrants_proposed,
             "immigrants_accepted": self.immigrants_accepted,
             "immigrants_rejected": self.immigrants_rejected,
+            "immigrants_shortfall": self.immigrants_shortfall,
+            "breadth_total": self.breadth_total,
             "errors": self.errors,
             "events": len(self.events),
         }
@@ -171,7 +203,9 @@ charged evaluations:
 {evidence}
 
 Read the measurements, not the parameter names. Decide which parameters the
-trace says are worth concentrating the remaining budget on, and where.
+trace says are worth concentrating the remaining budget on, and where. Name
+AT MOST {tilt_cap} parameters in "weights" -- the table's strongest cases -- and
+leave the rest unlisted.
 
 Reply with ONLY a JSON object of this shape, no prose and no code fence:
 
@@ -186,10 +220,12 @@ Rules, and the harness checks every one of them:
 - Within one parameter the heaviest value may outweigh the lightest POSITIVE
   one by at most {max_ratio}x; more concentration than that and the whole
   reply is REFUSED. Concentration is the point; a de-facto exclusion is not.
-- For a parameter you name, a value you do NOT list gets weight zero. Never
-  give weight zero -- by listing it as zero or by leaving it out -- to a value
-  held by any configuration on the front above. That is the one revision that
-  could throw away what the run has already measured to be good.
+- For a parameter you name, a value you do NOT list keeps the mass it already
+  holds, reduced by the mixture below: silence damps a value, it never
+  excludes one. List the values the evidence speaks to and stay silent about
+  the rest. What IS refused is an EXPLICIT zero weight on a value held by any
+  configuration on the front above -- writing that zero is the one revision
+  that could throw away what the run has already measured to be good.
 - "free" lists parameters whose weights should move back toward uniform,
   because the measurements no longer justify biasing them.
 - Your reply is not installed as written: it is MIXED with the weights above
@@ -197,15 +233,37 @@ Rules, and the harness checks every one of them:
   tilt rather than a replacement. Say what the evidence says; the mixture
   supplies the caution."""
 
+#: The joint-proposal channel, and the reason it is REQUIRED rather than
+#: offered. Both oracle studies name the same standing gap in the model's own
+#: words -- per-parameter weights cannot express the interaction structure the
+#: front is built out of -- at EVERY checkpoint of both, and three times they
+#: name these proposals as its only carrier. Offered, the clause went
+#: unanswered: zero proposals across roughly thirty analog calls, by the live
+#: model and by the hindsight oracle alike (every admitted checkpoint of both
+#: studies reports an immigrant count of 0), while the same clause on the
+#: six-field NAS venue was sometimes answered. Optionality, not capability,
+#: was suppressing it -- so the clause states a count, and the harness meters
+#: the answer instead of refusing over it.
 IMMIGRANTS_CLAUSE = """
-You may also include an "immigrants" key holding up to {m} COMPLETE
+Your reply MUST also carry an "immigrants" key holding EXACTLY {m} COMPLETE
 configurations worth measuring next -- recombinations or refinements of what
 the occupancy table says the front rewards, never repeats of configurations
-the run has already measured. Every parameter present, every value from that
-parameter's declared domain:
+the run has already measured. A per-parameter table cannot say which values
+belong TOGETHER; these {m} are where you say it. Every parameter present,
+every value from that parameter's declared domain:
 
 {{"immigrants": [{{"<parameter>": <value>, ...}}]}}
 """
+
+#: How many parameters one reply is ASKED to name in ``"weights"``. Not a
+#: refusal threshold and deliberately not one: the harness counts breadth
+#: (``tilt_breadth``) and never throttles it, because a second refusal mode is
+#: what v3 exists to remove. The number is the oracle's own: over the five
+#: usable hindsight checkpoints of the two studies it tilted 2 to 8 focused
+#: parameters, where the live replies tilted or freed all 24 fields of the
+#: analog venue at once -- a breadth that says nothing a uniform table does
+#: not.
+TILT_CAP = 4
 
 #: The heading the elite-occupancy half of the evidence bundle carries. It is
 #: a constant because the immigrants clause and the analysis tooling both name
@@ -217,6 +275,16 @@ ELITE_TABLE_TITLE = "WHAT THE FRONT IS BUILT OUT OF"
 #: unversioned bundle before it was the trace alone. A study that pools events
 #: across the change would otherwise be pooling two different prompts.
 EVIDENCE_VERSION = "v2"
+
+#: Which MECHANISM authored an event, journalled beside the evidence version
+#: so a cell self-identifies without its campaign's paperwork. ``"v3"`` is
+#: silence-keeps-mass admission, required-k joint proposals and the
+#: focused-tilt ask; ``"v2"`` before it refused a subset reply whole, offered
+#: the proposals and asked for no focus. The two markers move INDEPENDENTLY:
+#: v3 changed what the harness asks for and what it admits, not what it shows,
+#: so the evidence version stays where it was and a study may pool bundles
+#: across the mechanism change while refusing to pool the mechanisms.
+MECHANISM_VERSION = "v3"
 
 
 class Reguidance:
@@ -457,6 +525,7 @@ class Reguidance:
                                          int(note["at_charges"]))
         note["rows_shown"] = len(view_rows)
         note["evidence"] = EVIDENCE_VERSION
+        note["mechanism"] = MECHANISM_VERSION
         note["evidence_sha256"] = evidence_digest(evidence)
         # The rendering itself, not a recipe for reconstructing it. The oracle
         # instrument proved a late-checkpoint prompt UNRECONSTRUCTIBLE from the
@@ -484,6 +553,14 @@ class Reguidance:
         if self.gate_reads_view:
             gate_rows = [(dict(row[0]), dict(row[1])) for row in view_rows]
             note["gate_reads_view"] = True
+        # Breadth is METERED, not gated: it is read off every reply that came
+        # back, whatever the verdict, so a campaign's median tilt is taken
+        # over the replies the model wrote rather than over the subset the
+        # admission rule happened to keep.
+        breadth = _weights_breadth(reply)
+        note["tilt_breadth"] = breadth
+        self.telemetry.breadth_total += breadth
+
         parsed, refusal = self._parse(reply, gate_rows, specs)
         if parsed is None:
             self.telemetry.revisions_refused += 1
@@ -573,6 +650,7 @@ class Reguidance:
             charges=int(note["at_charges"]),
             evidence=evidence,
             immigrants=clause,
+            tilt_cap=TILT_CAP,
             max_ratio=f"{self.max_weight_ratio:g}",
             damping=self.damping,
         )
@@ -622,21 +700,17 @@ class Reguidance:
         The reasons are the ones
         :func:`~agent_evolve.policies.measurement_evidence.admit_weighted_restriction`
         refuses on, plus the two the GRADED form adds: an all-zero field (a
-        restriction that samples nothing) and ``excludes_front`` -- zero mass,
-        listed or omitted, on a value some rank-0 configuration holds. Nothing
-        is repaired anywhere in here: a repaired prior is the harness's prior
+        restriction that samples nothing) and ``excludes_front`` -- an EXPLICIT
+        zero weight on a value some rank-0 configuration holds, which is the
+        only way a reply can take mass off the measured front. A value the
+        reply simply omits is damped, not excluded, and is admitted; the module
+        docstring records what reading that omission as a zero cost. Nothing is
+        repaired anywhere in here: a repaired prior is the harness's prior
         wearing the model's name.
         """
 
-        text = reply if isinstance(reply, str) else ""
-        match = re.search(r"\{.*\}", text, re.S)
-        if match is None:
-            return None, "unparsed"
-        try:
-            raw = json.loads(match.group(0))
-        except (ValueError, TypeError):
-            return None, "unparsed"
-        if not isinstance(raw, dict):
+        raw = _json_object(reply)
+        if raw is None:
             return None, "unparsed"
         entries = raw.get("weights")
         if entries is None:
@@ -690,11 +764,17 @@ class Reguidance:
             if ratio > self.max_weight_ratio:
                 return None, (f"over_concentrated ({ratio:.3g}x > "
                               f"{self.max_weight_ratio:g}x) for {name!r}")
-            # Zero is zero however it is spelled: a value the reply omits from
-            # a parameter it names carries no mass either.
+            # Only a zero the reply WROTE. Silence about a value is not a
+            # zero -- damping leaves an unlisted value ``(1 - a)`` of the mass
+            # it holds -- so a subset reply excludes nothing and is admitted.
+            # At ``a == 1`` there is no mixture and an omission really does
+            # become a zero, so the gate carries the whole guarantee again and
+            # reads silence the way the installed weights will.
             held = {_token(v): w for v, w in clean}
+            unlisted = 0.0 if self.damping >= 1.0 else None
             for value in front_values.get(name, ()):
-                if held.get(_token(value), 0.0) <= 0.0:
+                mass = held.get(_token(value), unlisted)
+                if mass is not None and mass <= 0.0:
                     return None, f"excludes_front for {name!r}"
             weights[name] = clean
 
@@ -708,6 +788,10 @@ class Reguidance:
         if not weights and not free:
             return None, "empty"
 
+        # The required-k clause is NOT enforced here, and that is the design:
+        # the two halves of a reply are judged separately, so a model that
+        # under-answers the joint-proposal ask does not also lose the prior it
+        # got right. ``_immigrants`` counts the shortfall.
         immigrants = raw.get("immigrants")
         if not isinstance(immigrants, list):
             immigrants = []
@@ -754,7 +838,10 @@ class Reguidance:
            the two share, which is where the cap has meaning.)
 
         A field the reply neither weights nor frees is left exactly as it is:
-        silence about a parameter is not evidence about it.
+        silence about a parameter is not evidence about it. A VALUE the reply
+        omits from a field it does weight is the same shape one level down --
+        it keeps ``(1 - a)`` of its share rather than being zeroed -- which is
+        why the admission gate can afford to refuse written zeros only.
 
         The mixture is directional in one place only: a value the BASE
         excludes -- a hard restriction seeded in at the first event -- regains
@@ -803,21 +890,27 @@ class Reguidance:
         rows: Sequence[Tuple[Config, Mapping[str, float]]],
         note: Dict[str, Any],
     ) -> Tuple[Config, ...]:
-        """Complete configurations, validated value-by-value like ``llm_init``.
+        """The REQUIRED k, validated value-by-value like ``llm_init``.
 
-        Same rule, same counters, one addition: a member the run has already
-        measured is dropped. It would cost nothing (the cache holds it) and
+        Same rule, same counters, two additions. A member the run has already
+        measured is dropped: it would cost nothing (the cache holds it) and
         buy nothing, and counting it as accepted would report guidance that
-        moved no draw.
+        moved no draw. And a reply that writes FEWER than k is not refused --
+        the prior half of the same reply was judged on its own and is
+        installed on its own, so an under-answered ask cannot cost the run the
+        channel that did answer. The shortfall is COUNTED instead, on the
+        event (proposed against required) and in the run's telemetry, which is
+        where a campaign reads how often the required-k ask was met at all.
         """
 
-        if self.immigrants <= 0 or not raw:
+        if self.immigrants <= 0:
             return ()
+        provided = list(raw or ())
         measured = {_key(config) for config, _objectives in rows}
         accepted: List[Config] = []
         rejected: List[Dict[str, str]] = []
         loci = loci_of(self.template)
-        for member in raw:
+        for member in provided:
             self.telemetry.immigrants_proposed += 1
             reason = _immigrant_reason(member, self.template, loci,
                                        self.candidate_model)
@@ -831,8 +924,13 @@ class Reguidance:
                 continue
             self.telemetry.immigrants_accepted += 1
             accepted.append(dict(member))
+        shortfall = max(0, self.immigrants - len(provided))
+        self.telemetry.immigrants_shortfall += shortfall
         note["immigrants"] = {"accepted": len(accepted),
-                              "rejected": rejected}
+                              "rejected": rejected,
+                              "proposed": len(provided),
+                              "required": self.immigrants,
+                              "shortfall": shortfall}
         return tuple(accepted)
 
 
@@ -846,6 +944,38 @@ def _token(value: Any) -> str:
     """One declared value's identity, rendered as measurement_evidence does."""
 
     return value if isinstance(value, str) else json.dumps(value, default=str)
+
+
+def _json_object(reply: Any) -> Optional[Dict[str, Any]]:
+    """The one JSON object a reply carries, or ``None``.
+
+    The single reader of a raw reply, so the admission gate and the breadth
+    meter cannot disagree about what the model actually wrote.
+    """
+
+    text = reply if isinstance(reply, str) else ""
+    match = re.search(r"\{.*\}", text, re.S)
+    if match is None:
+        return None
+    try:
+        raw = json.loads(match.group(0))
+    except (ValueError, TypeError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _weights_breadth(reply: Any) -> int:
+    """How many parameters a reply names in ``"weights"``. 0 when unreadable.
+
+    A measurement, not a check: nothing in this module refuses over it. It
+    exists because the live pilot's replies tilted or freed every field of a
+    24-field venue at once, which a per-event count makes visible and an
+    admitted/refused verdict does not.
+    """
+
+    raw = _json_object(reply)
+    entries = raw.get("weights") if raw is not None else None
+    return len(entries) if isinstance(entries, dict) else 0
 
 
 def _front_indices(

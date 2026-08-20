@@ -28,7 +28,8 @@ from agent_evolve.core.problem import ObjectiveSpec, ValidationOutcome
 from agent_evolve.policies.measurement_evidence import (
     evidence_digest, render_elite_table, render_measurement_evidence)
 from agent_evolve.policies.reguidance import (
-    ELITE_TABLE_TITLE, EVIDENCE_VERSION, Reguidance, ReguidanceTelemetry)
+    ELITE_TABLE_TITLE, EVIDENCE_VERSION, MECHANISM_VERSION, TILT_CAP,
+    Reguidance, ReguidanceTelemetry)
 from agent_evolve.policies.weighted_prior import WeightedRestriction
 from agent_evolve.session.authorship import (AuthorshipConfig, build_authorship)
 from agent_evolve.session.genetic_loop import GeneticConfig, run_genetic_loop
@@ -260,9 +261,60 @@ def test_zeroing_a_value_a_front_member_holds_refuses_the_whole_reply():
     assert policy.telemetry.revisions_refused == 1
 
 
-def test_omitting_a_front_value_is_the_same_zero_and_refuses_the_reply():
-    policy = _policy(_reply({"mode": (["b", "c"], [1, 1])}))
+def test_omitting_a_front_value_is_admitted_and_damps():
+    """Silence keeps mass at the gate, and what reading it as a zero cost.
+
+    ROWS[0] is rank-0 and holds ``mode="a"``; this reply names ``mode`` and
+    lists only "b" and "c". Read as a zero it was refused WHOLE, and that
+    reading -- not the model -- was the binding constraint on the channel:
+    10 of 11 live refusals were ``excludes_front`` on subset replies; on the
+    losing taped pair the late revisions were refused exactly where the
+    oracle's hindsight alignment peaked (delta loglik 2.55 at k = 2); and the
+    oracle's OWN replies, authored with the winning run's front in hand, were
+    refused at the late checkpoints of both studies (s101 at k = 3, s105 at
+    k = 2 and k = 3). Damping already makes the exclusion impossible, so the
+    reply is admitted and the omitted front value is DAMPED, not dropped.
+    (2026-08-21, oracle studies s101_lost and s105_selfwin.)
+    """
+
+    policy = _policy(_reply({"mode": (["b", "c"], [1, 1])}), damping=0.5)
+    note = _revise(policy).note
+    assert note.get("admitted") is True, f"a subset reply was refused: {note}"
+    values, weights = policy.installed["mode"]
+    assert values == ("a", "b", "c")
+    # base uniform (1/3, 1/3, 1/3); proposal normalized (0, 1/2, 1/2); mixed
+    # at 0.5 = (1/6, 5/12, 5/12) -- the omitted front value keeps HALF.
+    assert weights == pytest.approx((1 / 6, 5 / 12, 5 / 12), abs=1e-12)
+    assert weights[0] == pytest.approx(0.5 * (1 / 3), abs=1e-12), (
+        "the omitted front value lost more mass than the mixture takes, so "
+        "silence is still being read as an exclusion somewhere"
+    )
+    assert policy.telemetry.revisions_refused == 0
+
+
+def test_an_explicit_zero_on_a_front_value_still_refuses_the_whole_reply():
+    """The half v3 did not relax: a zero the reply WROTE is still a zero."""
+
+    policy = _policy(_reply({"mode": (["a", "b", "c"], [0.0, 1, 1])}))
+    outcome = _revise(policy)
+    assert outcome.note["refused"].startswith("excludes_front")
+    assert policy.installed == {} and outcome.restriction is None
+    assert policy.telemetry.revisions_refused == 1
+
+
+def test_at_damping_one_there_is_no_mixture_and_silence_is_a_zero_again():
+    """The premise the relaxed gate rests on, written as its condition.
+
+    "Silence keeps mass" is a fact about the MIXTURE: an unlisted value keeps
+    ``(1 - a)`` of the share it held. At ``a = 1`` the reply is installed as
+    written, an omission really does zero a front value, and the gate is the
+    only guarantee left -- so it refuses, exactly as it did before. Every
+    measured cell runs at 0.5; this is the boundary, not the campaign.
+    """
+
+    policy = _policy(_reply({"mode": (["b", "c"], [1, 1])}), damping=1.0)
     assert _revise(policy).note["refused"].startswith("excludes_front")
+    assert policy.installed == {}
 
 
 def test_an_undeclared_field_and_an_undeclared_value_are_each_refused_whole():
@@ -398,6 +450,56 @@ def test_immigrants_are_not_read_when_none_were_bought():
     outcome = _revise(policy)
     assert outcome.immigrants == ()
     assert policy.telemetry.immigrants_proposed == 0
+    assert "immigrants" not in outcome.note, (
+        "a run that bought no proposals recorded a requirement anyway"
+    )
+    assert policy.telemetry.immigrants_shortfall == 0
+
+
+def test_a_short_immigrants_list_admits_the_weights_and_counts_the_shortfall():
+    """Required-k is a compliance METER, not a second refusal mode.
+
+    The two halves of a reply are judged separately: an under-answered joint
+    proposal cannot cost the run the prior half that was admissible on its
+    own. What the shortfall buys is the number a campaign needs -- how often
+    the required-k ask was answered at all -- which the optional clause it
+    replaced could never report, having been answered zero times.
+    (2026-08-21, oracle studies s101_lost and s105_selfwin.)
+    """
+
+    good = {"genome": [1] * GENOME, "mode": "c"}
+    also = {"genome": [1] * (GENOME - 1) + [0], "mode": "b"}
+    policy = _policy(_reply({"mode": (["a", "b", "c"], [2, 1, 1])},
+                            immigrants=[good, also]),
+                     immigrants=3)
+    outcome = _revise(policy)
+
+    assert outcome.note["admitted"] is True, "the weights half was refused too"
+    assert outcome.immigrants == (good, also), (
+        "the members that WERE written were not accepted"
+    )
+    assert outcome.note["immigrants"] == {
+        "accepted": 2, "rejected": [], "proposed": 2, "required": 3,
+        "shortfall": 1}
+    assert policy.telemetry.immigrants_shortfall == 1
+    assert (policy.telemetry.immigrants_proposed,
+            policy.telemetry.immigrants_accepted,
+            policy.telemetry.immigrants_rejected) == (2, 2, 0)
+
+
+def test_a_missing_immigrants_array_counts_the_whole_requirement_as_short():
+    policy = _policy(_reply({"mode": (["a", "b", "c"], [2, 1, 1])}),
+                     immigrants=3)
+    outcome = _revise(policy)
+
+    assert outcome.note["admitted"] is True and outcome.immigrants == ()
+    assert outcome.note["immigrants"] == {
+        "accepted": 0, "rejected": [], "proposed": 0, "required": 3,
+        "shortfall": 3}
+    assert policy.telemetry.immigrants_shortfall == 3
+    assert policy.telemetry.immigrants_proposed == 0, (
+        "an array that was never written counted as members proposed"
+    )
 
 
 # --- u9: the control seam ---------------------------------------------------
@@ -581,7 +683,11 @@ def test_the_immigrants_clause_grounds_proposals_in_the_occupancy_table():
                      immigrants=3)
     _revise(bought, rows=FRONT_ROWS)
     prompt = bought.prompts[0]
-    assert "up to 3 COMPLETE" in prompt
+    assert 'Your reply MUST also carry an "immigrants" key holding EXACTLY 3 ' \
+           'COMPLETE' in prompt, (
+        "the clause still offers the channel it was measured to have to "
+        "require: an optional immigrants key went unanswered in ~30 calls"
+    )
     assert grounding in prompt
     assert '{"immigrants": [{"<parameter>": <value>, ...}]}' in prompt, (
         "the reworded clause changed the schema it asks for"
@@ -592,6 +698,77 @@ def test_the_immigrants_clause_grounds_proposals_in_the_occupancy_table():
     assert "immigrants" not in none.prompts[0], (
         "a run that bought no immigrants was asked for them anyway"
     )
+
+
+# --- u9d: the focused tilt, asked for and metered ---------------------------
+#
+# The ask is an ask. The live pilot's replies tilted or freed all 24 fields of
+# the analog venue at once where the oracle tilted 2 to 8, so the prompt names
+# a ceiling and the harness COUNTS what came back -- on every reply, whatever
+# the verdict. A second refusal mode is exactly what v3 exists to remove.
+
+def test_the_prompt_asks_for_a_focused_tilt():
+    policy = _policy(_reply({"mode": (["a", "b", "c"], [2, 1, 1])}))
+    _revise(policy, rows=FRONT_ROWS)
+    asked = " ".join(policy.prompts[0].split())
+    assert (f'Name AT MOST {TILT_CAP} parameters in "weights" -- the table\'s '
+            "strongest cases -- and leave the rest unlisted.") in asked
+    assert TILT_CAP == 4
+
+
+def test_tilt_breadth_is_recorded_on_admitted_and_refused_replies_alike():
+    both = {"mode": (["a", "b", "c"], [2, 1, 1]), "genome": ([0, 1], [1, 2])}
+    admitted = _policy(_reply(both))
+    note = _revise(admitted).note
+    assert note["admitted"] is True and note["tilt_breadth"] == 2
+    assert admitted.telemetry.breadth_total == 2
+
+    over = dict(both, mode=(["a", "b", "c"], [9, 1, 1]))   # refused on ratio
+    refused = _policy(_reply(over))
+    note = _revise(refused).note
+    assert note["refused"].startswith("over_concentrated")
+    assert note["tilt_breadth"] == 2, (
+        "a refused reply's breadth went uncounted, so a campaign's median "
+        "would be taken over the admitted replies alone"
+    )
+    assert refused.telemetry.breadth_total == 2
+
+    unreadable = _policy("no json here")
+    assert _revise(unreadable).note["tilt_breadth"] == 0
+    assert unreadable.telemetry.breadth_total == 0
+
+
+# --- u9e: the bundle marker -------------------------------------------------
+
+def test_every_event_says_which_mechanism_wrote_it_and_which_evidence_it_read():
+    """Two markers, moving independently, so a cell self-identifies.
+
+    v3 changed what the harness ASKS FOR and what it ADMITS, not what it
+    shows, so the evidence version stays where it was: a study may pool
+    bundles across the mechanism change while refusing to pool mechanisms.
+    """
+
+    admitted = _policy(_reply({"mode": (["a", "b", "c"], [2, 1, 1])}))
+    refused = _policy("no json here")
+
+    def _boom(_prompt: str) -> str:
+        raise RuntimeError("the provider hung up")
+
+    errored = Reguidance(_boom, objectives=OBJECTIVES,
+                         candidate_model=_Candidate, template=dict(TEMPLATE),
+                         every=1, min_rows=1)
+    for policy in (admitted, refused, errored):
+        note = policy.maybe_revise(
+            rows=FRONT_ROWS, population=(), specs=OBJECTIVES, restriction=None,
+            charges=len(FRONT_ROWS), gen=1).note
+        assert note["mechanism"] == MECHANISM_VERSION == "v3", (
+            f"an event does not name its mechanism: {note}"
+        )
+        assert note["evidence"] == EVIDENCE_VERSION == "v2", (
+            "the mechanism version dragged the evidence version with it, so "
+            "a study pooling prompts would be pooling two bundles"
+        )
+        assert policy.telemetry.events[-1]["mechanism"] == "v3"
 
 
 # --- u10: a policy failure never kills a run --------------------------------
