@@ -205,6 +205,14 @@ class AuthorshipConfig:
     #: -- is the shuffled-evidence control, buildable without editing the
     #: product.
     adapt_evidence_view: Any = None
+    #: Which rows the revision channel's zero-on-front admission check reads.
+    #: ``False`` -- the default and the product's stance -- reads the rows the
+    #: run really measured, so the gate that protects a live run reads reality
+    #: whatever ``adapt_evidence_view`` showed the model. ``True`` reads the
+    #: VIEWED rows, which only a CONTROL arm wants: a control prompted with
+    #: donor rows and gated on this run's front accrues refusals the arm it
+    #: controls never meets, and its refusal rate stops being comparable.
+    adapt_gate_reads_view: bool = False
     limits: RuntimeLimits = field(default_factory=RuntimeLimits)
 
     def __post_init__(self) -> None:
@@ -253,6 +261,7 @@ class AuthorshipConfig:
                 ("adapt_immigrants", self.adapt_immigrants, 0),
                 ("adapt_damping", self.adapt_damping, 0.5),
                 ("adapt_evidence_view", self.adapt_evidence_view, None),
+                ("adapt_gate_reads_view", self.adapt_gate_reads_view, False),
             ) if value != default]
             if asked:
                 raise ValueError(
@@ -436,6 +445,15 @@ def _build_reguidance(
         + (f", with up to {config.adapt_immigrants} immigrant "
            "configuration(s) per revision." if config.adapt_immigrants
            else "."))
+    if config.adapt_gate_reads_view:
+        # Never silent: a run whose gate reads a view instead of its own
+        # measurements is a CONTROL, and a control that does not say so is
+        # indistinguishable from the product.
+        say("authorship.adapt_gate_reads_view=True: the zero-on-front check "
+            "reads the rows this run SHOWED the model, not the rows it "
+            "measured. That is a control arm's setting -- it makes the "
+            "control's refusal rate comparable to the arm it controls -- and "
+            "it is not the protection a live run wants.")
     return Reguidance(
         complete,
         objectives=list(objectives),
@@ -448,6 +466,7 @@ def _build_reguidance(
         damping=config.adapt_damping,
         max_weight_ratio=8.0,
         evidence_view=config.adapt_evidence_view,
+        gate_reads_view=config.adapt_gate_reads_view,
         telemetry=telemetry,
     ), None
 

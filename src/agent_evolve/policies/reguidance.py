@@ -18,6 +18,21 @@ with a few complete configurations worth measuring next. The reply is admitted
 or refused WHOLE and then step-damped into the installed weights, so a
 revision is a tilt and never a replacement.
 
+The evidence is a BUNDLE of two renderings, and the second one is why this
+channel was rebuilt. ``render_measurement_evidence`` supplies the front, the
+progress line and the per-locus rank correlations; ``render_elite_table``
+supplies value occupancy among the non-dominated configurations. At the 40-90
+rows a revision actually holds, over a two-dozen-field space, those
+correlations are noise -- the W1 pilot moved less between arms than the same
+arm moved between two draws -- while the sealed prior that did separate was
+authored in the occupancy format. Both halves read the same viewed rows, one
+digest covers the whole bundle, and every event journals ``evidence_text``:
+the bundle verbatim. A digest can falsify a reconstruction but cannot produce
+one, and the oracle instrument measured that a late checkpoint's prompt is not
+reconstructible from the cells beside it -- the row list a checkpoint reads
+carries cache-served repeats that the charge log, which counts charged
+evaluations, cannot recover.
+
 Three constraints shape everything here, and each is structural rather than
 procedural:
 
@@ -40,7 +55,16 @@ run measured and returns the rows the model is shown, so the shuffled-evidence
 arm -- same count, same shape, same cost, another run's rows -- is buildable
 without editing the product. Every event journals the digest of the rendered
 evidence, so no run can imply it reasoned over its own measurements when it
-did not.
+did not. ``gate_reads_view`` names which of those two row sets the front check
+reads, and its default is the product's safety stance: the gate that protects
+a LIVE run reads REALITY, so no revision can zero a value that some
+configuration this run actually measured onto the front, whatever the prompt
+happened to show. A CONTROL arm sets it ``True``, because a control whose
+prompt reads donor rows while its gate reads this run's front accrues
+``excludes_front`` refusals the arm it controls never meets, and its refusal
+rate stops being comparable (W1 pilot, seed 20370103: two of four revisions
+refused on the shuffled arm alone, on evidence that named no front value).
+A control is the only sane user of ``True``.
 
 This is the GRADED, mid-run form of the typed locus restriction, which is the
 one measurement-conditioned channel that separated from the unguided null with
@@ -64,12 +88,13 @@ from agent_evolve.policies.measurement_evidence import (
     MIN_EVIDENCE_ROWS,
     MeasuredRow,
     evidence_digest,
+    render_elite_table,
     render_measurement_evidence,
 )
 from agent_evolve.policies.weighted_prior import WeightedRestriction
 
 __all__ = ["ReguidanceTelemetry", "ReguidanceOutcome", "Reguidance", "PROMPT",
-           "IMMIGRANTS_CLAUSE"]
+           "IMMIGRANTS_CLAUSE", "ELITE_TABLE_TITLE", "EVIDENCE_VERSION"]
 
 Config = Dict[str, Any]
 #: field -> (values, weights), the installed overlay's one representation.
@@ -174,12 +199,24 @@ Rules, and the harness checks every one of them:
 
 IMMIGRANTS_CLAUSE = """
 You may also include an "immigrants" key holding up to {m} COMPLETE
-configurations worth measuring next -- every parameter present, every value
-from that parameter's declared domain, and none of them a configuration the
-run has already measured:
+configurations worth measuring next -- recombinations or refinements of what
+the occupancy table says the front rewards, never repeats of configurations
+the run has already measured. Every parameter present, every value from that
+parameter's declared domain:
 
 {{"immigrants": [{{"<parameter>": <value>, ...}}]}}
 """
+
+#: The heading the elite-occupancy half of the evidence bundle carries. It is
+#: a constant because the immigrants clause and the analysis tooling both name
+#: the section, and a heading two places quote is a heading worth declaring.
+ELITE_TABLE_TITLE = "WHAT THE FRONT IS BUILT OUT OF"
+
+#: Which evidence bundle an event was conditioned on, journalled on every
+#: event. ``"v2"`` is the measured trace PLUS the elite-occupancy table; the
+#: unversioned bundle before it was the trace alone. A study that pools events
+#: across the change would otherwise be pooling two different prompts.
+EVIDENCE_VERSION = "v2"
 
 
 class Reguidance:
@@ -207,6 +244,7 @@ class Reguidance:
         max_weight_ratio: float = 8.0,
         evidence_view: Optional[Callable[
             [Sequence[MeasuredRow]], Sequence[MeasuredRow]]] = None,
+        gate_reads_view: bool = False,
         telemetry: Optional[ReguidanceTelemetry] = None,
         min_rows: int = MIN_EVIDENCE_ROWS,
         front_shown: int = 8,
@@ -241,6 +279,12 @@ class Reguidance:
         self.damping = float(damping)
         self.max_weight_ratio = float(max_weight_ratio)
         self.evidence_view = evidence_view
+        #: Which rows the zero-on-front admission check reads. False -- the
+        #: default, and the only setting a shipped run should use -- reads the
+        #: rows this run really measured. True reads the VIEWED rows instead,
+        #: which is what makes a shuffled-evidence CONTROL's refusal rate
+        #: comparable to the arm it controls. See the module docstring.
+        self.gate_reads_view = bool(gate_reads_view)
         self.min_rows = int(min_rows)
         self.front_shown = int(front_shown)
         self.effects_shown = int(effects_shown)
@@ -409,12 +453,18 @@ class Reguidance:
         changed: bool,
     ) -> ReguidanceOutcome:
         view_rows = self._evidence_rows(rows, population)
-        evidence = render_measurement_evidence(
-            view_rows, list(specs), self._locus_domains,
-            front_shown=self.front_shown, effects_shown=self.effects_shown,
-            charged=int(note["at_charges"]))
+        evidence = self._evidence_bundle(view_rows, specs,
+                                         int(note["at_charges"]))
         note["rows_shown"] = len(view_rows)
+        note["evidence"] = EVIDENCE_VERSION
         note["evidence_sha256"] = evidence_digest(evidence)
+        # The rendering itself, not a recipe for reconstructing it. The oracle
+        # instrument proved a late-checkpoint prompt UNRECONSTRUCTIBLE from the
+        # cells it was journalled beside: the row list a checkpoint reads
+        # includes cache-served repeats, and the charge log -- which counts
+        # charged evaluations -- cannot recover them. A digest can only falsify
+        # a reconstruction; the text makes the study exact.
+        note["evidence_text"] = evidence
 
         prompt = self._prompt(evidence, note)
         self.telemetry.calls += 1
@@ -426,7 +476,15 @@ class Reguidance:
             self.telemetry.events.append(note)
             return self._outcome(note, changed)
 
-        parsed, refusal = self._parse(reply, rows, specs)
+        # WHICH front the admission check protects. Reality by default: a value
+        # this run measured onto its own front keeps its mass however the
+        # prompt was composed. A control arm hands the gate the same rows it
+        # prompted with, so the two arms refuse for the same reasons.
+        gate_rows = rows
+        if self.gate_reads_view:
+            gate_rows = [(dict(row[0]), dict(row[1])) for row in view_rows]
+            note["gate_reads_view"] = True
+        parsed, refusal = self._parse(reply, gate_rows, specs)
         if parsed is None:
             self.telemetry.revisions_refused += 1
             note["refused"] = refusal
@@ -474,6 +532,31 @@ class Reguidance:
             except Exception:               # a control that throws must not
                 measured = ()               # be able to kill a measurement
         return [tuple(row) for row in measured]      # type: ignore[misc]
+
+    def _evidence_bundle(
+        self,
+        view_rows: Sequence[MeasuredRow],
+        specs: Sequence[ObjectiveSpec],
+        charged: int,
+    ) -> str:
+        """The v2 bundle: the measured trace, then what the front is made of.
+
+        Both halves read the SAME rows -- the ones ``evidence_view`` returned
+        -- so the control parameter transforms the whole of what the model
+        sees rather than half of it, and one digest over the concatenation is
+        the identity of the whole prompt's evidence. Which is why the digest is
+        taken here, over the bundle, and not per section: a bundle whose halves
+        were separately digested could report "same evidence" while one half
+        had moved.
+        """
+
+        measured = render_measurement_evidence(
+            view_rows, list(specs), self._locus_domains,
+            front_shown=self.front_shown, effects_shown=self.effects_shown,
+            charged=int(charged))
+        elite = render_elite_table(
+            view_rows, list(specs), self._locus_domains)
+        return f"{measured}\n\n  {ELITE_TABLE_TITLE}:\n{elite}"
 
     def _prompt(self, evidence: str, note: Mapping[str, Any]) -> str:
         clause = ("" if self.immigrants <= 0

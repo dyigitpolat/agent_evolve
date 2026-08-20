@@ -25,7 +25,10 @@ from pydantic import BaseModel
 
 from agent_evolve import optimize
 from agent_evolve.core.problem import ObjectiveSpec, ValidationOutcome
-from agent_evolve.policies.reguidance import Reguidance, ReguidanceTelemetry
+from agent_evolve.policies.measurement_evidence import (
+    evidence_digest, render_elite_table, render_measurement_evidence)
+from agent_evolve.policies.reguidance import (
+    ELITE_TABLE_TITLE, EVIDENCE_VERSION, Reguidance, ReguidanceTelemetry)
 from agent_evolve.policies.weighted_prior import WeightedRestriction
 from agent_evolve.session.authorship import (AuthorshipConfig, build_authorship)
 from agent_evolve.session.genetic_loop import GeneticConfig, run_genetic_loop
@@ -415,6 +418,182 @@ def test_the_evidence_view_changes_the_digest_and_nothing_else():
     assert (identity.telemetry.as_dict() == donor.telemetry.as_dict())
 
 
+def test_the_gate_reads_the_run_by_default_and_the_view_only_when_told():
+    """The confound the W1 pilot's shuffled arm was built with, and its fix.
+
+    ROWS[0] is rank-0 in the RUN and holds ``mode="a"``; the donor view drops
+    it, so the VIEWED front holds only ``"b"`` and ``"c"``. One reply zeroing
+    ``"a"`` therefore reads as ``excludes_front`` against reality and as an
+    ordinary concentration against the view. The product refuses it -- the
+    gate that protects a live run reads what the run measured. The control
+    admits it, which is the whole point: refusals it accrues for evidence it
+    was never shown are not refusals the arm it controls could ever meet.
+    """
+
+    reply = _reply({"mode": (["a", "b", "c"], [0, 1, 1])})
+    view = lambda rows: list(rows)[1:]                    # noqa: E731
+
+    product = _policy(reply, evidence_view=view)
+    assert _revise(product).note["refused"].startswith("excludes_front")
+    assert product.installed == {}
+    assert product.gate_reads_view is False, "the default is not the safe one"
+
+    control = _policy(reply, evidence_view=view, gate_reads_view=True)
+    note = _revise(control).note
+    assert note.get("admitted") is True, (
+        f"the control's gate still read the run's own front: {note}")
+    assert note["gate_reads_view"] is True, (
+        "a run whose gate read a view did not journal that it had"
+    )
+    assert control.installed["mode"][0] == ("a", "b", "c")
+    assert control.installed["mode"][1][0] > 0.0, (
+        "damping below 1 must keep the zeroed value sampled even here"
+    )
+
+
+def test_the_gate_view_flag_changes_nothing_when_no_view_is_declared():
+    """True is a no-op on the product's own path: identity view, same front."""
+
+    reply = _reply({"mode": (["a", "b", "c"], [0, 1, 1])})
+    for policy in (_policy(reply), _policy(reply, gate_reads_view=True)):
+        assert _revise(policy).note["refused"].startswith("excludes_front")
+        assert policy.installed == {}
+
+
+# --- u9b: the v2 evidence bundle --------------------------------------------
+#
+# The bundle is two renderings and one digest. The measured trace answers
+# "which knob moves which cost" with rank correlations that need rows the
+# mid-run reader does not have; the occupancy table answers "what is the front
+# made of" with counts that survive tens of rows. Both read the SAME viewed
+# rows, so the control parameter transforms all of what the model sees.
+
+#: A trace whose front has two members, both holding ``mode="a"``, so the
+#: occupancy table has something to say and the front is not one row.
+FRONT_ROWS = _rows(
+    ([1] * GENOME, "a", 8, 3),                       # rank-0
+    ([0, 1] * (GENOME // 2), "a", 5, 1),             # rank-0
+    ([1, 1, 0, 0] * (GENOME // 4), "b", 4, 4),       # dominated
+    ([0] * GENOME, "c", 0, 5),                       # dominated
+)
+
+
+def _halves(note) -> tuple:
+    """The bundle split at its declared section title."""
+
+    head, sep, tail = note["evidence_text"].partition(
+        f"\n\n  {ELITE_TABLE_TITLE}:\n")
+    assert sep, f"the bundle carries no elite section:\n{note['evidence_text']}"
+    return head, tail
+
+
+def test_the_bundle_is_the_measured_trace_then_the_occupancy_table():
+    policy = _policy(_reply({"mode": (["a", "b", "c"], [2, 1, 1])}))
+    note = _revise(policy, rows=FRONT_ROWS).note
+    head, tail = _halves(note)
+
+    view = [(config, objectives, False) for config, objectives in FRONT_ROWS]
+    assert head == render_measurement_evidence(
+        view, list(OBJECTIVES), policy._locus_domains,
+        front_shown=policy.front_shown, effects_shown=policy.effects_shown,
+        charged=len(FRONT_ROWS))
+    assert tail == render_elite_table(view, list(OBJECTIVES),
+                                      policy._locus_domains)
+    assert "the current non-dominated front" in head
+    assert "counts of configurations, never scores" in tail
+    # Both halves reach the model, in that order, in one prompt.
+    prompt = policy.prompts[0]
+    assert prompt.count(note["evidence_text"]) == 1
+    assert prompt.index(head) < prompt.index(ELITE_TABLE_TITLE) < prompt.index(tail)
+
+
+def test_the_event_always_journals_the_bundle_verbatim_and_its_version():
+    admitted = _policy(_reply({"mode": (["a", "b", "c"], [2, 1, 1])}))
+    refused = _policy("no json here")
+
+    def _boom(_prompt: str) -> str:
+        raise RuntimeError("the provider hung up")
+
+    errored = Reguidance(_boom, objectives=OBJECTIVES,
+                         candidate_model=_Candidate, template=dict(TEMPLATE),
+                         every=1, min_rows=1)
+    for policy in (admitted, refused, errored):
+        note = policy.maybe_revise(
+            rows=FRONT_ROWS, population=(), specs=OBJECTIVES, restriction=None,
+            charges=len(FRONT_ROWS), gen=1).note
+        assert note["evidence"] == EVIDENCE_VERSION == "v2"
+        assert evidence_digest(note["evidence_text"]) == note["evidence_sha256"], (
+            "the journalled text is not the text that was digested, so an "
+            "oracle study reading it would be reading a different prompt"
+        )
+        assert note["evidence_text"] in policy.telemetry.events[-1]["evidence_text"]
+
+
+def test_the_digest_covers_the_whole_bundle_and_not_the_measured_half():
+    policy = _policy(_reply({"mode": (["a", "b", "c"], [2, 1, 1])}))
+    note = _revise(policy, rows=FRONT_ROWS).note
+    head, _tail = _halves(note)
+    assert evidence_digest(head) != note["evidence_sha256"], (
+        "the digest was taken over the measured half alone, so the occupancy "
+        "table could move without the journal noticing"
+    )
+
+
+def test_moving_which_rows_are_rank_zero_moves_the_occupancy_table_and_the_digest():
+    reply = _reply({"mode": (["a", "b", "c"], [2, 1, 1])})
+    wide = _revise(_policy(reply), rows=FRONT_ROWS).note
+    # One extra row dominates the whole trace: the front collapses to it, and
+    # its mode is "c" where the old front was "a" twice.
+    narrowed = FRONT_ROWS + _rows(([1] * GENOME, "c", 9, 0))
+    tight = _revise(_policy(reply), rows=narrowed).note
+
+    assert _halves(wide)[1] != _halves(tight)[1], (
+        "the front's membership changed and the occupancy table did not"
+    )
+    assert wide["evidence_sha256"] != tight["evidence_sha256"]
+
+
+def test_the_evidence_view_transforms_both_halves_of_the_bundle():
+    reply = _reply({"mode": (["a", "b", "c"], [2, 1, 1])})
+    identity = _policy(reply)
+    donor = _policy(reply, evidence_view=lambda rows: list(rows)[:2])
+
+    first = _revise(identity, rows=FRONT_ROWS).note
+    second = _revise(donor, rows=FRONT_ROWS).note
+    for a, b in zip(_halves(first), _halves(second)):
+        assert a != b, (
+            "a control arm swapped the rows the model reads and one half of "
+            "the bundle carried on rendering the run's own measurements"
+        )
+    assert second["rows_shown"] == 2
+    assert "all 2 measured configurations" in _halves(second)[1], (
+        "the occupancy table counted rows the control never showed"
+    )
+
+
+# --- u9c: what the immigrants clause asks for -------------------------------
+
+def test_the_immigrants_clause_grounds_proposals_in_the_occupancy_table():
+    grounding = ("recombinations or refinements of what\nthe occupancy table "
+                 "says the front rewards, never repeats of configurations\n"
+                 "the run has already measured")
+    bought = _policy(_reply({"mode": (["a", "b", "c"], [2, 1, 1])}),
+                     immigrants=3)
+    _revise(bought, rows=FRONT_ROWS)
+    prompt = bought.prompts[0]
+    assert "up to 3 COMPLETE" in prompt
+    assert grounding in prompt
+    assert '{"immigrants": [{"<parameter>": <value>, ...}]}' in prompt, (
+        "the reworded clause changed the schema it asks for"
+    )
+
+    none = _policy(_reply({"mode": (["a", "b", "c"], [2, 1, 1])}), immigrants=0)
+    _revise(none, rows=FRONT_ROWS)
+    assert "immigrants" not in none.prompts[0], (
+        "a run that bought no immigrants was asked for them anyway"
+    )
+
+
 # --- u10: a policy failure never kills a run --------------------------------
 
 def test_a_completion_that_raises_is_counted_and_the_run_finishes():
@@ -530,6 +709,28 @@ def test_adaptive_knobs_without_adaptation_are_refused_by_name():
         AuthorshipConfig(adaptation="sometimes")
     with pytest.raises(ValueError, match="adapt_damping"):
         AuthorshipConfig(adaptation="llm", adapt_damping=1.5)
+    with pytest.raises(ValueError, match="adapt_gate_reads_view"):
+        AuthorshipConfig(adapt_gate_reads_view=True)
+
+
+def test_the_gate_view_flag_is_off_by_default_and_reaches_the_policy():
+    said: List[str] = []
+    kwargs = dict(complete=lambda _p: "{}", objectives=list(OBJECTIVES),
+                  init_template=dict(TEMPLATE), candidate_model=_Candidate,
+                  budget=64, population_size=8)
+    default = build_authorship(AuthorshipConfig(adaptation="llm"),
+                               announce=said.append, **kwargs)
+    assert default.reguidance.gate_reads_view is False
+    assert not any("gate_reads_view" in message for message in said), (
+        "the product's own default announced itself as a control"
+    )
+    control = build_authorship(
+        AuthorshipConfig(adaptation="llm", adapt_gate_reads_view=True),
+        announce=said.append, **kwargs)
+    assert control.reguidance.gate_reads_view is True
+    assert any("adapt_gate_reads_view=True" in message for message in said), (
+        "a control arm's gate was installed without saying so"
+    )
 
 
 def test_adaptation_without_a_model_call_leaves_the_counters_a_home():
