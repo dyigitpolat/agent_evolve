@@ -230,6 +230,7 @@ remains the right tool.
 ## Describing your problem: five obligations
 
 That is the whole integration surface (`agent_evolve.contract.Problem`).
+`agent_evolve init` writes this file for you with the parts you own left blank.
 
 ```python
 from pydantic import BaseModel, Field
@@ -341,6 +342,29 @@ nothing. `chooser="llm"` still buys it — the negative result is published, not
 hidden, and the mechanism is reachable — and asking for it on a run that makes
 no model call is refused by name rather than quietly ignored.
 
+**Naming that configuration instead of inheriting it.** `authorship="guided"` is
+what `"auto"` resolves to on a model run — the authored surrogate plus
+model-proposed initialization, the two seams the ablations measured as winners,
+and neither of the per-decision seams that they did not — so a campaign can
+*state* what it ran. The other presets are `off`, `surrogate[-llm]`,
+`operators[-llm]`, `init-llm`, `generation-llm`, `generative`, `adaptive` and
+`full`.
+
+**Adaptive revision (experimental, opt-in).** `authorship="adaptive"` is `guided`
+plus `adaptation="llm"`, the one channel that reads what the run has *measured*:
+on a declared cadence in charged evaluations, one call is shown the current
+per-field sampling weights and a rendering of this run's own evidence, and
+replies with a revised weighted prior for the breeding path. It exists because
+guidance is otherwise authored before the first evaluation and never refreshed
+against anything. It is bounded rather than trusted — an admitted reply is
+*damped* into the installed weights rather than replacing them, so no revision
+can introduce an exclusion; a reply that would zero a value some measured
+front member holds is refused whole; and a revision whose following window does
+not improve the front is reverted before the next one is considered.
+**It is UNDER MEASUREMENT, and nothing here is a result.** It is off in every
+default and stays out of `authorship="auto"` until its first measured row lands,
+because every default in this package comes from one.
+
 ## What is measured, and what is not
 
 Every claim here is **venue-scoped**: it is a statement about the named domain,
@@ -404,6 +428,9 @@ The evidence archive itself (sealed preregistrations, spend ledgers, numbers
 bundles) is **not distributed with the package** — it is the research record
 behind the paper, and rows in it assert and re-verify their own absolute paths.
 The wave names in the table at the top are its addresses.
+[`docs/measurements.md`](docs/measurements.md) collects the rows on this page in
+one place, quoting this file rather than the archive; where the two disagree,
+this file is the copy of record.
 
 ## The credentialed path, and what it costs
 
@@ -471,18 +498,25 @@ None of these is required.
 
 ```
 agent_evolve version
+agent_evolve init     [PATH]                                # writes problem_def.py
 agent_evolve diagnose PROBLEM [--budget N] [--probe N]      # no model, no credential
-agent_evolve check    PROBLEM [--budget N] [--baseline-only]
+agent_evolve check    PROBLEM [--budget N] [--repeats N] [--baseline-only] [--json]
 agent_evolve run      PROBLEM [--budget N] [--proposer auto|llm|random]
                               [--strategy auto|genetic|authoring]
-                              [--authorship ...] [--prior ...] [--effort ...]
-                              [--chooser off|llm] [--structure-budget auto|N]
+                              [--authorship auto|guided|adaptive|...]
+                              [--prior auto|rule|rule-weighted|llm|llm-weighted]
+                              [--effort ...] [--chooser off|llm]
+                              [--structure-budget auto|N]
                               [--seal PATH] [--journal PATH] [--json]
 ```
 
 `PROBLEM` is `module:attribute`. `run --json` prints one machine-readable
 document — `best`, `pareto_front`, `evaluations`, `history`, `telemetry`,
-`provider_usage` — instead of prose, for scripted use.
+`provider_usage` — instead of prose, for scripted use. `check --json` prints the
+verdict as one document — the arms and their budgets, each arm's outcome, the
+per-objective comparison, the winner, `provider_usage` — and moves the prose to
+stderr, so `2>/dev/null` leaves exactly the document and the model's price is
+still stated before anything is spent.
 
 ## Examples
 
@@ -511,6 +545,6 @@ pass count. Add `-p no:cacheprovider` and drop `-q` (`python -m pytest tests/
 
 ## License
 
-MIT — see [LICENSE](LICENSE). **The copyright holder line is pending the
-project owner's sign-off and must be settled before any public release**; see
+MIT — see [LICENSE](LICENSE). The copyright holder line was settled by the
+project owner on 2026-08-18 and `LICENSE` stands as written; see
 `PACKAGING_TODO.md`.

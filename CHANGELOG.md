@@ -120,6 +120,103 @@ can move. `tests/test_numeric_domains.py`.
   Every resolution is announced through `on_progress`; offline both resolve to
   the pre-sentinel literals, so the credential-free stream stays byte-identical.
 
+### Added — the revision channel: guidance that reads what the run measured
+
+**Experimental, opt-in, and under measurement. Nothing below is a result.** It
+is off by default and stays out of `authorship="auto"` until its first measured
+row, because every default in this package comes from a measured row and this
+seam's row — the W1 pilot — is in progress.
+
+The end-to-end evaluation row's one decisive loss has a sealed diagnosis:
+guidance is authored before the first evaluation and nothing refreshes it
+against what the run measures, so on the one live physical simulator tested the
+guided stack is the best arm at 20, 40 and 80 charges and the worst by 160. It
+is not wasting budget — zero failed evaluations against uniform's 1.25% — it is
+working from a stale picture.
+
+- **`authorship.adaptation="llm"`, and the preset `"adaptive"`** (`guided` plus
+  this one channel). On a declared cadence in charged evaluations, one call
+  reads the domain card, the current per-field weights and a pure rendering of
+  what the run measured, and replies with a revised weighted prior — the
+  *classical breeding path's* prior, which initialization and mutation both draw
+  through. This is deliberately not the sampler-re-authoring channel, which lost
+  to its own shuffled-evidence control and does not ship.
+- **Admitted or refused whole**, under the same taxonomy: undeclared names,
+  invalid weights, in-field concentration above 8, or a zero on any value a
+  rank-0 measured configuration holds. An admitted reply is then **step-damped**
+  into the installed weights — `w = (1-a)*prev + a*proposal` on normalized
+  per-field distributions, `adapt_damping=0.5` by default. Damping below 1 makes
+  an introduced exclusion impossible, and a convex mix of two within-cap vectors
+  stays within cap (the mediant inequality), so the worst case a wrong revision
+  can reach is a bounded tilt inside declared domains, forever.
+- **The revert rule now binds.** Its first live measurement found it impotent:
+  across six revision-carrying runs on a three-objective simulator it admitted
+  **23 revisions and reverted 0**, because the bet asked only that some
+  post-event row be rank-0 in the pooled rows — and on three objectives almost
+  every fresh point is non-dominated. One run's revisions locked it flat for 120
+  charges while its one-factor-apart frozen twin kept improving. The bet is now
+  the loop's own unwind semantics: a revision survives its window only if some
+  row measured after the event **strictly dominates** a member of the pre-event
+  front.
+- **Evidence v2: occupancy where the front lives.** At the 40–90 rows a mid-run
+  revision actually has, over a 24-field space, per-locus rank correlations are
+  noise — the model re-tilted the same fields across a flat 120-charge window —
+  while the sealed graded-prior seat's own working format was never shown to it.
+  The bundle now carries per-value occupancy among the current non-dominated
+  configurations against occupancy among everything measured, rendered by a
+  pure, exactly-tested renderer that never sees an objective value.
+- **Every event retains the bundle it was shown, verbatim** (`note`'s
+  `evidence_text`), because the oracle instrument proved late checkpoints
+  unreconstructible from cells: `state.evaluated` includes cache-served repeats
+  the charge log cannot recover (2 of 4 digests reproduced on one flagship, 0 of
+  4 on another). Each call also journals the sha256 of that evidence.
+- **`adapt_gate_reads_view`** (default `False`, the product's stance). The live
+  gate reads reality by design — no revision may zero a value some configuration
+  *this run* measured onto the front, whatever the prompt showed. But a
+  shuffled-evidence control whose prompt reads donor rows while its gate reads
+  this run's front accrues refusals the arm it controls never meets (two of four
+  revisions refused on the control alone, W1 pilot seed 20370103), so its
+  refusal rate stops being comparable. A control arm is the only sane user of
+  `True`, and the docstring says both halves.
+- **Off is byte-identical to the pre-seam loop** — no call fires, no evidence is
+  rendered, no counter moves, and the fossil holds unmodified.
+  `tests/test_reguidance.py`, `tests/test_measurement_conditioned.py`.
+
+### Added — the release tail
+
+- **`agent_evolve check --json`.** `run` has had a machine-readable document
+  since 0.3.0 and `check` printed prose only, so scripted use of the *verdict* —
+  the one thing this package asks you to run before spending anything — meant
+  parsing sentences. It emits one document on stdout carrying the arms and their
+  budgets, each arm's outcome, the per-objective comparison, the winner and the
+  provider usage; the prose moves to stderr rather than being dropped, so the
+  price is still stated before the spend and `2>/dev/null` leaves exactly the
+  document. `run --json`'s conventions throughout: a block nobody could populate
+  serializes as `null` rather than being omitted, so `verdict: null` under
+  `--baseline-only` reads as "no model ever ran" and not as a loss. The prose
+  verdict and the document are two renderings of one computation.
+  `tests/test_public_knobs.py`.
+- **`agent_evolve init [PATH]`** writes the five-obligation `problem_def.py`
+  template — the knapsack example's shape with the knapsack removed. It lands as
+  a valid `Problem`, so `diagnose` can be pointed at it the same minute, with
+  exactly one obligation refusing by name: a template that returned a plausible
+  number from `evaluate` would let a run look like it worked. An existing file is
+  never overwritten. `tests/test_init_scaffold.py`.
+- **The terra and sol rungs are declared routes now, not half-declared ones.**
+  `openai/gpt-5.6-terra` gains its execution profile (`max_output_tokens`
+  128000; provenance: the OpenRouter catalog's
+  `top_provider.max_completion_tokens`, fetched 2026-08-20, reads 128000 for
+  all three tiers) — without it a live terra cell ran at the provider's silent
+  ~65k default while luna and sol ran a declared 128k, and truncation selects
+  against exactly the terra/high rung a capability ladder exists to measure.
+  Both routes also enter
+  `MODEL_PRICES_PER_MTOK` — terra `$1.00`/`$6.00`, sol `$5.00`/`$30.00` per
+  million, in both spellings, from this project's own routing table — so a
+  terra or sol run reports a derived `cost_usd` instead of `null`. Unknown
+  staying unknown was honest and is no longer necessary.
+  `tests/test_openrouter_model_execution_profile.py`,
+  `tests/test_provider_cost_reporting.py`.
+
 ## 0.4.0 — unreleased (the release cut)
 
 The cut that makes the package installable, swappable and honest about its own

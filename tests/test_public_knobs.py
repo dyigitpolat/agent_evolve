@@ -144,3 +144,102 @@ def test_run_without_json_still_prints_the_prose(capsys):
     out = capsys.readouterr().out
     assert code == 0
     assert "best" in out and "evaluations" in out
+
+
+def _check_json_on_the_knapsack_example() -> tuple:
+    """``check --json`` on the shipped example, in its own process.
+
+    The example is named the way the README names it (`module:attribute` off
+    the repository root), so this exercises the path a reader would type rather
+    than an import the suite arranged for itself. `--baseline-only` keeps it
+    free, and the credential names are scrubbed in the child so "offline" is a
+    property of the run and not of the developer's shell.
+    """
+    import os
+    import pathlib
+    import subprocess
+    import sys
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    env["AGENTEVOLVE_SCRUBBED"] = (
+        "OPENAI_API_KEY,OPENROUTER_API_KEY,ANTHROPIC_API_KEY"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-m", "agent_evolve.cli", "check",
+         "examples.knapsack.problem_def:problem",
+         "--budget", "12", "--repeats", "3", "--baseline-only", "--json"],
+        cwd=str(root), env=env, capture_output=True, text=True, check=True,
+    )
+    return json.loads(proc.stdout), proc.stderr
+
+
+def test_check_json_emits_one_parseable_document():
+    payload, _ = _check_json_on_the_knapsack_example()
+    assert payload["command"] == "check"
+    assert payload["problem"] == "examples.knapsack.problem_def:problem"
+    assert payload["budget"] == 12
+    assert payload["repeats"] == 3
+    assert payload["baseline_only"] is True
+    assert [spec["name"] for spec in payload["objectives"]] == [
+        "total_value", "total_weight"]
+
+    runs = payload["arms"]["baseline"]["runs"]
+    assert [run["seed"] for run in runs] == [0, 1, 2]
+    for run in runs:
+        assert run["evaluations"] <= 12
+        assert set(run["best"]) == {"total_value", "total_weight"}
+        # `calls: 0` is a measured zero, and the block is always present.
+        assert run["provider_usage"]["calls"] == 0
+
+
+def test_check_json_reports_the_absent_model_arm_as_null_not_as_a_loss():
+    # A `--baseline-only` run did not measure a model that lost; it never
+    # looked. `null` is the only reading of that which cannot be misquoted.
+    payload, _ = _check_json_on_the_knapsack_example()
+    assert payload["arms"]["model"] is None
+    assert payload["verdict"] is None
+    assert payload["model"] is None
+    assert payload["model_price_per_mtok"] is None
+    assert payload["provider_usage"] is None
+
+
+def test_check_json_keeps_stdout_to_the_document_and_the_prose_on_stderr():
+    payload, prose = _check_json_on_the_knapsack_example()
+    assert payload["arms"]["baseline"]["proposer"] == "random"
+    assert "agent_evolve check: examples.knapsack.problem_def:problem" in prose
+    assert "baseline only: no model, no credentials, no cost" in prose
+
+
+def test_check_json_carries_the_verdict_and_names_a_winner():
+    """The verdict block, exercised on the arms `check` itself computes.
+
+    The model arm here is another uninformed run, which is exactly the null the
+    command reports against; what is under test is that the rule the prose
+    states and the document's `winner` are one computation, not two.
+    """
+    from agent_evolve.cli import _verdict, _verdict_rows, _winner
+
+    problem = CliProblem()
+    baselines = [optimize(CliProblem(), budget=12, proposer="random", seed=i)
+                 for i in range(3)]
+    model_result = optimize(problem, budget=12, proposer="random", seed=7)
+    objectives = list(problem.objectives)
+
+    rows = _verdict_rows(model_result, baselines, objectives)
+    assert rows, "a judgeable objective produced no row"
+    for row in rows:
+        assert row["goal"] in {"min", "max"}
+        assert 0.0 < row["p"] <= 1.0
+        assert row["baseline_runs"] == 3
+    winner = _winner(rows)
+    assert winner in {"model", "baseline", "mixed"}
+
+    prose = "\n".join(_verdict(model_result, baselines, objectives))
+    won = sum(1 for row in rows if row["model_won"])
+    if winner == "model":
+        assert "on every objective" in prose
+    elif winner == "baseline":
+        assert "did not beat the uninformed baseline on any objective" in prose
+    else:
+        assert f"on {won} of {len(rows)} objectives" in prose

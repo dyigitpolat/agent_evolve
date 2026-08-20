@@ -1,4 +1,5 @@
-"""``agent_evolve`` command line: ``run``, ``check``, ``version``.
+"""``agent_evolve`` command line: ``init``, ``diagnose``, ``check``, ``run``,
+``version``.
 
 ``check`` is the one worth reading about. It runs the model against an
 uninformed sampler on *your* problem, at the same budget, with the same
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import statistics
 import sys
 from typing import Any, List, Optional, Sequence
@@ -100,15 +102,20 @@ def _summarise(label: str, result: Any, objectives: Sequence[Any]) -> str:
     return "\n".join(lines)
 
 
-def _verdict(
+def _verdict_rows(
     model_result: Any,
     baseline_results: Sequence[Any],
     objectives: Sequence[Any],
-) -> List[str]:
-    """State plainly whether the model beat chance, per objective."""
-    out: List[str] = []
-    beaten = 0
-    counted = 0
+) -> List[dict]:
+    """The comparison itself, as data: one row per objective it could judge.
+
+    The prose verdict and the ``--json`` document are two renderings of this
+    one computation. A second copy of the rule -- which draws count, how ``p``
+    is formed, what "won" means -- could disagree with the first, and the
+    disagreement would be invisible until someone compared two outputs of the
+    same run.
+    """
+    rows: List[dict] = []
     for spec in objectives:
         model_values = _front_values(model_result, spec.name)
         if not model_values:
@@ -122,7 +129,6 @@ def _verdict(
         ]
         if not draws:
             continue
-        counted += 1
         better = sum(
             1 for d in draws if (d > model_best if spec.goal == "max" else d < model_best)
         )
@@ -131,10 +137,46 @@ def _verdict(
         p = (better + 1) / (len(draws) + 1)
         median = statistics.median(draws)
         won = (model_best > median) if spec.goal == "max" else (model_best < median)
-        beaten += int(won)
+        rows.append({
+            "objective": spec.name,
+            "goal": spec.goal,
+            "model_best": model_best,
+            "random_median": median,
+            "baseline_runs": len(draws),
+            "baseline_better": better,
+            "p": p,
+            "model_won": won,
+        })
+    return rows
+
+
+def _winner(rows: Sequence[dict]) -> Optional[str]:
+    """``model``, ``baseline`` or ``mixed`` -- ``None`` when nothing was judged."""
+    if not rows:
+        return None
+    beaten = sum(1 for row in rows if row["model_won"])
+    if beaten == len(rows):
+        return "model"
+    if beaten == 0:
+        return "baseline"
+    return "mixed"
+
+
+def _verdict(
+    model_result: Any,
+    baseline_results: Sequence[Any],
+    objectives: Sequence[Any],
+) -> List[str]:
+    """State plainly whether the model beat chance, per objective."""
+    out: List[str] = []
+    rows = _verdict_rows(model_result, baseline_results, objectives)
+    counted = len(rows)
+    beaten = sum(1 for row in rows if row["model_won"])
+    for row in rows:
         out.append(
-            f"    {spec.name}: model {model_best:g} vs random median {median:g} "
-            f"over {len(draws)} runs  (p = {p:.2f})"
+            f"    {row['objective']}: model {row['model_best']:g} vs random "
+            f"median {row['random_median']:g} over {row['baseline_runs']} runs "
+            f" (p = {row['p']:.2f})"
         )
     if counted:
         out.append("")
@@ -178,35 +220,154 @@ def _model_line(model: Optional[str]) -> str:
     return f"model {resolved}{origin}{cost}"
 
 
+def _arm_outcome(result: Any, objectives: Sequence[Any], seed: int) -> dict:
+    """One arm's run as data: what it spent and the best it reached.
+
+    The Pareto front's rows are deliberately not here -- ``run --json`` is the
+    command that hands you a front, and duplicating it under five baseline
+    repeats would bury the one thing ``check`` exists to answer.
+    """
+    import dataclasses
+
+    best = {}
+    for spec in objectives:
+        values = _front_values(result, spec.name)
+        if values:
+            best[spec.name] = (max if spec.goal == "max" else min)(values)
+    return {
+        "seed": seed,
+        "evaluations": result.evaluations,
+        "pareto_front": len(result.pareto_front),
+        "best": best,
+        "provider_usage": (
+            dataclasses.asdict(result.provider_usage)
+            if result.provider_usage is not None else None
+        ),
+    }
+
+
+def _check_json(
+    args: argparse.Namespace,
+    objectives: Sequence[Any],
+    baselines: Sequence[Any],
+    model_result: Any,
+    model_error: Optional[BaseException],
+) -> str:
+    """One machine-readable document for a ``check`` verdict.
+
+    Same conventions as ``run --json``: a block nobody could populate
+    serializes as ``null`` rather than being omitted, so a reader can tell
+    "measured nothing" from "nobody looked" -- ``verdict: null`` under
+    ``--baseline-only`` is the second of those, and it is the honest answer
+    when no model ever ran.
+
+    The resolved model and its price ride in the document, because ``check``'s
+    contract is that nobody is billed by a default they never saw, and a
+    machine-readable mode that dropped the price would quietly break it.
+    """
+    from agent_evolve.settings import AgentEvolveSettings, model_price
+
+    model_arm: Optional[dict] = None
+    resolved: Optional[str] = None
+    price = None
+    if not args.baseline_only:
+        resolved = args.model or AgentEvolveSettings.from_env().model
+        price = model_price(resolved)
+        if model_error is not None:
+            model_arm = {
+                "seed": 0,
+                "error": f"{type(model_error).__name__}: {model_error}",
+            }
+        else:
+            model_arm = _arm_outcome(model_result, objectives, seed=0)
+            model_arm["error"] = None
+
+    rows = (
+        _verdict_rows(model_result, baselines, objectives)
+        if model_result is not None else []
+    )
+    verdict = None
+    if model_arm is not None and model_error is None:
+        verdict = {
+            "objectives": rows,
+            "objectives_judged": len(rows),
+            "objectives_won": sum(1 for row in rows if row["model_won"]),
+            "winner": _winner(rows),
+        }
+
+    payload = {
+        "command": "check",
+        "problem": args.problem,
+        "budget": args.budget,
+        "repeats": args.repeats,
+        "baseline_only": bool(args.baseline_only),
+        "model": resolved,
+        "model_is_default": (None if resolved is None else args.model is None),
+        "model_price_per_mtok": (
+            None if price is None else {"input": price[0], "output": price[1]}
+        ),
+        "objectives": [
+            {"name": spec.name, "goal": spec.goal} for spec in objectives
+        ],
+        "arms": {
+            "baseline": {
+                "proposer": "random",
+                "runs": [
+                    _arm_outcome(result, objectives, seed=i)
+                    for i, result in enumerate(baselines)
+                ],
+            },
+            "model": model_arm,
+        },
+        "verdict": verdict,
+        "provider_usage": (
+            None if model_arm is None else model_arm.get("provider_usage")
+        ),
+    }
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
 def _cmd_check(args: argparse.Namespace) -> int:
     from agent_evolve.api import optimize
 
     problem = _load_problem(args.problem)
     objectives = list(problem.objectives)
-    quiet = (lambda _m: None) if not args.verbose else (lambda m: print(m, flush=True))
+    # `run --json`'s convention: one parseable document on stdout and nothing
+    # else. The prose does not disappear, it moves to stderr -- including the
+    # model's price, which `check` states BEFORE it spends, and which a
+    # machine-readable mode has no business making quieter. `2>/dev/null` then
+    # leaves exactly the document.
+    stream = sys.stderr if args.json else sys.stdout
 
-    print(f"agent_evolve check: {args.problem}")
-    print(f"budget {args.budget} evaluations per run, {args.repeats} baseline runs")
+    def emit(message: str = "") -> None:
+        print(message, file=stream, flush=True)
+
+    quiet = (lambda _m: None) if not args.verbose else emit
+
+    emit(f"agent_evolve check: {args.problem}")
+    emit(f"budget {args.budget} evaluations per run, {args.repeats} baseline runs")
     if args.baseline_only:
-        print("baseline only: no model, no credentials, no cost\n")
+        emit("baseline only: no model, no credentials, no cost\n")
     else:
-        print(f"{_model_line(args.model)}\n")
+        emit(f"{_model_line(args.model)}\n")
 
     baselines = []
     for i in range(args.repeats):
         baselines.append(
             optimize(problem, budget=args.budget, proposer="random", seed=i, on_progress=quiet)
         )
-    print(_summarise(f"random baseline (run 1 of {args.repeats})", baselines[0], objectives))
+    emit(_summarise(f"random baseline (run 1 of {args.repeats})", baselines[0], objectives))
 
     if args.baseline_only:
-        print(
+        emit(
             "\n  Baseline only. Re-run without --baseline-only, with a provider "
             "credential set, to compare a model against it."
         )
+        if args.json:
+            print(_check_json(args, objectives, baselines, None, None))
         return 0
 
-    print()
+    emit()
     try:
         model_result = optimize(
             problem,
@@ -217,13 +378,17 @@ def _cmd_check(args: argparse.Namespace) -> int:
             on_progress=quiet,
         )
     except Exception as error:  # noqa: BLE001 - reported, not raised, so the baseline still stands
-        print(f"  model run failed: {type(error).__name__}: {error}")
-        print("\n  The baseline above still stands, and cost nothing.")
+        emit(f"  model run failed: {type(error).__name__}: {error}")
+        emit("\n  The baseline above still stands, and cost nothing.")
+        if args.json:
+            print(_check_json(args, objectives, baselines, None, error))
         return 1
-    print(_summarise("model", model_result, objectives))
-    print("\n  verdict")
+    emit(_summarise("model", model_result, objectives))
+    emit("\n  verdict")
     for line in _verdict(model_result, baselines, objectives):
-        print(line)
+        emit(line)
+    if args.json:
+        print(_check_json(args, objectives, baselines, model_result, None))
     return 0
 
 
@@ -289,6 +454,153 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+#: The five obligations with this project's problem removed and yours left to
+#: write. It is the knapsack example's shape -- the same order, the same
+#: comments about why each obligation exists -- with the knapsack taken out.
+#:
+#: It imports and it is a valid ``Problem`` the moment it lands, so ``diagnose``
+#: can be run against it immediately; only ``evaluate`` refuses, by name,
+#: because measuring is the one obligation nothing can guess for you. A template
+#: that returned a plausible number instead would let a run look like it worked.
+_SCAFFOLD = '''"""Your problem, as the five obligations ``agent_evolve`` asks for.
+
+Fill in the parts marked TODO. The README section "Describing your problem:
+five obligations" explains each one and what it buys you; the worked reference
+is ``examples/knapsack/problem_def.py``.
+
+    candidate_model   the schema a proposal must satisfy
+    objectives        what is optimized, and which way
+    seeds()           where to start
+    validate()        cheap rejection that explains itself
+    materialize()     candidate -> the artifact that gets measured
+    evaluate()        artifact -> objective values
+
+Then, before spending anything::
+
+    agent_evolve diagnose problem_def:problem --budget 40
+    agent_evolve run problem_def:problem --budget 40 --proposer random
+"""
+
+from pydantic import BaseModel, Field
+
+from agent_evolve import ObjectiveSpec, ValidationOutcome
+
+
+class CandidateConfig(BaseModel):
+    """One candidate configuration.
+
+    TODO: your decision variables. Declare their domains here -- an enum, a
+    ``Literal``, a bounded number -- because everything that reads this schema,
+    including the uninformed sampler your run is measured against, draws only
+    from what it declares. A field with no finite reading is one the operators
+    leave frozen, and that is the commonest reason a run goes nowhere.
+    """
+
+    workers: int = Field(..., ge=1, le=64, description="TODO: describe this axis")
+
+
+class MyProblem:
+    """TODO: one line saying what is being optimized, and under what limit."""
+
+    candidate_model = CandidateConfig
+
+    # -- 1. what is being optimized ---------------------------------------
+    @property
+    def objectives(self):
+        # TODO: name each objective and its direction. Direction is declared,
+        # never encoded by negating a value.
+        return [
+            ObjectiveSpec("throughput", "max"),
+            ObjectiveSpec("cost", "min"),
+        ]
+
+    # -- 2. where to start -------------------------------------------------
+    def seeds(self):
+        """Configurations you would have tried anyway.
+
+        Seeds are evaluated before anything is proposed, so the result answers
+        "did this beat what I already had" rather than leaving it assumed.
+        Return ``[]`` if you have none.
+        """
+        # TODO
+        return [{"workers": 8}]
+
+    # -- 3. cheap rejection that explains itself ---------------------------
+    def validate(self, config) -> ValidationOutcome:
+        """Reject what cannot work, and say what would.
+
+        The message is fed back to the proposer verbatim, so state what is
+        wrong AND what would be acceptable. A rejection costs no evaluation.
+        """
+        # TODO: your feasibility rules, e.g.
+        #   return ValidationOutcome(
+        #       False, "constraint",
+        #       "workers above 32 needs the sharded strategy; reduce workers",
+        #   )
+        return ValidationOutcome(True)
+
+    # -- 4. candidate -> the artifact that gets measured -------------------
+    def materialize(self, config):
+        """Canonicalise to the thing that actually gets measured.
+
+        Two configurations often produce the same artifact -- the same build,
+        the same mapping, the same deployment. Materializing first means the
+        second one is free instead of being paid for twice. Put anything cheap
+        and deterministic here and keep ``evaluate`` for the expensive part.
+        """
+        # TODO
+        return (config["workers"],)
+
+    # -- 5. measure it -----------------------------------------------------
+    def evaluate(self, artifact):
+        """Measure the artifact and return one value per objective."""
+        # TODO: run the build, the simulation, the benchmark -- the expensive
+        # thing. `budget` counts calls to this method, so this is what you are
+        # paying for.
+        raise NotImplementedError(
+            "evaluate() is the one obligation nothing can guess for you: "
+            "return {\\"throughput\\": ..., \\"cost\\": ...} for this artifact"
+        )
+
+    # -- optional: prose context for a model-driven proposer ---------------
+    def search_space_description(self):
+        # TODO, or delete: what a model should know about this space that the
+        # schema cannot say. Only the `llm` proposer reads it.
+        return ""
+
+
+# `module:attribute` on the command line resolves to this name.
+problem = MyProblem()
+'''
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    """Write the five-obligation template, and refuse to overwrite anything.
+
+    A scaffold that clobbers is a scaffold nobody can run twice, and the file
+    it would clobber is the one thing in the directory nobody else can rewrite.
+    """
+    from pathlib import Path
+
+    target = Path(args.path)
+    if target.is_dir() or target.suffix != ".py":
+        target = target / "problem_def.py"
+    if target.exists():
+        raise SystemExit(
+            f"refusing to overwrite {target}. Name another path, or move the "
+            "existing file first."
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_SCAFFOLD, encoding="utf-8")
+    module = target.stem
+    print(f"wrote {target}")
+    print("")
+    print("Fill in the parts marked TODO, then, before spending anything:")
+    print(f"  agent_evolve diagnose {module}:problem --budget 40")
+    print(f"  agent_evolve run {module}:problem --budget 40 --proposer random")
+    return 0
+
+
 def _cmd_version(_args: argparse.Namespace) -> int:
     try:
         from importlib.metadata import version
@@ -317,12 +629,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     check.add_argument("problem", help="module:attribute naming your problem")
     check.add_argument("--budget", type=int, default=40, help="evaluations per run")
-    check.add_argument("--repeats", type=int, default=5, help="baseline runs (default 5)")
+    check.add_argument(
+        "--repeats", type=int, default=5,
+        help=(
+            "uninformed BASELINE runs (default 5, seeds 0..N-1). The model arm "
+            "is one run at seed 0 and this does not repeat it, so the spread "
+            "you see is chance's, not the model's"
+        ),
+    )
     check.add_argument("--model", default=None, help="model id for the model arm")
     check.add_argument(
         "--baseline-only",
         action="store_true",
         help="run only the free baseline; no credentials needed",
+    )
+    check.add_argument(
+        "--json", action="store_true",
+        help=(
+            "print one machine-readable JSON document of the verdict on "
+            "stdout; the prose moves to stderr rather than being dropped"
+        ),
     )
     check.add_argument("--verbose", action="store_true")
     check.set_defaults(func=_cmd_check)
@@ -442,6 +768,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     run.add_argument("--verbose", action="store_true")
     run.set_defaults(func=_cmd_run)
+
+    init = sub.add_parser(
+        "init",
+        help="write a problem_def.py template: the five obligations, blank",
+        description=(
+            "Writes the five-obligation template -- the shipped knapsack "
+            "example's shape with the knapsack removed. PATH may be a "
+            "directory (problem_def.py is written inside it) or a .py file to "
+            "write. An existing file is never overwritten."
+        ),
+    )
+    init.add_argument(
+        "path", nargs="?", default=".",
+        help="directory to write problem_def.py into, or a .py path (default .)",
+    )
+    init.set_defaults(func=_cmd_init)
 
     ver = sub.add_parser("version", help="print the installed version")
     ver.set_defaults(func=_cmd_version)

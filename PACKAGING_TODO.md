@@ -313,3 +313,55 @@ cells on 0.5.0 and disclose any number that moves rather than absorbing it.**
 The byte-fossil test passes unmodified — its venue is enum-only, so nothing it
 pins can move — which bounds the exposure to venues with a numeric locus but
 does not measure it.
+
+---
+
+## State update 2026-08-20 (the release tail) — append-only
+
+The state of the release now lives in **`RELEASE_CHECKLIST.md`**, which lists
+what is done with the test or transcript that proves it and leaves only the
+owner's items unchecked. This file stays the *reasoning*; that one is the state.
+
+### Closed
+
+- **§3 "`check` has no `--json`"** — `check --json` emits one document on stdout
+  (arms, budgets, per-arm outcomes, the per-objective comparison, the winner,
+  `provider_usage`) and moves the prose to stderr, so the price is still stated
+  before the spend. The prose verdict and the document are two renderings of one
+  computation, which is why there is no second copy of the rule to drift.
+  `tests/test_public_knobs.py`.
+- **§3's nice-to-have, `agent_evolve init`** — writes the five-obligation
+  `problem_def.py` (the knapsack example with the knapsack removed), lands as a
+  valid `Problem` that `diagnose` runs against immediately, leaves `evaluate`
+  refusing by name, and never overwrites. `tests/test_init_scaffold.py`.
+- **§4 "a scope snapshot inside the package"** — `docs/measurements.md`, quoting
+  `README.md` verbatim, with the archive named as the authoritative record and
+  the README as the copy of record. No number in it was retyped from memory.
+- **Prices for the routes the ladder actually uses** — `openai/gpt-5.6-terra`
+  and `openai/gpt-5.6-sol` join `MODEL_PRICES_PER_MTOK` in both spellings, from
+  the program's own routing table, so those runs derive `cost_usd` instead of
+  reporting unknown.
+
+### Half-closed, deliberately
+
+- **§3 "`check`'s model arm is single-shot at `seed = 0`"** — `--help` now says
+  so, which was the stated minimum. A `--model-repeats` is still not built.
+
+### Found by running CI on this cut, and NOT fixed
+
+All three reproduce on pristine `cbed1c5`; the triage and the transcripts are in
+`RELEASE_CHECKLIST.md`. The first is a product defect and belongs in §6's
+company rather than in a packaging list:
+
+- **`run --proposer llm` without the `[llm]` extra no longer refuses.** On any
+  problem with seeds — the genetic path — `optimize` builds the completion seam
+  directly and never reaches `_build_harness`, which is the only place that
+  names `pip install 'agent_evolve[llm]'`. The run completes on the classical
+  path and says nothing, so 0.4.0's "fails up front naming the install command"
+  is no longer true where it matters. A request for a model that cannot be
+  honoured is now a silent fallback.
+- `scripts/ci-local.sh` injects `AGENTEVOLVE_SCRUBBED=…`, which makes
+  `test_credentials_present_is_true_for_a_real_provider_key` fail under the
+  local runner and pass on GitHub — a drift between the runner and the workflow
+  it claims not to redefine.
+- `test_full_multi_option_evolution_runs_through_reflection` fails on 3.13 only.

@@ -45,9 +45,25 @@ _DEFAULT_HARNESS = "pydantic_ai"
 #: Published price per million tokens for the routes we default to or document,
 #: so cost can be shown rather than guessed. Absent from this table means
 #: unknown, and unknown is reported as unknown.
+#:
+#: Both spellings of each route are entered because a run is priced by the name
+#: the *caller* used: ``model=`` is echoed straight into the usage record, and a
+#: caller may write either the package's prefixed form or the bare id the
+#: raw-HTTP seam sends. One spelling in the table would report `cost_usd: null`
+#: on the other, which is the defect 0.4.0 fixed for luna.
+#:
+#: The three tiers are the ladder this project measures capability on, and the
+#: numbers are its own routing table (wave-D `wd_common.py`'s `PRICES`, itself
+#: the OpenRouter catalog's published prices) rather than anything recalled.
+#: terra and sol were absent until the ladder wave started using them, so those
+#: runs reported cost unknown -- honest, and no longer necessary.
 MODEL_PRICES_PER_MTOK = {
     "openrouter:openai/gpt-5.6-luna": (0.10, 0.60),
     "openai/gpt-5.6-luna": (0.10, 0.60),
+    "openrouter:openai/gpt-5.6-terra": (1.00, 6.00),
+    "openai/gpt-5.6-terra": (1.00, 6.00),
+    "openrouter:openai/gpt-5.6-sol": (5.00, 30.00),
+    "openai/gpt-5.6-sol": (5.00, 30.00),
 }
 
 
