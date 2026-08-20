@@ -34,6 +34,7 @@ EXPECTED_PROFILE_NAMES = (
     "gpt_oss_20b",
     "gpt_luna",
     "gpt_sol",
+    "gpt_terra",
     "mistral",
     "qwen",
 )

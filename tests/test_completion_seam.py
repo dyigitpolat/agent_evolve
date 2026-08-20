@@ -444,6 +444,24 @@ def test_the_product_declares_the_route_ceiling_it_could_not_send(
     assert declared_max_output_tokens("someone/unknown-model") is None
 
 
+def test_every_tier_of_the_model_ladder_declares_the_same_ceiling() -> None:
+    # The ladder wave varies MODEL against EFFORT and reads monotonicity off
+    # the result. A tier with no declared ceiling sends none and runs at the
+    # provider's undeclared default (~65,536) while its siblings run at
+    # 128,000, so the longest replies of exactly one tier get truncated and the
+    # ladder measures a transport gap instead of the model. All three tiers
+    # read 128000 in the OpenRouter catalog (top_provider.max_completion_tokens,
+    # fetched 2026-08-20); all three must therefore declare it here.
+    from agent_evolve.integrations.pydantic_ai.model_execution_profile import (
+        declared_max_output_tokens)
+
+    ladder = ("openai/gpt-5.6-luna", "openai/gpt-5.6-terra",
+              "openai/gpt-5.6-sol")
+    declared = {model: declared_max_output_tokens(model) for model in ladder}
+    assert declared == dict.fromkeys(ladder, 128_000), (
+        f"a ladder tier would have run at a different ceiling: {declared}")
+
+
 def test_optimize_sends_the_declared_ceiling_and_never_invents_one(
     monkeypatch,
 ) -> None:

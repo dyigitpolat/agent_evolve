@@ -33,6 +33,14 @@ Three things are rendered, in the order the evidence supports them:
 
 ``coverage`` rides along with ``effects``: which declared values a locus has
 actually been measured at, so "this region is exhausted" is checkable.
+
+:func:`render_elite_table` renders a fourth thing separately, because it is a
+different KIND of statement and its consumers ask for it by name: value
+occupancy among the non-dominated rows, against occupancy across the whole
+trace. ``effects`` needs rows before it says anything true; occupancy is a
+count over configurations and survives the tens of rows a mid-run reader
+actually has. Its docstring carries the measurement that settled which of the
+two to lead with.
 """
 
 from __future__ import annotations
@@ -49,12 +57,15 @@ from agent_evolve.policies.genetic import Locus, loci_of, read_locus
 
 __all__ = [
     "MIN_EVIDENCE_ROWS",
+    "ELITE_ENRICHMENT_FLOOR",
+    "ELITE_MIN_COUNT",
     "MeasuredRow",
     "EvidenceView",
     "front_of",
     "spearman",
     "locus_effects",
     "render_measurement_evidence",
+    "render_elite_table",
     "evidence_digest",
     "WeightedProposal",
     "PriorVerdict",
@@ -293,6 +304,143 @@ def render_measurement_evidence(
         if weak:
             lines.append(f"    (no determinable effect on any cost: "
                          f"{', '.join(weak[:12])})")
+    return "\n".join(lines)
+
+
+#: How far a value's share among the front must exceed its share of the whole
+#: trace before this table calls it informative. At the tens of rows a mid-run
+#: revision actually has, a smaller gap is one row changing its mind.
+ELITE_ENRICHMENT_FLOOR = 0.05
+
+#: How often a value must appear among the front to be worth printing whatever
+#: its enrichment. Twice is the fewest that is not a single draw.
+ELITE_MIN_COUNT = 2
+
+
+def render_elite_table(
+    rows: Sequence[MeasuredRow],
+    specs: Sequence[ObjectiveSpec],
+    domains: Mapping[str, Sequence[Any]],
+    *,
+    max_elite: int = 12,
+) -> str:
+    """What the non-dominated configurations are MADE OF. Pure, like the rest.
+
+    ``effects`` above answers "which knob moves which cost" with a per-locus
+    rank correlation, and that answer has a measured floor under it: it needs
+    rows. A mid-run revision has 40-90 of them spread over a two-dozen-field
+    space, and at that scale the correlations are noise -- the W1 pilot's
+    revision channel re-tilted them four times a run and moved the final result
+    by less than the revision draw's own sampling variance (2026-08-19, five
+    taped analog pairs: 2/5 by sign under both bet variants, and the same arm
+    on the same tape moving 0.29 between two draws). Re-reading a noisy
+    statistic more often does not make it a signal.
+
+    What DID separate, sealed, was a graded prior whose author never computed a
+    correlation: the format that seat worked in was value OCCUPANCY -- which
+    declared values the configurations that are already good are built out of,
+    read against how often the same value shows up in the run at large. It is a
+    count over configurations rather than a statistic over ranks, it assumes no
+    ordering on a categorical domain, and one more row cannot swing it the way
+    one more row swings a Spearman. This function renders that format.
+
+    The elite are the goal-aware rank-0 rows -- :func:`front_of`, the same
+    domination relation selection itself uses -- truncated to *max_elite* in
+    measurement order when the front is larger, so a run whose front is half
+    its trace still gets a table a model can read.
+
+    Occupancy is per FIELD, not per locus: a sequence field's elements pool
+    into one entry, because the weight table a revision writes is keyed per
+    field and a table per position would be a different prior for every genome
+    length. Pooling makes the denominator the number of in-domain SLOTS the
+    field contributes rather than the number of rows, which for a scalar field
+    is exactly the number of rows and so reduces to "count among elite / elite
+    size".
+
+    Only values worth the line are printed: a value whose elite share beats its
+    overall share by more than :data:`ELITE_ENRICHMENT_FLOOR`, or that the
+    front holds at least :data:`ELITE_MIN_COUNT` times. A field with no such
+    value is omitted entirely and the closing line counts how many fields that
+    was, so an omission reads as "measured, said nothing" rather than as an
+    absence the reader has to notice.
+
+    NO objective value appears anywhere in this rendering. The front's scores
+    are the business of the section above; this one says only where the front
+    sits in the search space, so occupancy cannot be misread as a score.
+    """
+
+    rows = list(rows)
+    if not rows:
+        return "  no candidate has been measured yet."
+
+    fields: List[str] = []
+    declared: Dict[str, List[str]] = {}
+    for locus in loci_of(dict(rows[0][0])):
+        if locus.field in declared:
+            continue
+        values = list(domains.get(str(locus)) or ())
+        if len(values) < 2:
+            continue
+        fields.append(locus.field)
+        declared[locus.field] = [_token(v) for v in values]
+
+    def _tally(subset: Sequence[MeasuredRow]
+               ) -> Tuple[Dict[str, Dict[str, int]], Dict[str, int]]:
+        counts = {name: {token: 0 for token in declared[name]}
+                  for name in fields}
+        slots = {name: 0 for name in fields}
+        for config, _objectives, _survived in subset:
+            for locus in loci_of(dict(config)):
+                held = counts.get(locus.field)
+                if held is None:
+                    continue
+                try:
+                    token = _token(read_locus(config, locus))
+                except Exception:
+                    continue
+                if token not in held:
+                    continue
+                held[token] += 1
+                slots[locus.field] += 1
+        return counts, slots
+
+    front = front_of(rows, specs)
+    elite = front[:max_elite]
+    elite_counts, elite_slots = _tally(elite)
+    all_counts, all_slots = _tally(rows)
+
+    scope = (f"the {len(elite)} non-dominated configurations"
+             if len(front) <= len(elite) else
+             f"the first {len(elite)} of {len(front)} non-dominated "
+             f"configurations, in measurement order")
+    lines: List[str] = [
+        f"  which declared values {scope} hold, as a share of that set, "
+        f"against the same value's share across all {len(rows)} measured "
+        f"configurations. These are counts of configurations, never scores:"
+    ]
+
+    silent = 0
+    for name in fields:
+        shown: List[str] = []
+        for token in declared[name]:
+            elite_count = elite_counts[name][token]
+            elite_total = elite_slots[name]
+            elite_share = elite_count / elite_total if elite_total else 0.0
+            overall_total = all_slots[name]
+            overall_share = (all_counts[name][token] / overall_total
+                             if overall_total else 0.0)
+            if not (elite_share - overall_share > ELITE_ENRICHMENT_FLOOR
+                    or elite_count >= ELITE_MIN_COUNT):
+                continue
+            shown.append(f"{token} {elite_count}/{elite_total}="
+                         f"{elite_share:.2f} vs {overall_share:.2f} overall "
+                         f"({elite_share - overall_share:+.2f})")
+        if not shown:
+            silent += 1
+            continue
+        lines.append(f"    {name}: " + "; ".join(shown))
+    lines.append(f"    ({silent} of {len(fields)} parameters showed no value "
+                 f"the front concentrates on)")
     return "\n".join(lines)
 
 

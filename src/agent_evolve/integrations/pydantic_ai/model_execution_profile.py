@@ -457,6 +457,41 @@ GPT_5_6_LUNA_OPENAI_XHIGH = OpenRouterModelExecutionProfile(
 )
 
 
+# The third tier of the same OpenAI family, and the one the model ladder was
+# missing. Without a profile here `declared_max_output_tokens` returns None for
+# the terra route, so nothing is sent, so the route runs at the provider's
+# undeclared default (~65,536) while its luna and sol siblings run at 128,000 --
+# a silent per-tier ceiling that truncates exactly the longest replies and would
+# have selected against terra at high effort, manufacturing non-monotonicity out
+# of a transport gap. Provenance: OpenRouter model catalog,
+# `top_provider.max_completion_tokens`, fetched 2026-08-20, reads 128000 for all
+# three tiers (luna, terra, sol).
+GPT_5_6_TERRA_OPENAI_XHIGH = OpenRouterModelExecutionProfile(
+    profile_id="gpt_5_6_terra_openai_xhigh",
+    profile_version=1,
+    requested_model="openai/gpt-5.6-terra",
+    accepted_resolved_models=("openai/gpt-5.6-terra",),
+    provider_only=("openai",),
+    accepted_resolved_providers=("OpenAI",),
+    max_output_tokens=128_000,
+    reasoning_effort="xhigh",
+    # The pinned first-party endpoint does not advertise temperature.
+    temperature=None,
+    structured_output_mode=(
+        OpenRouterStructuredOutputMode.NATIVE_JSON_SCHEMA
+    ),
+    structured_output_strict=True,
+    json_schema_dialect=(
+        OpenRouterJsonSchemaDialect.OPENAI_STRICT_BOUNDED_TEXT_V1
+    ),
+    # Same OpenRouter spelling bridge as its luna and sol siblings: the endpoint
+    # advertises ``max_tokens`` while the maintained transport emits
+    # ``max_completion_tokens``. Routing stays pinned to OpenAI, fallbacks
+    # forbidden.
+    provider_require_parameters=False,
+)
+
+
 GPT_OSS_120B_GROQ_HIGH = OpenRouterModelExecutionProfile(
     profile_id="gpt_oss_120b_groq_high",
     profile_version=7,
@@ -537,6 +572,7 @@ OPENROUTER_MODEL_EXECUTION_PROFILES = {
     "gpt_oss_20b": GPT_OSS_20B_GROQ_HIGH,
     "gpt_luna": GPT_5_6_LUNA_OPENAI_XHIGH,
     "gpt_sol": GPT_5_6_SOL_OPENAI_XHIGH,
+    "gpt_terra": GPT_5_6_TERRA_OPENAI_XHIGH,
     "mistral": MISTRAL_LARGE_3_MISTRAL,
     "qwen": QWEN_3_7_MAX_ALIBABA_XHIGH,
 }
@@ -606,7 +642,9 @@ def declared_max_output_tokens(model: str) -> "int | None":
 __all__ = [
     "DEEPSEEK_V4_PRO_STREAMLAKE_XHIGH",
     "DEEPSEEK_V4_PRO_STREAMLAKE_XHIGH_NATIVE_JSON",
+    "GPT_5_6_LUNA_OPENAI_XHIGH",
     "GPT_5_6_SOL_OPENAI_XHIGH",
+    "GPT_5_6_TERRA_OPENAI_XHIGH",
     "GPT_OSS_120B_GROQ_HIGH",
     "GPT_OSS_20B_GROQ_HIGH",
     "GPT_OSS_20B_GROQ_HIGH_SERIAL",

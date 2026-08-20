@@ -28,6 +28,8 @@ from agent_evolve.core.problem import ObjectiveSpec
 from agent_evolve.infrastructure.authored_runtime import AuthoredRuntime
 from agent_evolve.policies.llm_generator import AuthoredGenerator
 from agent_evolve.policies.measurement_evidence import (
+    ELITE_ENRICHMENT_FLOOR,
+    ELITE_MIN_COUNT,
     MIN_EVIDENCE_ROWS,
     WeightedProposal,
     admit_weighted_restriction,
@@ -35,6 +37,7 @@ from agent_evolve.policies.measurement_evidence import (
     front_of,
     locus_effects,
     parse_weighted_restriction,
+    render_elite_table,
     render_measurement_evidence,
     spearman,
 )
@@ -376,6 +379,131 @@ def test_rendering_the_same_rows_twice_is_the_same_bytes():
 def test_an_empty_trace_renders_as_an_empty_trace():
     assert "no candidate has been measured" in render_measurement_evidence(
         [], SPECS, DOMAINS)
+
+
+# ------------------------------------------------- occupancy among the elite
+#
+# Every share below is computed by hand in the comment beside it. The table
+# exists because rank correlations over tens of rows are noise; a test that
+# checked it by recomputing it in the test would be checking nothing.
+
+def _row(knob, other, cost, survived=True):
+    return ({"knob": knob, "other": other}, {"cost": float(cost)}, survived)
+
+
+def test_elite_occupancy_prints_the_shares_it_computed_by_hand():
+    # Front = the three cost-1 rows; the two cost-5 rows are dominated.
+    body = [_row("a", "p", 1), _row("a", "q", 1), _row("b", "p", 1),
+            _row("c", "p", 5), _row("d", "q", 5), _row("d", "q", 5)]
+    text = render_elite_table(body, SPECS, DOMAINS)
+
+    # knob among 3 elite: a 2/3, b 1/3, c 0, d 0.  knob among 6 rows:
+    # a 2/6, b 1/6, c 1/6, d 2/6.  "a" and "b" are enriched; "c" and "d" are
+    # held by nothing on the front, so neither clause admits them.
+    assert ("    knob: a 2/3=0.67 vs 0.33 overall (+0.33); "
+            "b 1/3=0.33 vs 0.17 overall (+0.17)") in text
+    assert " c " not in text and " d " not in text
+    # other among 3 elite: p 2/3, q 1/3.  Among 6 rows: p 3/6, q 3/6.
+    # "q" is under-represented and held once, so neither clause admits it.
+    assert "    other: p 2/3=0.67 vs 0.50 overall (+0.17)" in text
+    assert "q " not in text
+    assert ("    (0 of 2 parameters showed no value the front concentrates "
+            "on)") in text
+
+
+def test_a_value_the_front_holds_twice_prints_even_when_it_is_diluted():
+    """The OR in the inclusion rule, exercised on the arm that is not enrichment."""
+
+    body = [_row("a", "p", 1), _row("a", "q", 1),          # elite
+            _row("b", "p", 1), _row("b", "q", 1),          # elite
+            _row("a", "p", 5), _row("a", "q", 5),
+            _row("a", "p", 5), _row("a", "q", 5)]
+    text = render_elite_table(body, SPECS, DOMAINS)
+    # "a" is 2/4 = 0.50 among the elite against 6/8 = 0.75 overall: enrichment
+    # of -0.25, which the floor refuses, and a count of 2, which admits it.
+    assert ELITE_MIN_COUNT == 2
+    assert "a 2/4=0.50 vs 0.75 overall (-0.25)" in text
+    assert "b 2/4=0.50 vs 0.25 overall (+0.25)" in text
+
+
+def test_a_thin_enrichment_held_once_is_below_the_floor_and_is_dropped():
+    # "b" sits on the front once: 1/4 = 0.25 elite against 5/25 = 0.20
+    # overall. The gap is 0.05 and the rule admits only MORE than that.
+    body = ([_row("a", "p", 1), _row("b", "q", 1),
+             _row("c", "p", 1), _row("d", "q", 1)]
+            + [_row("abcd"[i % 4], "pq"[i % 2], 5) for i in range(16)]
+            + [_row("b", "p", 5) for _ in range(5)])
+    text = render_elite_table(body, SPECS, DOMAINS)
+    assert ELITE_ENRICHMENT_FLOOR == 0.05
+    assert "b 1/4" not in text, (
+        "a value one front member holds, enriched by less than the floor, "
+        f"was printed anyway:\n{text}"
+    )
+
+
+def test_a_field_with_nothing_to_say_is_omitted_and_counted_in_one_line():
+    body = ([_row("a", "p", 1), _row("b", "q", 1),
+             _row("c", "p", 1), _row("d", "q", 1)]
+            + [_row("abcd"[i % 4], "pq"[i % 2], 5) for i in range(16)])
+    text = render_elite_table(body, SPECS, DOMAINS)
+    # knob: every value is 1/4 elite against 5/20 overall -- zero enrichment,
+    # one occurrence each, so the whole field says nothing and is dropped.
+    assert "knob" not in text
+    # other: p and q are each held twice, so the count clause keeps them.
+    assert "    other: p 2/4=0.50 vs 0.50 overall (+0.00); " \
+           "q 2/4=0.50 vs 0.50 overall (+0.00)" in text
+    assert ("    (1 of 2 parameters showed no value the front concentrates "
+            "on)") in text
+
+
+def test_a_front_larger_than_the_cap_is_truncated_in_measurement_order():
+    body = [_row("a", "p", 1), _row("a", "q", 1), _row("b", "p", 1),
+            _row("c", "q", 1)]
+    text = render_elite_table(body, SPECS, DOMAINS, max_elite=2)
+    assert "first 2 of 4 non-dominated configurations, in measurement order" \
+        in text
+    # Only the first two rows count, and both hold "a": 2/2 against 2/4.
+    assert "a 2/2=1.00 vs 0.50 overall (+0.50)" in text
+    assert "b " not in text and "c " not in text
+
+
+def test_a_sequence_field_pools_its_positions_into_one_entry():
+    body = [({"genome": [1, 1]}, {"cost": 1.0}, True),
+            ({"genome": [1, 1]}, {"cost": 1.0}, True),
+            ({"genome": [0, 0]}, {"cost": 5.0}, False),
+            ({"genome": [0, 0]}, {"cost": 5.0}, False)]
+    domains = {"genome[0]": [0, 1], "genome[1]": [0, 1]}
+    text = render_elite_table(body, SPECS, domains)
+    assert "genome[0]" not in text and "genome[1]" not in text, (
+        "the occupancy table keyed a sequence per POSITION, which is not the "
+        f"key the weight table it feeds is written in:\n{text}"
+    )
+    # Two elite rows x two positions = four in-domain slots, all holding 1;
+    # four rows x two positions = eight slots, four of them holding 1.
+    assert "    genome: 1 4/4=1.00 vs 0.50 overall (+0.50)" in text
+    assert "    (0 of 1 parameters showed no value the front concentrates on)" \
+        in text
+
+
+def test_no_objective_value_reaches_the_occupancy_table():
+    body = [_row("a", "p", 1337.5), _row("b", "q", 1337.5),
+            _row("c", "p", 4242.25), _row("d", "q", 4242.25)]
+    text = render_elite_table(body, SPECS, DOMAINS)
+    assert "1337" not in text and "4242" not in text, (
+        f"occupancy rendered a score, which is the other section's job:\n{text}"
+    )
+    assert "cost" not in text
+
+
+def test_an_empty_trace_has_no_elite_to_render():
+    assert "no candidate has been measured" in render_elite_table(
+        [], SPECS, DOMAINS)
+
+
+def test_rendering_the_same_rows_twice_is_the_same_occupancy_bytes():
+    body = rows(9)
+    assert (render_elite_table(body, SPECS, DOMAINS)
+            == render_elite_table(body, SPECS, DOMAINS))
 
 
 # ---------------------------------------------------------------- the gate
