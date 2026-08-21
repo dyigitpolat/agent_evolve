@@ -444,6 +444,46 @@ def test_immigrants_are_validated_capped_and_reach_the_next_generation():
     assert good in problem.stream, "the injected immigrant was never measured"
 
 
+def test_the_event_splits_its_rejections_by_reason():
+    """One aggregate count names no failure; three counts name three.
+
+    ``already_measured`` is the one the live measurement was drowning in --
+    proposals arrived on schedule and were accepted 0 of 69, every drop a
+    configuration the run had already charged -- and it is the one the novelty
+    clause is aimed at, so a campaign has to be able to read it apart from a
+    model that misread a declared vocabulary (``out_of_domain``) or wrote
+    something that is not a configuration of this schema at all (``shape``).
+    """
+
+    duplicate = dict(ROWS[0][0], genome=list(ROWS[0][0]["genome"]))
+    fresh = {"genome": [1] * (GENOME - 1) + [0], "mode": "c"}
+    policy = _policy(_reply({"mode": (["a", "b", "c"], [1, 1, 2])},
+                            immigrants=[
+                                {"mode": "c"},                       # shape
+                                {"genome": [1] * (GENOME - 1) + [2],
+                                 "mode": "a"},                       # domain
+                                duplicate,                           # measured
+                                fresh,
+                            ]),
+                     immigrants=4)
+    outcome = _revise(policy)
+
+    assert outcome.immigrants == (fresh,)
+    assert outcome.note["immigrants"]["rejected_by_reason"] == {
+        "shape": 1, "out_of_domain": 1, "already_measured": 1}, (
+        "the event reports a rejection total the campaign cannot act on"
+    )
+    assert outcome.note["immigrants"]["rejected"] == [
+        {"reason": "shape"}, {"reason": "out_of_domain"},
+        {"reason": "already_measured"}], (
+        "the per-member rejection list changed shape; the split was meant to "
+        "be added beside it, not to replace it"
+    )
+    assert (policy.telemetry.immigrants_proposed,
+            policy.telemetry.immigrants_accepted,
+            policy.telemetry.immigrants_rejected) == (4, 1, 3)
+
+
 def test_immigrants_are_not_read_when_none_were_bought():
     policy = _policy(_reply({"mode": (["a", "b", "c"], [1, 1, 2])},
                             immigrants=[{"genome": [1] * GENOME, "mode": "c"}]))
@@ -479,8 +519,8 @@ def test_a_short_immigrants_list_admits_the_weights_and_counts_the_shortfall():
         "the members that WERE written were not accepted"
     )
     assert outcome.note["immigrants"] == {
-        "accepted": 2, "rejected": [], "proposed": 2, "required": 3,
-        "shortfall": 1}
+        "accepted": 2, "rejected": [], "rejected_by_reason": {},
+        "proposed": 2, "required": 3, "shortfall": 1}
     assert policy.telemetry.immigrants_shortfall == 1
     assert (policy.telemetry.immigrants_proposed,
             policy.telemetry.immigrants_accepted,
@@ -494,8 +534,8 @@ def test_a_missing_immigrants_array_counts_the_whole_requirement_as_short():
 
     assert outcome.note["admitted"] is True and outcome.immigrants == ()
     assert outcome.note["immigrants"] == {
-        "accepted": 0, "rejected": [], "proposed": 0, "required": 3,
-        "shortfall": 3}
+        "accepted": 0, "rejected": [], "rejected_by_reason": {},
+        "proposed": 0, "required": 3, "shortfall": 3}
     assert policy.telemetry.immigrants_shortfall == 3
     assert policy.telemetry.immigrants_proposed == 0, (
         "an array that was never written counted as members proposed"
@@ -698,6 +738,70 @@ def test_the_immigrants_clause_grounds_proposals_in_the_occupancy_table():
     assert "immigrants" not in none.prompts[0], (
         "a run that bought no immigrants was asked for them anyway"
     )
+
+
+def test_the_immigrants_clause_grounds_novelty_in_the_measured_count():
+    """The 0-of-69 signature's fix, stated as the model can act on it.
+
+    Required, the clause was ANSWERED -- twelve proposals a cell, on schedule
+    -- and accepted zero times: at roughly 320 measured rows a recombination
+    of the elites on display is usually a configuration the run has already
+    charged, and the dedup drops it before it costs anything. "Never repeats"
+    was already in the prose; the ground was not, because the model cannot
+    count rows it was never handed. So the clause states the count and states
+    the price of a repeat.
+    """
+
+    policy = _policy(_reply({"mode": (["a", "b", "c"], [2, 1, 1])}),
+                     immigrants=3)
+    _revise(policy, rows=FRONT_ROWS)
+    asked = " ".join(policy.prompts[0].split())
+    assert f"this run has ALREADY MEASURED {len(FRONT_ROWS)} configurations" \
+        in asked, (
+        "the novelty ask names no count, which is the state that was measured "
+        "to be answered 12 times a cell and accepted 0 of 69"
+    )
+    assert ("A proposal that repeats one of those "
+            f"{len(FRONT_ROWS)} is REJECTED without being measured and WASTES "
+            "the slot it took.") in asked
+    assert ("Every one of the 3 must differ from every configuration this run "
+            "has measured, in at least one parameter") in asked
+
+    # The count is the RUN's, not the rendering's: a control arm that shows
+    # donor rows is asked for novelty against the same dedup its proposals
+    # will actually meet.
+    donor = _policy(_reply({"mode": (["a", "b", "c"], [2, 1, 1])}),
+                    immigrants=3, evidence_view=lambda rows: list(rows)[:2])
+    _revise(donor, rows=FRONT_ROWS)
+    assert f"ALREADY MEASURED {len(FRONT_ROWS)} configurations" in \
+        " ".join(donor.prompts[0].split())
+
+
+def test_the_novelty_ground_moves_with_the_run_and_the_reply_shape_does_not():
+    """Two events, two counts, one schema line."""
+
+    seen: List[int] = []
+
+    def _reply_for(prompt: str) -> str:
+        seen.append(len(prompt))
+        return _reply({"mode": (["a", "b", "c"], [2, 1, 1])})
+
+    policy = _policy(_reply_for, immigrants=2, max_events=2, every=1,
+                     min_rows=1)
+    _revise(policy, rows=FRONT_ROWS, charges=4)
+    _revise(policy, rows=FRONT_ROWS + ROWS, charges=16)
+
+    counts = [line for prompt in policy.prompts
+              for line in prompt.split("\n") if "ALREADY MEASURED" in line]
+    assert len(counts) == 2 and counts[0] != counts[1], (
+        f"the measured count did not track the run's own rows: {counts}"
+    )
+    assert "ALREADY MEASURED 4" in counts[0]
+    assert "ALREADY MEASURED 7" in counts[1]
+    for prompt in policy.prompts:
+        assert '{"immigrants": [{"<parameter>": <value>, ...}]}' in prompt, (
+            "the novelty wording changed the reply shape the clause asks for"
+        )
 
 
 # --- u9d: the focused tilt, asked for and metered ---------------------------

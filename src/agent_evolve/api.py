@@ -37,11 +37,55 @@ Proposer = Literal["auto", "llm", "random"]
 
 #: Who turns a screen's evidence into a sampling prior. The llm forms fall
 #: back to their rule comparator -- out loud -- when no model call is possible.
-_PRIORS = ("rule", "rule-weighted", "llm", "llm-weighted")
+_PRIORS = ("rule", "rule-weighted", "llm", "llm-weighted",
+           "llm-weighted-committed")
 
 #: Candidates proposed per generation. The budget decides how many generations
 #: that buys, so the caller states the number they know and not this one.
 _BATCH = 8
+
+#: The largest budget any SEALED row was measured at. At or below it the
+#: genetic sizing is a control arm and may not move; above it there is nothing
+#: to hold still. A constant rather than a knob, because a knob is a way to
+#: move a sealed arm by accident.
+_SEALED_BUDGET_CEILING = 384
+
+
+def _genetic_sizing(budget: int) -> tuple[int, int]:
+    """``(population, offspring per generation)``, from the budget alone.
+
+    Sized from the BUDGET, not from how many seeds the caller happened to
+    supply: one seed would otherwise give a population of two, which cannot
+    recombine into anything its parents do not already contain.
+
+    Two regimes, and the split is measured rather than tasteful.
+
+    Up to ``_SEALED_BUDGET_CEILING`` the population is the old expression --
+    capped at twelve, floored at four -- written here as the literal branch so
+    that every budget a sealed row was measured at runs the arithmetic it was
+    measured with. The byte fossil and the sizing table both pin it.
+
+    Above that ceiling the cap was a THROTTLE. At B = 2000 twelve members
+    converge long before the budget is gone: late generations propose
+    recombinations the population already holds, those hit the evaluation
+    cache, and the generation count -- which is a cap on generations, not on
+    charges -- runs out with the budget unspent. Measured, six of six cheap
+    cells spent 969 to 1212 of 2000 charges while the uniform comparator spent
+    1696 to 1842, so the matched-budget comparison was decided by how much each
+    arm could spend and not by how well it was guided; on recall per
+    EVALUATION the same cells read at parity or better. So the population
+    grows with the budget (one member per 32 charges, floored at the old cap of
+    twelve and ceilinged at 64, where the per-generation selection cost starts
+    to be the thing being paid for) and the offspring count follows it. The
+    generations formula is untouched: it divides by the offspring count and
+    adapts on its own.
+    """
+
+    if int(budget) > _SEALED_BUDGET_CEILING:
+        pop = min(64, max(12, int(budget) // 32))
+        return pop, pop - 2
+    pop = max(4, min(budget // 4, 12))
+    return pop, max(2, pop - 2)
 
 
 def _describe(problem: Any) -> str:
@@ -275,7 +319,9 @@ def optimize(
     and ``0`` -- the literal pre-sentinel defaults, so the credential-free path
     stays byte-identical -- and with one, to ``"llm-weighted"`` and a screen
     sized from the budget, announced through *on_progress* rather than picked
-    silently.
+    silently. ``"llm-weighted-committed"`` is the tuning-round variant under
+    measurement: ``"llm-weighted"`` with the prompt's leave-a-locus-free
+    caution swapped for evidence-proportional commitment.
 
     *chooser* names who picks parents and cut points inside a generation, and
     defaults to ``"off"``. ``"llm"`` buys the per-offspring chooser, which is
@@ -508,14 +554,14 @@ def optimize(
                 from agent_evolve.policies.weighted_prior import (
                     statistical_weighted_prior)
                 prior_proposer = statistical_weighted_prior
-            elif prior in ("llm", "llm-weighted"):
+            elif prior in ("llm", "llm-weighted", "llm-weighted-committed"):
                 if complete is None:
                     announce(
                         f"prior={prior!r} needs a model call and none is "
                         "available; using the credential-free rule comparator "
                         "instead."
                     )
-                    if prior == "llm-weighted":
+                    if prior != "llm":
                         from agent_evolve.policies.weighted_prior import (
                             statistical_weighted_prior)
                         prior_proposer = statistical_weighted_prior
@@ -529,9 +575,14 @@ def optimize(
                     from agent_evolve.policies.semantics import domain_card
                     from agent_evolve.policies.weighted_prior import (
                         llm_weighted_prior_proposer)
+                    # The two model-weighted forms differ by ONE clause of the
+                    # prompt; everything downstream of the reply is shared.
                     prior_proposer = llm_weighted_prior_proposer(
                         complete, objectives=list(bound.objectives),
-                        domain_context=domain_card(bound))
+                        domain_context=domain_card(bound),
+                        style=("committed"
+                               if prior == "llm-weighted-committed"
+                               else "cautious"))
 
             if authorship_config is None:
                 if complete is not None:
@@ -546,12 +597,10 @@ def optimize(
                         "authorship='off' to disable.")
                 else:
                     authorship_config = AuthorshipConfig()
-            # Sized from the BUDGET, not from how many seeds the caller
-            # happened to supply: one seed would otherwise give a population
-            # of two, which cannot recombine into anything its parents do not
-            # already contain.
-            pop = max(4, min(budget // 4, 12))
-            offspring = max(2, pop - 2)
+            # One rule, stated once, in `_genetic_sizing`: the sealed
+            # expression at and below the sealed ceiling, a population that
+            # grows with the budget above it.
+            pop, offspring = _genetic_sizing(budget)
 
             from agent_evolve.policies.semantics import domain_card
             from agent_evolve.session.authorship import build_authorship

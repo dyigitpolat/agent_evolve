@@ -244,6 +244,16 @@ Rules, and the harness checks every one of them:
 #: six-field NAS venue was sometimes answered. Optionality, not capability,
 #: was suppressing it -- so the clause states a count, and the harness meters
 #: the answer instead of refusing over it.
+#:
+#: The novelty half is the SECOND thing the live measurement forced. Required,
+#: the clause was answered on schedule -- twelve proposals per cell -- and
+#: accepted 0 of 69: at roughly 320 measured rows, a recombination of the
+#: elites the occupancy table shows is usually a configuration the run has
+#: already charged, and the dedup drops it. "Never repeats" was already in the
+#: prose; what was missing was the GROUND for it, because the model cannot
+#: count rows it was shown a digest of. So the clause now states how many
+#: configurations the run has measured and what a repeat costs. Nothing about
+#: admission moved: a repeat is still dropped, and the drop is still counted.
 IMMIGRANTS_CLAUSE = """
 Your reply MUST also carry an "immigrants" key holding EXACTLY {m} COMPLETE
 configurations worth measuring next -- recombinations or refinements of what
@@ -253,6 +263,13 @@ belong TOGETHER; these {m} are where you say it. Every parameter present,
 every value from that parameter's declared domain:
 
 {{"immigrants": [{{"<parameter>": <value>, ...}}]}}
+
+NOVELTY IS THE POINT: this run has ALREADY MEASURED {measured}
+configurations, and the evidence above is drawn from them. A proposal that
+repeats one of those {measured} is REJECTED without being measured and WASTES
+the slot it took. Every one of the {m} must differ from every configuration
+this run has measured, in at least one parameter -- recombine what the front
+rewards into a joint setting the trace does not already contain.
 """
 
 #: How many parameters one reply is ASKED to name in ``"weights"``. Not a
@@ -636,8 +653,14 @@ class Reguidance:
         return f"{measured}\n\n  {ELITE_TABLE_TITLE}:\n{elite}"
 
     def _prompt(self, evidence: str, note: Mapping[str, Any]) -> str:
+        # The novelty ground is the run's OWN row count -- the same number the
+        # prompt states above the evidence -- because that is the count the
+        # dedup the proposals will meet actually holds. A view arm changes
+        # which rows are RENDERED, never how many the run has measured, so the
+        # two arms are asked for novelty against the same standard.
         clause = ("" if self.immigrants <= 0
-                  else IMMIGRANTS_CLAUSE.format(m=self.immigrants))
+                  else IMMIGRANTS_CLAUSE.format(m=self.immigrants,
+                                                measured=int(note["rows"])))
         return PROMPT.format(
             context=self.domain_context.strip(),
             goals="\n".join(f"  {s.name}: {s.goal}imise" for s in self.objectives),
@@ -926,8 +949,22 @@ class Reguidance:
             accepted.append(dict(member))
         shortfall = max(0, self.immigrants - len(provided))
         self.telemetry.immigrants_shortfall += shortfall
+        # WHY the channel bought nothing, per event, in one line. The rejection
+        # list already carried the reason on each member; the split is what a
+        # campaign reads, because the three reasons name three different
+        # failures and one aggregate count names none of them. A member the run
+        # has already charged (``already_measured``) says the ask needs more
+        # novelty ground -- the live 0-of-69 signature; ``out_of_domain`` says
+        # the model misread a declared vocabulary; ``shape`` says it wrote
+        # something that is not a configuration of this schema at all. Sparse
+        # by construction: a reason that never fired is absent, not zero.
+        by_reason: Dict[str, int] = {}
+        for entry in rejected:
+            reason = entry["reason"]
+            by_reason[reason] = by_reason.get(reason, 0) + 1
         note["immigrants"] = {"accepted": len(accepted),
                               "rejected": rejected,
+                              "rejected_by_reason": by_reason,
                               "proposed": len(provided),
                               "required": self.immigrants,
                               "shortfall": shortfall}

@@ -18,6 +18,8 @@ from agent_evolve.policies.genetic import (
 )
 from agent_evolve.policies.structure import attribute, crossed_screen
 from agent_evolve.policies.weighted_prior import (
+    COMMITTED_PROMPT,
+    PROMPT,
     WeightedPriorTelemetry,
     WeightedRestriction,
     llm_weighted_prior_proposer,
@@ -239,6 +241,104 @@ def test_a_provider_error_is_counted_and_never_raised():
     prior = llm_weighted_prior_proposer(
         boom, objectives=SPECS, telemetry=tel)(_and_attr(), Arch)
     assert prior.weighted == {} and tel.errors == 1
+
+
+# --- the two closing clauses: the shipped one, and the committed variant ----
+
+#: The shipped prompt, copied out literally. Every sealed prior row was
+#: measured under these bytes; a variant that edits them instead of adding
+#: itself beside them would silently redefine the arm it is compared against.
+CAUTIOUS_PROMPT_TODAY = """The search has spent {n} evaluations on a screening design.
+
+OBJECTIVES: {goals}
+
+SEARCH SPACE (declared domains):
+{schema}
+
+SCREEN EVIDENCE (per locus value, within-screen):
+{screen}
+
+Read the table as evidence about THIS evaluator. It may or may not match how
+such problems usually behave; where they disagree, the table wins.
+
+Propose a WEIGHTED sampling prior. For any locus the evidence (or the
+parameter's meaning) separates, list the values worth sampling and a
+non-negative weight for each: higher weight, more draws. A value you omit gets
+weight zero and is not sampled; a locus you omit stays free. You are not
+choosing a candidate and must not propose one. Over-restricting a
+frontier-spreading parameter destroys diversity: leave a locus free unless you
+have a reason.
+
+Reply with ONLY this JSON shape and no other text:
+{{"weights": {{"<param>": {{"values": [...], "weights": [...]}}}}, "free": ["<param>", ...]}}"""
+
+
+def test_the_cautious_prompt_has_not_moved_by_one_character():
+    assert PROMPT == CAUTIOUS_PROMPT_TODAY
+
+
+def test_cautious_is_the_default_and_renders_the_same_bytes():
+    seen: list[str] = []
+
+    def capture(prompt):
+        seen.append(prompt)
+        return json.dumps({"weights": {}, "free": ["width"]})
+
+    attr = _and_attr()
+    llm_weighted_prior_proposer(capture, objectives=SPECS)(attr, Arch)
+    llm_weighted_prior_proposer(
+        capture, objectives=SPECS, style="cautious")(attr, Arch)
+    assert seen[0] == seen[1], "naming the default must not change the ask"
+
+
+def test_the_committed_variant_swaps_the_closing_clause_and_nothing_else():
+    head = "choosing a candidate and must not propose one. "
+    tail = "\n\nReply with ONLY this JSON shape"
+    assert COMMITTED_PROMPT.split(head)[0] == PROMPT.split(head)[0]
+    assert (COMMITTED_PROMPT[COMMITTED_PROMPT.index(tail):]
+            == PROMPT[PROMPT.index(tail):])
+    # the caution is gone, and what replaced it asks for commitment
+    assert "leave a locus free unless you" not in COMMITTED_PROMPT
+    assert "Over-restricting" not in COMMITTED_PROMPT
+    assert "give weights proportional to that evidence" in COMMITTED_PROMPT
+    assert "hedging every parameter as free discards the screen" in (
+        COMMITTED_PROMPT)
+
+
+def test_the_committed_style_is_what_the_run_actually_sends():
+    seen: list[str] = []
+
+    def capture(prompt):
+        seen.append(prompt)
+        return json.dumps(
+            {"weights": {"width": {"values": [8, 16], "weights": [3, 1]}}})
+
+    propose = llm_weighted_prior_proposer(
+        capture, objectives=SPECS, style="committed")
+    prior = propose(_and_attr(), Arch)
+    assert "hedging every parameter as free" in seen[0]
+    assert "leave a locus free unless you" not in seen[0]
+    # the screen still reaches the model, and the parse is the shared one
+    assert "non-dominated" in seen[0] and "must not propose one" in seen[0]
+    assert prior.weighted["width"] == ((8, 16), (3.0, 1.0))
+    assert propose.style == "committed"
+
+
+def test_the_committed_style_validates_a_reply_exactly_as_the_cautious_one():
+    reply = json.dumps(
+        {"weights": {"width": {"values": [8, 32], "weights": [1, 1]}}})
+    for style in ("cautious", "committed"):
+        tel = WeightedPriorTelemetry()
+        prior = llm_weighted_prior_proposer(
+            lambda _p: reply, objectives=SPECS, telemetry=tel,
+            style=style)(_and_attr(), Arch)
+        assert prior.weighted == {} and tel.out_of_domain == 1, style
+
+
+def test_an_unknown_prior_style_is_refused_by_name():
+    with pytest.raises(ValueError, match="style"):
+        llm_weighted_prior_proposer(
+            lambda _p: "{}", objectives=SPECS, style="hedged")
 
 
 def test_the_prompt_carries_the_screen_and_never_asks_for_a_candidate():

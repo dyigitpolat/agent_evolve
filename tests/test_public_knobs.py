@@ -81,6 +81,35 @@ def test_llm_priors_without_a_credential_fall_back_out_loud():
     )
 
 
+def test_the_committed_prior_variant_is_reachable_and_falls_back_out_loud():
+    said: list[str] = []
+    optimize(CliProblem(), budget=12, seed=4, structure_budget=4,
+             prior="llm-weighted-committed", on_progress=said.append)
+    assert any("rule" in m for m in said), (
+        "the fallback from the committed model prior to the rule was silent"
+    )
+
+
+def test_the_committed_prior_variant_sends_the_committed_clause(monkeypatch):
+    seen: list[str] = []
+
+    def _canned(model, settings=None, **kwargs):
+        def complete(prompt):
+            seen.append(prompt)
+            return json.dumps(
+                {"weights": {"width": {"values": [8, 16], "weights": [3, 1]}}})
+        return complete
+
+    monkeypatch.setattr(
+        "agent_evolve.integrations.completion.completion_for", _canned)
+    optimize(CliProblem(), budget=16, seed=5, structure_budget=4,
+             prior="llm-weighted-committed", proposer="llm")
+    priors = [p for p in seen if "WEIGHTED sampling prior" in p]
+    assert priors, "the prior seat was never asked"
+    assert all("hedging every parameter as free" in p for p in priors)
+    assert not any("leave a locus free unless you" in p for p in priors)
+
+
 def test_bad_knob_values_are_rejected_by_name():
     with pytest.raises(ValueError, match="prior"):
         optimize(CliProblem(), budget=8, prior="nonsense")

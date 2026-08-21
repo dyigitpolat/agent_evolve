@@ -20,6 +20,7 @@ __all__ = ["AuthorshipConfig", "AuthorshipPolicies", "PRESETS",
 _SURROGATE = ("off", "rule", "llm")
 _OPERATORS = ("off", "rule", "llm")
 _INITIALIZATION = ("off", "llm")
+_INIT_STYLE = ("joint", "split")
 _GENERATION = ("off", "llm")
 _ADAPTATION = ("off", "llm")
 
@@ -69,6 +70,17 @@ class AuthorshipConfig:
     surrogate: str = "off"
     operators: str = "off"
     initialization: str = "off"
+    #: WHAT the one initialization call asks for. ``"joint"`` -- the default
+    #: and every sealed row -- asks for one list that is individually strong
+    #: AND collectively diverse. ``"split"`` asks the same call for two
+    #: labelled halves, ``(k + 1) // 2`` strongest individual bets and the
+    #: rest coverage, which is the tuning round's answer to a measured
+    #: conflation: with one ask, deliberation buys diversity and the pool
+    #: median pays (reasoning effort ``none`` beat ``medium`` on 23 of 24
+    #: paired seeds), so effort had no clean channel into exploitation. The
+    #: halves are labelled in the init telemetry, so the exploit subset can be
+    #: scored on its own. See policies.llm_init.
+    init_style: str = "joint"
     generation: str = "off"
     pool_factor: int = 4
     exploration_floor: float = 0.25
@@ -225,6 +237,20 @@ class AuthorshipConfig:
             raise ValueError(
                 f"authorship.initialization must be one of {_INITIALIZATION}, "
                 f"got {self.initialization!r}"
+            )
+        if self.init_style not in _INIT_STYLE:
+            raise ValueError(
+                f"authorship.init_style must be one of {_INIT_STYLE}, got "
+                f"{self.init_style!r}"
+            )
+        if self.init_style != "joint" and self.initialization == "off":
+            # The same rule the adaptation knobs follow: a setting nothing
+            # reads is a campaign reporting something it never bought.
+            raise ValueError(
+                f"authorship.init_style={self.init_style!r} shapes the ask the "
+                "model-proposed initial population is authored from and this "
+                "run has authorship.initialization='off'; set "
+                "initialization='llm' or drop the setting"
             )
         if self.operators not in _OPERATORS:
             raise ValueError(
@@ -488,9 +514,16 @@ def _build_initialization(config, complete, schema_text, say,
         say("authorship.initialization='llm' received no template/size; "
             "initialization stays schema-uniform.")
         return (), note
+    if config.init_style != "joint":
+        k_exploit = (int(k) + 1) // 2
+        say(f"authorship.init_style='{config.init_style}': the one "
+            f"initialization call asks for {k_exploit} strongest individual "
+            f"bets and {int(k) - k_exploit} coverage members, labelled, "
+            "instead of one strong-and-diverse list.")
     proposals = author_initial_population(
         complete, candidate_model=candidate_model, template=dict(template),
-        k=int(k), domain_context=schema_text, telemetry=telemetry)
+        k=int(k), domain_context=schema_text, telemetry=telemetry,
+        style=config.init_style)
     if not proposals:
         say("the model proposed no usable initial members; initialization "
             "stays schema-uniform.")

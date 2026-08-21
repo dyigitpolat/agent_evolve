@@ -41,7 +41,12 @@ __all__ = [
     "WeightedPriorTelemetry",
     "llm_weighted_prior_proposer",
     "PROMPT",
+    "COMMITTED_PROMPT",
+    "PRIOR_STYLES",
 ]
+
+#: How the prompt's last instruction reads. See :data:`COMMITTED_PROMPT`.
+PRIOR_STYLES = ("cautious", "committed")
 
 
 @dataclass(frozen=True)
@@ -211,7 +216,7 @@ class WeightedPriorTelemetry:
         }
 
 
-PROMPT = """The search has spent {n} evaluations on a screening design.
+_PROMPT_BODY = """The search has spent {n} evaluations on a screening design.
 
 OBJECTIVES: {goals}
 
@@ -228,12 +233,36 @@ Propose a WEIGHTED sampling prior. For any locus the evidence (or the
 parameter's meaning) separates, list the values worth sampling and a
 non-negative weight for each: higher weight, more draws. A value you omit gets
 weight zero and is not sampled; a locus you omit stays free. You are not
-choosing a candidate and must not propose one. Over-restricting a
-frontier-spreading parameter destroys diversity: leave a locus free unless you
-have a reason.
+choosing a candidate and must not propose one. {closing}
 
 Reply with ONLY this JSON shape and no other text:
 {{"weights": {{"<param>": {{"values": [...], "weights": [...]}}}}, "free": ["<param>", ...]}}"""
+
+_CAUTIOUS_CLOSE = (
+    "Over-restricting a\nfrontier-spreading parameter destroys diversity: "
+    "leave a locus free unless you\nhave a reason."
+)
+
+_COMMITTED_CLOSE = (
+    "Commit: for every parameter this\nscreen's evidence separates, give "
+    "weights proportional to that evidence.\nList a parameter as free ONLY "
+    "when the evidence genuinely does not separate\nits values; hedging every "
+    "parameter as free discards the screen this run\npaid for."
+)
+
+#: The shipped prompt, and every sealed row's: the caution clause asks for a
+#: locus to be left free unless there is a reason to bind it.
+PROMPT = _PROMPT_BODY.replace("{closing}", _CAUTIOUS_CLOSE)
+
+#: The same prompt with that one clause swapped for its opposite instruction.
+#: The tuning round's target is a measured phenotype, not a taste: the terra
+#: tier obeys the caution clause most literally -- the flattest weight ratios
+#: of the three tiers (1.82 against luna's 2.67 and sol's 4.0) and a median of
+#: five parameters listed free where the others list none -- and it costs that
+#: tier at the endpoint (4 of 6 paired seeds). Everything else about the
+#: prompt, the reply shape, and the validation is identical, so the arm
+#: measures the clause and nothing else.
+COMMITTED_PROMPT = _PROMPT_BODY.replace("{closing}", _COMMITTED_CLOSE)
 
 
 def llm_weighted_prior_proposer(
@@ -242,6 +271,7 @@ def llm_weighted_prior_proposer(
     objectives: Sequence[ObjectiveSpec],
     telemetry: WeightedPriorTelemetry | None = None,
     domain_context: str = "",
+    style: str = "cautious",
 ) -> Callable[[Attribution, Any], WeightedRestriction]:
     """A prior proposer that elicits a GRADED prior and repairs nothing.
 
@@ -252,10 +282,21 @@ def llm_weighted_prior_proposer(
     weighted evenly over its full declared domain is recorded as free, not as
     a restriction; a field weighted UNevenly over the full domain is a real
     graded prior and is kept.
+
+    *style* names which closing instruction the prompt carries -- the shipped
+    ``"cautious"`` clause or the ``"committed"`` one (see
+    :data:`COMMITTED_PROMPT`). It changes the prompt's last sentence and
+    nothing else: same reply shape, same parse, same validation, so the two
+    arms differ by the clause alone.
     """
 
     from agent_evolve.policies.semantics import objective_lines, parameter_lines
 
+    if style not in PRIOR_STYLES:
+        raise ValueError(
+            f"weighted prior style must be one of {PRIOR_STYLES}, got "
+            f"{style!r}")
+    template = COMMITTED_PROMPT if style == "committed" else PROMPT
     tel = telemetry if telemetry is not None else WeightedPriorTelemetry()
     goals = ", ".join(objective_lines(objectives))
     preamble = f"{domain_context.strip()}\n\n" if domain_context.strip() else ""
@@ -265,7 +306,7 @@ def llm_weighted_prior_proposer(
         if not domains:
             return WeightedRestriction({})
         described = parameter_lines(candidate_model, fields=list(domains))
-        prompt = preamble + PROMPT.format(
+        prompt = preamble + template.format(
             n=attr.n_evaluated,
             goals=goals,
             schema="\n".join(f"  {line}" for line in described)
@@ -347,4 +388,7 @@ def llm_weighted_prior_proposer(
     propose.telemetry = tel                    # type: ignore[attr-defined]
     propose.mechanism = "weighted_prior"       # type: ignore[attr-defined]
     propose.authored_by = "llm"                # type: ignore[attr-defined]
+    # Which clause this arm bought, readable off the proposer: an arm that
+    # cannot say which prompt it ran is not an arm.
+    propose.style = style                      # type: ignore[attr-defined]
     return propose
