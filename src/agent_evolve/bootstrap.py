@@ -44,7 +44,7 @@ _register_builtin()
 #: model call with a bare ModuleNotFoundError. Checking here turns that into
 #: one sentence naming the install command.
 _REQUIRES = {
-    "pydantic_ai": ("pydantic_ai", "agentevolve[llm]"),
+    "pydantic_ai": ("pydantic_ai", "agentevolve-optimizer[llm]"),
 }
 
 
@@ -104,5 +104,5 @@ def explain_missing_harness(harness_id: str) -> str:
     reasons = "; ".join(f"{name} failed to load ({why})" for name, why in load_failures.items())
     return (
         f"Unknown proposer {harness_id!r}. Available: {known}. {reasons}. "
-        "Install the optional dependency, e.g. pip install 'agentevolve[llm]'."
+        "Install the optional dependency, e.g. pip install 'agentevolve-optimizer[llm]'."
     )

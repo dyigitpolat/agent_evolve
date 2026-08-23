@@ -69,22 +69,25 @@ def test_version_is_single_sourced_from_the_code(project):
 
 
 def test_the_distribution_name_is_the_unclaimed_spelling(project):
-    """`agent_evolve` normalizes to `agent-evolve` (PEP 503), which is taken
-    on PyPI by an unrelated package -- so that spelling as a DISTRIBUTION
-    name would make the README's own install line fetch someone else's code.
-    The distribution is `agentevolve`; the import stays `agent_evolve`.
-    Checked 2026-08-24 against the live index before the first publish."""
+    """Two PyPI rules bound this name, both hit before the first publish.
+    `agent_evolve` normalizes to `agent-evolve` (PEP 503), which is taken by
+    an unrelated package -- the README's own install line would have fetched
+    someone else's code. And Warehouse's upload-time similarity check strips
+    separators too, so the plain `agentevolve` was refused as too similar to
+    the same squat. The suffix clears the ultranormalized comparison; the
+    import stays `agent_evolve`. Checked 2026-08-24 against the live index
+    and against a live upload attempt."""
 
-    assert project["project"]["name"] == "agentevolve"
+    assert project["project"]["name"] == "agentevolve-optimizer"
 
 
 def test_installed_distribution_version_matches_the_attribute():
     from importlib.metadata import PackageNotFoundError, version
 
     try:
-        installed = version("agentevolve")
+        installed = version("agentevolve-optimizer")
     except PackageNotFoundError:
-        pytest.skip("agentevolve is not installed as a distribution here")
+        pytest.skip("agentevolve-optimizer is not installed as a distribution here")
     assert installed == agent_evolve.__version__, (
         f"distribution metadata says {installed} but agent_evolve.__version__ "
         f"is {agent_evolve.__version__}; reinstall, or stop writing the version "

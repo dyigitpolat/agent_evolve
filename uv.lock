@@ -31,7 +31,7 @@ wheels = [
 ]
 
 [[package]]
-name = "agentevolve"
+name = "agentevolve-optimizer"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },

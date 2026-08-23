@@ -232,7 +232,7 @@ def _llm_refusal_message(*, extra_missing: bool) -> str:
 
     fix = (
         "Install the model path's optional dependencies with: pip install "
-        "'agentevolve[llm]'. Then set OPENROUTER_API_KEY (or "
+        "'agentevolve-optimizer[llm]'. Then set OPENROUTER_API_KEY (or "
         "AGENTEVOLVE_DOTENV naming a file that does)"
         if extra_missing else
         "Set OPENROUTER_API_KEY (or AGENTEVOLVE_DOTENV naming a file that "

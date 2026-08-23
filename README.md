@@ -36,9 +36,9 @@ the other six host nothing are published rather than omitted.
 ## Install
 
 ```bash
-pip install agentevolve                 # core: pydantic + python-dotenv, nothing else
-pip install 'agentevolve[llm]'         # adds the model-driven proposer
-pip install 'agentevolve[pymoo]'       # adds the classical comparator + the swap example
+pip install agentevolve-optimizer              # core: pydantic + python-dotenv, nothing else
+pip install 'agentevolve-optimizer[llm]'         # adds the model-driven proposer
+pip install 'agentevolve-optimizer[pymoo]'       # adds the classical comparator + the swap example
 ```
 
 Python 3.11 or newer. The core install has **two** dependencies, needs no
@@ -440,7 +440,7 @@ Everything above runs without a credential. The model-driven proposer needs one,
 and it is documented separately because it spends money.
 
 ```bash
-pip install 'agentevolve[llm]'
+pip install 'agentevolve-optimizer[llm]'
 export AGENTEVOLVE_DOTENV=/path/to/your/.env      # nothing is loaded unless you name it
 agent_evolve check yourpkg.problem:problem --budget 40
 ```
@@ -531,7 +531,7 @@ still stated before anything is spent.
 ## Tests
 
 ```bash
-pip install 'agentevolve[dev,pymoo]'
+pip install 'agentevolve-optimizer[dev,pymoo]'
 python -m pytest tests/test_public_contract.py           # the shipped surface, ~1 second
 python -m pytest tests/                                  # the package, offline
 python -m pytest tests/ -m research                      # needs the research corpus

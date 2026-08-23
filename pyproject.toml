@@ -7,13 +7,15 @@ requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-# The distribution is `agentevolve`; the import is `agent_evolve`. They
-# differ because PEP 503 normalizes `agent_evolve` to `agent-evolve`, which
-# is already taken on PyPI by an unrelated package -- so the underscore
-# spelling as a DISTRIBUTION name would make `pip install agent_evolve`
-# fetch someone else's code. Found by checking the index before the first
-# publish; a test pins this name so it cannot drift back.
-name = "agentevolve"
+# The distribution is `agentevolve-optimizer`; the import is `agent_evolve`.
+# They differ because of two PyPI rules, both hit before the first publish:
+# PEP 503 normalizes `agent_evolve` to `agent-evolve`, which is taken by an
+# unrelated package -- so the underscore spelling would make `pip install
+# agent_evolve` fetch someone else's code -- and Warehouse's upload-time
+# similarity check ALSO strips separators, so the plain `agentevolve` was
+# refused as "too similar" to that same squat. The suffix is what clears
+# the ultranormalized comparison. A test pins this name so it cannot drift.
+name = "agentevolve-optimizer"
 # Single-sourced from the code, which is the SSOT. Two literals drift, and this
 # one already had: the wheel metadata and `agent_evolve.__version__` disagreed
 # for a release cycle, so `agent_evolve version` printed a number no source file
@@ -56,7 +58,7 @@ dependencies = [
 # SUPPORTED_PYDANTIC_CORE_VERSION and *fails closed* on anything else, because
 # the recorded provider boundary has to replay bit-exactly for a sealed run to
 # mean anything. Declaring a range the code refuses to honour is worse than
-# pinning: a clean `pip install 'agent_evolve[llm]'` resolved pydantic-ai
+# pinning: a clean `pip install 'agentevolve-optimizer[llm]'` resolved pydantic-ai
 # 1.107.5 and 27 boundary-codec tests failed closed on first run. The metadata
 # now says what the code supports. `tests/test_packaging_metadata.py` asserts
 # these pins equal the constants, so widening one without the other is a test

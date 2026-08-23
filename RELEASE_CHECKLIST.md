@@ -226,17 +226,25 @@ Everything below was verified by running it on this tree, after the
 mechanism-v3 and tuning-knob commits that postdate the first cut of this
 checklist.
 
-- [x] **The distribution is `agentevolve`, and that is a supply-chain fix.**
-      `agent_evolve` PEP-503-normalizes to `agent-evolve`, which is TAKEN on
-      PyPI by an unrelated third-party package — so every install line the
-      README ever suggested would have fetched someone else's code. Found by
-      checking the live index before the first publish; the free spelling
-      `agentevolve` (the project's own name) is pinned by
+- [x] **The distribution is `agentevolve-optimizer`, and that is a
+      supply-chain fix — settled by two PyPI rules, the second found by a
+      live upload.** `agent_evolve` PEP-503-normalizes to `agent-evolve`,
+      TAKEN by an unrelated package — every install line the README ever
+      suggested would have fetched someone else's code. The obvious repair,
+      plain `agentevolve`, was then refused at upload time: Warehouse's
+      similarity check strips separators before comparing, so a name
+      differing from a squat only by an underscore's absence is "too similar
+      to an existing project" by rule (owner-observed on the real upload,
+      2026-08-24). The suffix clears the ultranormalized comparison; the
+      owner chose `-optimizer`. Pinned with the full rationale by
       `tests/test_packaging_metadata.py::test_the_distribution_name_is_the_unclaimed_spelling`.
       The IMPORT stays `agent_evolve`; the console script stays
       `agent_evolve`; only `pip install` changes, and every install line in
-      README, the pymoo-swap README, `bootstrap`'s hints and the CI stranger
-      grep now carries the new spelling.
+      README, the pymoo-swap README, `bootstrap`'s hints, the refusal
+      message and the CI stranger grep carries the final spelling. Artifacts
+      rebuilt (`agentevolve_optimizer-0.5.0` wheel + sdist, twine PASSED),
+      wheel re-smoked in a clean venv, `uv.lock` regenerated, tag moved
+      (local-only, never pushed).
 - [x] **The stranger's refusal names every fix that applies.** On a core
       install with no credential, `--proposer llm` names the extra
       (`pip install 'agentevolve[llm]'`) AND the credential AND the
@@ -276,9 +284,12 @@ checklist.
 - [ ] `git push origin main` (and the tag: `git push origin v0.5.0`).
 - [ ] `git push origin release/v0.4-sweep` — the sealed-substrate branch the
       paper cites; local-only until pushed.
-- [ ] PyPI: create the `agentevolve` project (first upload claims the name —
-      do this soon; the collision this release dodged is exactly how the old
-      name was lost) and `twine upload dist/*` — or wire trusted publishing
-      to the GitHub repo and cut a GitHub release from the tag.
+- [ ] PyPI: `twine upload dist/*` publishes `agentevolve-optimizer` (first
+      upload claims it — do this soon) — or wire trusted publishing to the
+      GitHub repo and cut a GitHub release from the tag. In parallel and
+      without blocking anything: a PEP 541 name-transfer request against the
+      squatted `agent-evolve` (placeholder URLs, single release) can be
+      filed at github.com/pypi/support; if it ever succeeds, `agentevolve`
+      can become an alias later.
 - [ ] GitHub release notes: the 0.5.0 CHANGELOG section is written to be
       pasted.

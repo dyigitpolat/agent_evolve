@@ -8,17 +8,20 @@ bounded number. Both were written down in `PACKAGING_TODO.md` §6 as known and
 unfixed. Both are fixed here, and the second one moves the substrate under the
 search — which is stated rather than absorbed.
 
-### Changed — the distribution is named `agentevolve`, and why that is a fix
+### Changed — the distribution is named `agentevolve-optimizer`, and why that is a fix
 
 The metadata said `name = "agent_evolve"`, which PEP 503 normalizes to
 `agent-evolve` — and that name is **already taken on PyPI** by an unrelated
 third-party package. Every install line this README has ever suggested
 (`pip install agent_evolve`) therefore resolved to **someone else's code**:
 not a hypothetical, a supply-chain footgun, found by checking the index
-before the first publish rather than after. The distribution is now
-**`agentevolve`** (free, and the project's own name as it has always been
-written); the import is `agent_evolve` exactly as before, so no user code
-changes. `agent_evolve version` and the packaging tests read the new
+before the first publish rather than after. And the obvious repair — the plain
+**`agentevolve`** — was then refused by the index itself: Warehouse's
+upload-time similarity check strips separators before comparing, so a name
+that differs from a squat only by an underscore or its absence is "too
+similar to an existing project" by rule. The distribution is therefore
+**`agentevolve-optimizer`** — the brand plus what the tool is; the import is
+`agent_evolve` exactly as before, so no user code changes. `agent_evolve version` and the packaging tests read the new
 distribution name, and the install hints in `bootstrap` name the new extra
 spellings.
 

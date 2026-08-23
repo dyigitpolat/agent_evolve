@@ -299,8 +299,8 @@ def test_the_refusal_names_the_extra_exactly_when_it_is_missing():
 
     missing = _llm_refusal_message(extra_missing=True)
     present = _llm_refusal_message(extra_missing=False)
-    assert "agentevolve[llm]" in missing
-    assert "agentevolve[llm]" not in present
+    assert "agentevolve-optimizer[llm]" in missing
+    assert "agentevolve-optimizer[llm]" not in present
     for message in (missing, present):
         assert "OPENROUTER_API_KEY" in message
         assert "proposer='random'" in message

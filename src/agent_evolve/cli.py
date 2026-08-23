@@ -606,7 +606,7 @@ def _cmd_version(_args: argparse.Namespace) -> int:
         from importlib.metadata import version
 
         # The DISTRIBUTION name; the import stays agent_evolve. See pyproject.
-        print(version("agentevolve"))
+        print(version("agentevolve-optimizer"))
     except Exception:
         print("unknown (not installed as a distribution)")
     return 0

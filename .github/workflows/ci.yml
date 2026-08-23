@@ -82,7 +82,7 @@ jobs:
           cd /tmp/stranger
           env -i PATH=/usr/bin:/bin HOME=/tmp \
             /tmp/clean/bin/agent_evolve run myproblem:problem --budget 8 --proposer llm 2>&1 \
-            | grep -q "agentevolve\[llm\]" \
+            | grep -q "agentevolve-optimizer\[llm\]" \
             && echo "actionable" \
             || (echo "the failure did not name the fix"; exit 1)
 
