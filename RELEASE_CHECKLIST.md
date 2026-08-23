@@ -281,15 +281,23 @@ checklist.
 
 ## Owner actions — the complete remaining distance
 
-- [ ] `git push origin main` (and the tag: `git push origin v0.5.0`).
+- [ ] `git push origin main`, then `git push origin v0.5.0` — the tag push
+      is the publish trigger.
 - [ ] `git push origin release/v0.4-sweep` — the sealed-substrate branch the
       paper cites; local-only until pushed.
-- [ ] PyPI: `twine upload dist/*` publishes `agentevolve-optimizer` (first
-      upload claims it — do this soon) — or wire trusted publishing to the
-      GitHub repo and cut a GitHub release from the tag. In parallel and
-      without blocking anything: a PEP 541 name-transfer request against the
-      squatted `agent-evolve` (placeholder URLs, single release) can be
-      filed at github.com/pypi/support; if it ever succeeds, `agentevolve`
-      can become an alias later.
+- [ ] PyPI, via the pending Trusted Publisher the owner already registered
+      (2026-08-24): verify its four fields read exactly `agentevolve-optimizer`
+      / `dyigitpolat` / `agent_evolve` / `publish.yml`, with environment
+      `pypi` (pending publishers are freely editable until first use). Then
+      the two pushes below make the release: the tag-push runs
+      `.github/workflows/publish.yml`, whose first successful OIDC upload is
+      what CREATES the project. No token exists anywhere in this flow. A
+      `twine upload` with an API token also works but would create the
+      project OUTSIDE the pending publisher, invalidating it — if that path
+      is ever taken, re-add the publisher afterward under the project's own
+      settings. In parallel and without blocking anything: a PEP 541
+      name-transfer request against the squatted `agent-evolve` (placeholder
+      URLs, single release) can be filed at github.com/pypi/support; if it
+      ever succeeds, `agentevolve` can become an alias later.
 - [ ] GitHub release notes: the 0.5.0 CHANGELOG section is written to be
       pasted.

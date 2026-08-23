@@ -1,0 +1,48 @@
+# Publish to PyPI via Trusted Publishing (OIDC). No token lives anywhere:
+# PyPI's pending publisher for `agentevolve-optimizer` names this repository
+# and THIS FILE, and the first successful run from here is what creates the
+# project. The fields on the PyPI side must read exactly:
+#   owner dyigitpolat / repository agent_evolve / workflow publish.yml /
+#   environment pypi
+# -- a mismatch in any one of them is a refused upload, not a queued one.
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+  # The escape hatch for a re-run without re-tagging. It publishes whatever
+  # the chosen ref builds, so the version guard below is what keeps a manual
+  # run honest.
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: build and publish
+    runs-on: ubuntu-latest
+    # Referenced here and auto-created on first run. Scoping the OIDC grant
+    # to an environment means a workflow edited on a branch cannot publish:
+    # only this job, on this environment, holds the identity PyPI trusts.
+    environment: pypi
+    permissions:
+      id-token: write        # the whole credential story; nothing else is one
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - name: The tag is the version, or nothing ships
+        # A tag pointing at a tree whose __version__ disagrees would publish
+        # a release whose name lies about its contents. workflow_dispatch has
+        # no tag; it must still name a version that exists in the tree.
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          CODE=$(python -c "import sys; sys.path.insert(0, 'src'); import agent_evolve; print(agent_evolve.__version__)")
+          test "$TAG" = "$CODE" || {
+            echo "tag v$TAG but agent_evolve.__version__ is $CODE"; exit 1; }
+      - name: Build from the tagged tree
+        run: python -I -m build
+      - name: Publish (OIDC; metadata checked by the action)
+        uses: pypa/gh-action-pypi-publish@release/v1
