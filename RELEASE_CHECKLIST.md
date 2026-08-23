@@ -219,3 +219,66 @@ decision was made.
       Confirm it is the intended signal for a first public cut.
 - [ ] **The paper's venue**, and with it the "available at" sentence, which
       becomes writable only once the branches above are pushed.
+
+## Finalization pass — 2026-08-24 (this working tree, ready to tag)
+
+Everything below was verified by running it on this tree, after the
+mechanism-v3 and tuning-knob commits that postdate the first cut of this
+checklist.
+
+- [x] **The distribution is `agentevolve`, and that is a supply-chain fix.**
+      `agent_evolve` PEP-503-normalizes to `agent-evolve`, which is TAKEN on
+      PyPI by an unrelated third-party package — so every install line the
+      README ever suggested would have fetched someone else's code. Found by
+      checking the live index before the first publish; the free spelling
+      `agentevolve` (the project's own name) is pinned by
+      `tests/test_packaging_metadata.py::test_the_distribution_name_is_the_unclaimed_spelling`.
+      The IMPORT stays `agent_evolve`; the console script stays
+      `agent_evolve`; only `pip install` changes, and every install line in
+      README, the pymoo-swap README, `bootstrap`'s hints and the CI stranger
+      grep now carries the new spelling.
+- [x] **The stranger's refusal names every fix that applies.** On a core
+      install with no credential, `--proposer llm` names the extra
+      (`pip install 'agentevolve[llm]'`) AND the credential AND the
+      credential-free way out; with the extra present it does not tell you to
+      reinstall it. `api._llm_refusal_message`, both renderings unit-tested;
+      the CI stranger job's grep is the behavioral gate and passes.
+- [x] **CHANGELOG is complete through the tree being tagged**: the rename,
+      mechanism v3 (with its re-pilot verdicts), and the four tuning knobs
+      (each carrying its measured pilot read, including the negative ones) —
+      and the 0.5.0 section is dated.
+- [x] **`uv.lock` regenerated** at the renamed distribution (dev-only; not in
+      the sdist).
+- [x] **Clean build from an empty `dist/`**: `agentevolve-0.5.0-py3-none-any.whl`
+      + `agentevolve-0.5.0.tar.gz`, zero warnings, `twine check` PASSED on
+      both.
+- [x] **Wheel smoke in a clean venv** (the stranger's path, scripted):
+      `agent_evolve version` → 0.5.0; import name unchanged; `init` scaffold
+      writes and refuses overwrite; five-obligation problem defined from
+      scratch optimizes offline; explicit-llm-without-credential refuses
+      loudly naming the fixes; `[pymoo]` extra installs and the swap runs.
+- [x] **Full offline suite green at the release state** (see the final commit
+      message for the count), including the new name-pin and refusal-message
+      tests.
+- [x] **CI matrix state, honestly**: `stranger` PASSES after the refusal fix;
+      the two remaining local-runner reds are pre-existing and named —
+      `test_credentials_present_is_true_for_a_real_provider_key` fails ONLY
+      under `act`'s injected `AGENTEVOLVE_SCRUBBED` (green on GitHub), and one
+      py3.13-only research-path ordering drift
+      (`test_full_multi_option_evolution_runs_through_reflection`) reproduces
+      on a pristine tree and predates this release.
+- [x] **`Development Status :: 4 - Beta` stands** as the declared signal for a
+      first public cut — honest for a tool whose adaptive channel is
+      documented as under measurement.
+
+## Owner actions — the complete remaining distance
+
+- [ ] `git push origin main` (and the tag: `git push origin v0.5.0`).
+- [ ] `git push origin release/v0.4-sweep` — the sealed-substrate branch the
+      paper cites; local-only until pushed.
+- [ ] PyPI: create the `agentevolve` project (first upload claims the name —
+      do this soon; the collision this release dodged is exactly how the old
+      name was lost) and `twine upload dist/*` — or wire trusted publishing
+      to the GitHub repo and cut a GitHub release from the tag.
+- [ ] GitHub release notes: the 0.5.0 CHANGELOG section is written to be
+      pasted.

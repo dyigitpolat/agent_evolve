@@ -220,6 +220,32 @@ def _resolve_strategy(strategy: str, has_seeds: bool, announce) -> str:
     return "authoring"
 
 
+def _llm_refusal_message(*, extra_missing: bool) -> str:
+    """The explicit-llm refusal, naming every way out that applies.
+
+    On a core install the stranger who asks for a model is missing TWO
+    things, and the fix a message names first should be the one they hit
+    first: the optional dependencies, then the credential. On an install
+    that already has the extra, naming it would be noise. The CI stranger
+    job holds the extra-missing rendering to actually naming the extra.
+    """
+
+    fix = (
+        "Install the model path's optional dependencies with: pip install "
+        "'agentevolve[llm]'. Then set OPENROUTER_API_KEY (or "
+        "AGENTEVOLVE_DOTENV naming a file that does)"
+        if extra_missing else
+        "Set OPENROUTER_API_KEY (or AGENTEVOLVE_DOTENV naming a file that "
+        "does)"
+    )
+    return (
+        "proposer='llm' was asked for by name, but no provider credential "
+        f"is configured, so no model can be called. {fix}, or run with "
+        "proposer='random', which needs nothing -- or proposer='auto', "
+        "which chooses it out loud."
+    )
+
+
 def _check_structure_budget(structure_budget: int, budget: int) -> None:
     """The screen is charged against the search it informs, so it must fit."""
 
@@ -506,14 +532,10 @@ def optimize(
                     # measure a model measured the control instead, and the
                     # only trace was `calls: 0`. Found by the release CI's
                     # stranger job, 2026-08-20.
-                    raise RuntimeError(
-                        "proposer='llm' was asked for by name, but no "
-                        "provider credential is configured, so no model can "
-                        "be called. Set OPENROUTER_API_KEY (or "
-                        "AGENTEVOLVE_DOTENV naming a file that does), or run "
-                        "with proposer='random', which needs nothing -- or "
-                        "proposer='auto', which chooses it out loud."
-                    )
+                    import importlib.util
+                    raise RuntimeError(_llm_refusal_message(
+                        extra_missing=importlib.util.find_spec("pydantic_ai")
+                        is None))
             if chooser == "llm":
                 if complete is None:
                     announce(

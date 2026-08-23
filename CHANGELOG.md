@@ -1,12 +1,26 @@
 # Changelog
 
-## 0.5.0 — unreleased
+## 0.5.0 — 2026-08-24
 
 Two defects the end-to-end evaluation row found and the test suite could not:
 the package could not sell its own measured result, and it could not search a
 bounded number. Both were written down in `PACKAGING_TODO.md` §6 as known and
 unfixed. Both are fixed here, and the second one moves the substrate under the
 search — which is stated rather than absorbed.
+
+### Changed — the distribution is named `agentevolve`, and why that is a fix
+
+The metadata said `name = "agent_evolve"`, which PEP 503 normalizes to
+`agent-evolve` — and that name is **already taken on PyPI** by an unrelated
+third-party package. Every install line this README has ever suggested
+(`pip install agent_evolve`) therefore resolved to **someone else's code**:
+not a hypothetical, a supply-chain footgun, found by checking the index
+before the first publish rather than after. The distribution is now
+**`agentevolve`** (free, and the project's own name as it has always been
+written); the import is `agent_evolve` exactly as before, so no user code
+changes. `agent_evolve version` and the packaging tests read the new
+distribution name, and the install hints in `bootstrap` name the new extra
+spellings.
 
 ### Fixed — the mechanisms that measured could only be bought with the one that did not
 
@@ -181,6 +195,66 @@ working from a stale picture.
 - **Off is byte-identical to the pre-seam loop** — no call fires, no evidence is
   rendered, no counter moves, and the fossil holds unmodified.
   `tests/test_reguidance.py`, `tests/test_measurement_conditioned.py`.
+
+### Added — the revision channel, v3: what two oracle studies forced
+
+The W1/W2 pilot measured the channel's first form null-to-harmful, and two
+live oracle-trace studies (R10) localized why. All three repairs are in, and
+the re-pilot verdicts travel with them rather than being promised.
+
+- **Silence keeps mass at the gate.** The admission check treated an
+  unlisted value of a named field as a zero and refused the whole reply —
+  and 10 of 11 live refusals were exactly that, on subset replies, including
+  the oracle's own hindsight replies at the late checkpoints of both
+  studies. The mixture already makes implicit exclusion impossible below
+  damping 1, so the gate now refuses only an EXPLICIT zero on a front-held
+  value; at `damping >= 1` — where that premise fails — silence reads as a
+  zero again. Re-pilot: refusals collapsed to 1 in 60 events.
+- **Immigrants are required-k, and shortfall is counted.** An optional
+  clause drew zero proposals in ~30 calls from the live model and the oracle
+  alike; the oracle named per-field independence as unable to carry the
+  interaction structure three times. The clause now demands exactly k
+  complete configurations, grounded in the occupancy table, and states how
+  many configurations the run has already measured; a shorter reply keeps
+  its admissible weights half and counts `immigrants_shortfall`. Rejections
+  split by reason in the event note — which immediately paid for itself: on
+  a 24-field schema every rejection is `shape`, not the dedup collision the
+  pilot memo first inferred, and that correction is in the memo.
+- **At most four tilted fields.** Live replies tilted or freed all 24 fields
+  where the oracle tilts 2–8 grounded ones; the prompt now asks for the
+  table's strongest cases only, and `tilt_breadth` is journaled per event
+  (re-pilot median and max: exactly 4). No new refusal mode.
+- Events self-identify with `mechanism: "v3"`; the evidence format is
+  unchanged (`"v2"`).
+
+### Added — four tuning knobs, each carrying its measured verdict
+
+Every default still comes from a measured row; these ship as knobs with
+their pilot reads stated, not as silent improvements.
+
+- **High-budget sizing.** Above budget 384 — the largest budget any sealed
+  row was measured at, now the named constant `_SEALED_BUDGET_CEILING` — the
+  population grows one member per 32 charges (floor 12, ceiling 64) instead
+  of capping at twelve. At or below 384 the literal old expression runs,
+  re-verified at every integer budget in the range. The cap was a throttle:
+  at budget 2000, six of six cells spent 969–1212 charges while the uniform
+  comparator spent ~1800, and the matched-budget comparison was decided by
+  spend, not guidance. Re-measured after the fix: 5W/1T/0L against uniform
+  (median recall 0.833 vs 0.667) with the budget genuinely spendable.
+- **`init_style="split"`** (default `"joint"`, byte-identical prompt pinned):
+  one call, two labeled sub-asks — strongest bets and coverage — with
+  per-half telemetry. Its pilot read is negative and stated: it did not
+  remove the effort axis's pool-median reversal and read 0W/3T/5L against
+  the joint ask at the endpoint on the one venue tried. It stays off.
+- **`prior="llm-weighted-committed"`** (API-only; the cautious prompt is
+  byte-identical-pinned): removes the leave-free caution that one model
+  tier's hedging phenotype obeys most literally, asking instead for
+  evidence-proportional commitment. Pilot read, both halves: it repaired
+  that tier's endpoint 4W/1T/1L with three rescues to ≤0.01 — while
+  excluding an optimal value at the artifact level on 7 of 8 seeds, the
+  third measured case of artifact-level and endpoint-level readings
+  disagreeing. The defaults are untouched; the one-factor decomposition is
+  the measurement campaign's question.
 
 ### Added — the release tail
 

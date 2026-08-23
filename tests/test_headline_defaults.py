@@ -287,3 +287,20 @@ def test_an_explicit_llm_request_with_no_credential_is_refused_by_name(monkeypat
                         lambda *args, **kwargs: None)
     with pytest.raises(RuntimeError, match="proposer='random'"):
         optimize(_Problem(), budget=16, seed=6, proposer="llm")
+
+
+def test_the_refusal_names_the_extra_exactly_when_it_is_missing():
+    """2026-08-24: the CI stranger job holds the doctrine — a stranger on a
+    core install who asks for a model is told to install 'agentevolve[llm]'
+    first; an install that already has the extra is not told to reinstall
+    it."""
+
+    from agent_evolve.api import _llm_refusal_message
+
+    missing = _llm_refusal_message(extra_missing=True)
+    present = _llm_refusal_message(extra_missing=False)
+    assert "agentevolve[llm]" in missing
+    assert "agentevolve[llm]" not in present
+    for message in (missing, present):
+        assert "OPENROUTER_API_KEY" in message
+        assert "proposer='random'" in message

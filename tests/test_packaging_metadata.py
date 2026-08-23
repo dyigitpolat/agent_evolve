@@ -68,13 +68,23 @@ def test_version_is_single_sourced_from_the_code(project):
     assert attr == "agent_evolve.__version__", attr
 
 
+def test_the_distribution_name_is_the_unclaimed_spelling(project):
+    """`agent_evolve` normalizes to `agent-evolve` (PEP 503), which is taken
+    on PyPI by an unrelated package -- so that spelling as a DISTRIBUTION
+    name would make the README's own install line fetch someone else's code.
+    The distribution is `agentevolve`; the import stays `agent_evolve`.
+    Checked 2026-08-24 against the live index before the first publish."""
+
+    assert project["project"]["name"] == "agentevolve"
+
+
 def test_installed_distribution_version_matches_the_attribute():
     from importlib.metadata import PackageNotFoundError, version
 
     try:
-        installed = version("agent_evolve")
+        installed = version("agentevolve")
     except PackageNotFoundError:
-        pytest.skip("agent_evolve is not installed as a distribution here")
+        pytest.skip("agentevolve is not installed as a distribution here")
     assert installed == agent_evolve.__version__, (
         f"distribution metadata says {installed} but agent_evolve.__version__ "
         f"is {agent_evolve.__version__}; reinstall, or stop writing the version "

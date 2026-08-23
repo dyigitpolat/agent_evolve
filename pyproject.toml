@@ -7,7 +7,13 @@ requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent_evolve"
+# The distribution is `agentevolve`; the import is `agent_evolve`. They
+# differ because PEP 503 normalizes `agent_evolve` to `agent-evolve`, which
+# is already taken on PyPI by an unrelated package -- so the underscore
+# spelling as a DISTRIBUTION name would make `pip install agent_evolve`
+# fetch someone else's code. Found by checking the index before the first
+# publish; a test pins this name so it cannot drift back.
+name = "agentevolve"
 # Single-sourced from the code, which is the SSOT. Two literals drift, and this
 # one already had: the wheel metadata and `agent_evolve.__version__` disagreed
 # for a release cycle, so `agent_evolve version` printed a number no source file

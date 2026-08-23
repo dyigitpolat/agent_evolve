@@ -11,7 +11,7 @@ Both need no credential, no provider account and no network. Both spend exactly
 60 evaluations.
 
 ```bash
-pip install 'agent_evolve[pymoo]'
+pip install 'agentevolve[pymoo]'
 python examples/pymoo_swap/nsga2_baseline.py
 python examples/pymoo_swap/agentevolve_swap.py
 ```
