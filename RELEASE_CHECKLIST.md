@@ -268,21 +268,32 @@ checklist.
 - [x] **Full offline suite green at the release state** (see the final commit
       message for the count), including the new name-pin and refusal-message
       tests.
-- [x] **CI matrix state, honestly**: `stranger` PASSES after the refusal fix;
-      the two remaining local-runner reds are pre-existing and named —
-      `test_credentials_present_is_true_for_a_real_provider_key` fails ONLY
-      under `act`'s injected `AGENTEVOLVE_SCRUBBED` (green on GitHub), and one
-      py3.13-only research-path ordering drift
-      (`test_full_multi_option_evolution_runs_through_reflection`) reproduces
-      on a pristine tree and predates this release.
+- [x] **CI matrix state**: `stranger` PASSES after the refusal fix; the
+      py3.13 red is FIXED (2026-08-24, the interleave assertion) — the
+      full-run test had pinned the SCHEDULER'S arrival order across two
+      concurrently gathered slot groups, which CPython 3.13's asyncio
+      interleaves differently; the code re-orders outcomes by slot and never
+      promised arrival order, and the assertion now holds the true invariant
+      (exact per-generation evaluation multisets at the receipt boundaries)
+      on 3.11 through 3.13. The one remaining local-runner red is not a
+      defect: `test_credentials_present_is_true_for_a_real_provider_key`
+      fails ONLY under `act`'s injected `AGENTEVOLVE_SCRUBBED` env (green on
+      GitHub).
 - [x] **`Development Status :: 4 - Beta` stands** as the declared signal for a
       first public cut — honest for a tool whose adaptive channel is
       documented as under measurement.
 
 ## Owner actions — the complete remaining distance
 
-- [ ] `git push origin main`, then `git push origin v0.5.0` — the tag push
-      is the publish trigger.
+- [ ] **Move the remote tag — it points at the wrong tree.** The pushed
+      `v0.5.0` sits at `2260f0a`, whose distribution name is the plain
+      `agentevolve` PyPI refuses, and whose tree has no publish workflow
+      (which is why the tag push published nothing — so moving it is a
+      correction of an unreleased pointer, not a history rewrite):
+      `git push origin :refs/tags/v0.5.0`, then after main is pushed,
+      `git push origin v0.5.0` — that second push is the publish trigger.
+- [ ] `git push origin main` — carries the rename, the publish workflow and
+      the 3.13 interleave fix; the CI matrix should go fully green on it.
 - [ ] `git push origin release/v0.4-sweep` — the sealed-substrate branch the
       paper cites; local-only until pushed.
 - [ ] PyPI, via the pending Trusted Publisher the owner already registered
