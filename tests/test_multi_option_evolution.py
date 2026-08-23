@@ -765,19 +765,31 @@ def test_full_multi_option_evolution_runs_through_reflection() -> None:
         (2, 4, 4, 7, 2, 4),
         (4, 6, 7, 11, 2, 5),
     )
-    assert fixture.problem.evaluations == [
-        (0, 0, 0),
-        (0, 0, 1),
-        (1, 0, 0),
-        (4, 0, 0),
-        (3, 0, 1),
-        (2, 0, 1),
-        (0, 5, 0),
-        (3, 5, 1),
-        (2, 5, 1),
-        (3, 5, 0),
-        (2, 5, 0),
-    ]
+    # Per GENERATION, exactly these evaluations -- and deliberately not their
+    # interleave. The planner gathers the direct and engine slot groups
+    # concurrently and the engine gathers its per-item coroutines, then BOTH
+    # re-order outcomes by slot id before anything downstream reads them --
+    # arrival order is scheduler behaviour, not a contract, and CPython 3.13
+    # interleaves the two gathered groups differently than 3.11/3.12 did.
+    # The exact-order form of this assertion was the "check on something
+    # adjacent to the claim" pattern docs/scope.md names: it failed on a
+    # green mechanism the first time the interpreter's scheduler moved.
+    # (2026-08-24; the generation boundaries come from the receipts pinned
+    # just above, and duplicates would break the multiset equality.)
+    boundaries = (2, 4, 7, 11)              # seeds, then +2, +3, +4 per receipt
+    expected_by_generation = (
+        [(0, 0, 0), (0, 0, 1)],
+        [(1, 0, 0), (4, 0, 0)],
+        [(3, 0, 1), (2, 0, 1), (0, 5, 0)],
+        [(3, 5, 1), (2, 5, 1), (3, 5, 0), (2, 5, 0)],
+    )
+    assert len(fixture.problem.evaluations) == boundaries[-1]
+    start = 0
+    for end, expected in zip(boundaries, expected_by_generation, strict=True):
+        assert sorted(fixture.problem.evaluations[start:end]) == sorted(
+            expected
+        ), f"generation slice [{start}:{end}]"
+        start = end
 
 
 def test_same_support_alias_is_retained_while_crossover_excludes_known_union() -> None:
