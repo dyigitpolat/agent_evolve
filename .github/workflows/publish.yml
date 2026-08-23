@@ -39,7 +39,20 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
-          CODE=$(python -c "import sys; sys.path.insert(0, 'src'); import agent_evolve; print(agent_evolve.__version__)")
+          # Read the literal WITHOUT importing the package: importing pulls in
+          # the runtime dependencies, which this job deliberately does not
+          # install (it builds; it does not run). The first tag-triggered run
+          # failed on exactly that -- ModuleNotFoundError: pydantic.
+          CODE=$(python - << 'PY'
+          import ast, pathlib
+          tree = ast.parse(pathlib.Path("src/agent_evolve/__init__.py").read_text())
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Assign) and any(
+                      getattr(t, "id", None) == "__version__" for t in node.targets):
+                  print(ast.literal_eval(node.value))
+                  break
+          PY
+          )
           test "$TAG" = "$CODE" || {
             echo "tag v$TAG but agent_evolve.__version__ is $CODE"; exit 1; }
       - name: Build from the tagged tree
