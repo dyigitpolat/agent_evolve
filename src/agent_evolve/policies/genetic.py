@@ -32,8 +32,10 @@ __all__ = [
     "DomainRestriction",
     "crossover",
     "mutate",
+    "one_mutation_neighbourhood",
     "uniform_candidate",
     "tournament",
+    "crowding_distances",
     "truncation_survival",
 ]
 
@@ -537,6 +539,59 @@ def mutate(
     return out
 
 
+def _nearness(value: Any, current: Any) -> float:
+    """How far *value* sits from *current* on a numeric axis; 0 where none exists.
+
+    A projected domain is a GRID, and the move that decides an exact optimum is
+    one step along it, so a neighbourhood enumerated nearest-first tries that
+    step before it tries the far end of the axis. Values with no distance --
+    enumerations, strings, booleans -- all read 0 and therefore keep the
+    schema's own declared order under a stable sort.
+    """
+
+    if isinstance(value, bool) or isinstance(current, bool):
+        return 0.0
+    if isinstance(value, (int, float)) and isinstance(current, (int, float)):
+        return abs(float(value) - float(current))
+    return 0.0
+
+
+def one_mutation_neighbourhood(
+    config: Mapping[str, Any],
+    candidate_model: Any,
+    *,
+    restriction: SamplingPrior | None = None,
+) -> Iterable[dict[str, Any]]:
+    """Every candidate exactly one declared value away from *config*, in order.
+
+    This is the deterministic complement to :func:`mutate`: same move, no RNG,
+    and the whole neighbourhood rather than one sample of it. It exists for the
+    endgame, where a population has already found the right region and the only
+    thing left is the last grid step -- measured, NSGA-II reaches the EXACT
+    optimum on 6 of 10 NAS seeds where our loop reaches within 10% on 9 of 10,
+    by spending its endgame enumerating neighbours while a breeding loop keeps
+    recombining a front that is already solved.
+
+    The order is fixed and free of chance: loci in :func:`loci_of` order, and
+    within a locus the declared values nearest the current one first. Loci the
+    schema does not constrain contribute nothing -- there is no neighbour to
+    name where there is no declared domain.
+
+    A generator, not a list: the neighbourhood of a long genome over a
+    256-point grid is tens of thousands of candidates, and a caller that wants
+    the first handful should pay for the first handful.
+    """
+
+    for locus in loci_of(config):
+        domain = locus_domain(candidate_model, locus, restriction=restriction)
+        if not domain:
+            continue                        # undeclared domain: no neighbour
+        current = read_locus(config, locus)
+        for value in sorted((v for v in domain if v != current),
+                            key=lambda v: _nearness(v, current)):
+            yield write_locus(config, locus, value)
+
+
 def uniform_candidate(
     template: Mapping[str, Any],
     candidate_model: Any,
@@ -586,22 +641,104 @@ def tournament(
     return min(contenders, key=lambda pair: pair[1])[0]
 
 
+def crowding_distances(
+    vectors: Sequence[Mapping[str, float]]
+) -> list[float]:
+    """NSGA-II crowding distance for one tied set, one number per member.
+
+    Per objective, sort the set: the two boundary members are infinitely alone
+    on that axis and take ``inf``; every interior member accumulates the gap
+    between its two neighbours, divided by the objective's range over the set
+    so that objectives measured in seconds and objectives measured in watts
+    contribute comparably. An axis on which the whole set is constant separates
+    nobody and is skipped.
+
+    Direction never enters. Crowding measures how alone a point is, and a
+    minimised axis is exactly as wide as a maximised one -- which is also why
+    this needs objective VECTORS and cannot be computed from a ranking value.
+    """
+
+    n = len(vectors)
+    if n <= 2:
+        return [math.inf] * n               # every member is a boundary
+    distances = [0.0] * n
+    for name in sorted({key for vec in vectors for key in vec}):
+        column = [vec.get(name) for vec in vectors]
+        if any(value is None for value in column):
+            continue                        # not an axis the whole set carries
+        values = [float(value) for value in column]
+        order = sorted(range(n), key=lambda i: values[i])
+        span = values[order[-1]] - values[order[0]]
+        if span <= 0:
+            continue
+        distances[order[0]] = math.inf
+        distances[order[-1]] = math.inf
+        for position in range(1, n - 1):
+            index = order[position]
+            if distances[index] == math.inf:
+                continue                    # a boundary elsewhere stays one
+            distances[index] += (values[order[position + 1]]
+                                 - values[order[position - 1]]) / span
+    return distances
+
+
 def truncation_survival(
     population: Sequence[tuple[Mapping[str, Any], float]],
     *,
     keep: int,
     key_of,
+    method: str = "count",
+    objectives_of=None,
 ) -> list[tuple[Mapping[str, Any], float]]:
     """Deduplicate by candidate identity, then keep the *keep* best.
 
     Deduplication is not cosmetic: without it a population collapses onto copies
     of one genome and recombination stops producing anything new, which is the
     failure mode a diversity-free loop reaches within a couple of generations.
+
+    *method* decides what happens to members the ranking value cannot separate.
+    ``"count"`` -- the default -- keeps them in the order they were measured,
+    which is exactly what this function did before the knob existed and is
+    therefore byte-identical. ``"crowding"`` breaks ties WITHIN a domination
+    count by :func:`crowding_distances`, keeping the members that are most
+    alone. That matters where most of the population is non-dominated: on the
+    five-objective fleet unit almost nothing dominates anything, count-only
+    survival is then near-random, and the unit hosts no claim at all.
+
+    ``"crowding"`` needs *objectives_of*: a callable from a population item to
+    its objective vector. Crowding lives in objective space and a ranking value
+    is a scalar summary of it, so the vectors have to be supplied rather than
+    reconstructed.
     """
 
+    if method not in ("count", "crowding"):
+        raise ValueError(
+            f"method must be 'count' or 'crowding', got {method!r}")
     best: dict[str, tuple[Mapping[str, Any], float]] = {}
     for config, value in population:
         k = key_of(config)
         if k not in best or value < best[k][1]:
             best[k] = (config, value)
-    return sorted(best.values(), key=lambda pair: pair[1])[:keep]
+    if method == "count":
+        return sorted(best.values(), key=lambda pair: pair[1])[:keep]
+    if objectives_of is None:
+        raise ValueError(
+            "method='crowding' needs objectives_of: crowding distance is "
+            "measured in objective space, and a ranking value alone cannot "
+            "say how alone a point is"
+        )
+    tied: dict[float, list[tuple[Mapping[str, Any], float]]] = {}
+    for pair in best.values():
+        tied.setdefault(pair[1], []).append(pair)
+    ordered: list[tuple[Mapping[str, Any], float]] = []
+    for value in sorted(tied):
+        group = tied[value]
+        if len(group) == 1:
+            ordered.extend(group)
+            continue
+        spread = crowding_distances([objectives_of(pair[0]) for pair in group])
+        # Stable on equal distance, so a tie the crowding rule also cannot
+        # break keeps the order it was measured in rather than an arbitrary one.
+        ordered.extend(pair for _d, pair in sorted(
+            zip(spread, group), key=lambda item: -item[0]))
+    return ordered[:keep]

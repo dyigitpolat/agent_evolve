@@ -30,6 +30,7 @@ from agent_evolve.policies.genetic import (
     crossover,
     loci_of,
     mutate,
+    one_mutation_neighbourhood,
     truncation_survival,
     uniform_candidate,
 )
@@ -159,6 +160,37 @@ class GeneticConfig:
     #: mutation already consult, so one revision reshapes every subsequent
     #: draw with no further calls.
     reguidance: Any = None
+    #: ENDGAME POLISH. A breeding loop that has already found the right region
+    #: keeps recombining a front it has solved, and the last grid step never
+    #: gets tried: measured on ten NAS seeds, NSGA-II reaches the EXACT
+    #: optimum 6W/4L against us while we reach within 10% 9W/1L, and it does
+    #: it by spending its endgame on cache-fuelled mass proposals around the
+    #: front. "sweep" answers with the deterministic version of that: when the
+    #: front has stopped moving and enough budget is still in hand, the
+    #: generation proposes the 1-mutation neighbourhood of a rank-0 member
+    #: instead of breeding. It is classical -- no model call, no RNG draw.
+    #: "off" -- the default -- is byte-identical to the pre-polish seam:
+    #: nothing is tracked, nothing is deduped and nothing is drawn.
+    polish: str = "off"
+    #: Consecutive CHARGES with an unchanged rank-0 front before a sweep may
+    #: engage. 0 means auto: twice the population size, which is roughly the
+    #: charges two generations of a converged population spend re-measuring
+    #: what it already holds. Any change to the front's objective-vector set
+    #: resets the count -- a front that is still moving is not stalled.
+    polish_after: int = 0
+    #: The fraction of the budget that must still be unspent for a sweep to
+    #: engage. A neighbourhood enumeration is only worth buying while there is
+    #: enough left to measure a useful part of it; below the reserve the
+    #: generation breeds as usual. Ignored when there is no budget to reserve
+    #: a fraction OF.
+    polish_reserve: float = 0.15
+    #: How survival breaks ties inside one domination count. "count" -- the
+    #: default -- keeps the measurement order and is byte-identical.
+    #: "crowding" prefers the members that are most alone in objective space
+    #: (NSGA-II crowding distance), which is what makes a many-objective unit
+    #: selectable at all: on the five-objective fleet unit almost nothing
+    #: dominates anything, so a count-only rule is near-random.
+    survival: str = "count"
 
 
 def domination_rank(
@@ -234,6 +266,13 @@ def run_genetic_loop(
             "candidates: the generator draws the pool, the portfolio "
             "recombines parents into it. Run one or the other."
         )
+    if config.polish not in ("off", "sweep"):
+        raise ValueError(
+            f"polish must be 'off' or 'sweep', got {config.polish!r}")
+    if config.survival not in ("count", "crowding"):
+        raise ValueError(
+            f"survival must be 'count' or 'crowding', got {config.survival!r}")
+    polish_on = config.polish == "sweep"
 
     specs = list(problem.objectives)
     candidate_model = getattr(problem, "candidate_model", None)
@@ -284,10 +323,20 @@ def run_genetic_loop(
     state = config.state if config.state is not None else SearchState()
     state.history = history
 
+    # What the run has already put in front of the evaluator, by configuration
+    # identity. The evaluation cache keys the MATERIALIZED artifact, which the
+    # loop cannot compute for a candidate it has not built yet, so the sweep's
+    # dedup reads this instead: every configuration handed to measure(),
+    # whether it was charged, served from cache or refused. Populated only
+    # under polish, so "off" leaves no side effect behind at all.
+    seen_keys: Set[str] = set()
+
     def measure(configs: List[Config], gen: int) -> List[Any]:
         room = budget_left()
         if room <= 0:
             return []
+        if polish_on:
+            seen_keys.update(_default_candidate_key(c) for c in configs[:room])
         valid, failed, _ordered = evaluate_batch(
             problem, configs[:room], specs, cache=cache
         )
@@ -446,6 +495,8 @@ def run_genetic_loop(
             [((c, o), r) for (c, o), r in zip(pool, ranks)],
             keep=config.population_size,
             key_of=lambda pair: _default_candidate_key(pair[0]),
+            method=config.survival,
+            objectives_of=lambda pair: pair[1],
         )
         return [pair for pair, _rank in kept]
 
@@ -472,6 +523,20 @@ def run_genetic_loop(
     # being byte-identical to the pre-screening seam.
     rng_pool = random.Random(0 if config.seed is None else (config.seed ^ 0x5CEE11))
 
+    # --- endgame polish state ------------------------------------------------
+    # The stall tracker reads the population and the charge counter and draws
+    # nothing: a tracker that touched the RNG would make "off" and "sweep"
+    # differ in the control arm's stream, which is the one thing they may not
+    # do. `polish_front` is the front's objective-vector SET, so a front that
+    # trades one member for another with the same vector is correctly read as
+    # unchanged, and a front that actually moved resets the count.
+    polish_front: Optional[frozenset] = None
+    polish_stall = 0                    # charges since the front last moved
+    polish_mark = spent()
+    polish_turn = 0                     # the rank-0 member a sweep starts at
+    polish_threshold = (config.polish_after if config.polish_after > 0
+                        else 2 * config.population_size)
+
     for gen in range(1, config.generations + 1):
         if budget_left() <= 0:
             log(f"budget exhausted after {spent()} evaluations; stopping at gen {gen}")
@@ -483,10 +548,68 @@ def run_genetic_loop(
         ranked = [(c, r) for (c, _o), r in zip(population, ranks)]
         filled = 0
         choices: Sequence[OperatorChoice] = ()
+
+        # --- endgame polish: enumerate, once breeding has stopped paying -----
+        # Everything here is deterministic. The sweep is the 1-mutation
+        # neighbourhood of a rank-0 member in a fixed order, minus what the run
+        # has already put in front of the evaluator, and a generation that
+        # sweeps makes no operator choice at all -- so no chooser is consulted
+        # and no model call is spent on a decision the sweep does not use.
+        polish_note: Optional[Dict[str, Any]] = None
+        polish_kids: List[Config] = []
+        polishing = False
+        if polish_on:
+            front_now = frozenset(
+                tuple(sorted((name, float(value)) for name, value in obj.items()))
+                for (_c, obj), rank in zip(population, ranks) if rank == 0)
+            if front_now == polish_front:
+                polish_stall += spent() - polish_mark
+            else:
+                polish_front = front_now
+                polish_stall = 0
+            polish_mark = spent()
+            # No declared budget means nothing to hold a fraction of, so the
+            # reserve cannot refuse: an unbounded run is all endgame.
+            reserved = (config.evaluation_budget is None
+                        or budget_left() >= config.polish_reserve
+                        * config.evaluation_budget)
+            member_index = -1
+            if polish_stall >= polish_threshold and reserved:
+                rank0 = [c for (c, _o), rank in zip(population, ranks)
+                         if rank == 0]
+                # Population order is measurement order within a rank, so the
+                # rotation visits the front first-measured first and a run's
+                # polish generations are reproducible from the seed alone.
+                proposed: Set[str] = set()
+                for step in range(len(rank0)):
+                    member = rank0[(polish_turn + step) % len(rank0)]
+                    for candidate in one_mutation_neighbourhood(
+                            member, candidate_model, restriction=restriction):
+                        key = _default_candidate_key(candidate)
+                        if key in seen_keys or key in proposed:
+                            continue
+                        proposed.add(key)
+                        polish_kids.append(candidate)
+                        if len(polish_kids) >= want:
+                            break
+                    if len(polish_kids) >= want:
+                        break
+                if polish_kids:
+                    member_index = polish_turn % len(rank0)
+                    polish_turn += 1
+                    polishing = True
+            # An exhausted neighbourhood reports `engaged: false` and the
+            # generation breeds: polish did not run, and a record that said it
+            # had would be the silent no-op this package refuses everywhere
+            # else.
+            polish_note = {"engaged": polishing,
+                           "proposed": len(polish_kids),
+                           "member_index": member_index}
+
         # An authored generator draws the whole generation, so there is no
         # parent choice to make and the chooser is not consulted -- calling it
         # and discarding the answer would spend a model call on nothing.
-        if config.generator is None:
+        if config.generator is None and not polishing:
             choices = list(pick(ranked, want, state))[:want]
             # A chooser that returns too few must not silently shrink the
             # generation: the arm would then spend less budget than the control
@@ -526,7 +649,9 @@ def run_genetic_loop(
         # the archive -- never the problem and never the cache -- so the only
         # candidates that can become evaluations are the `want` below.
         pool_kids: Optional[List[Config]] = None
-        if config.generator is not None:
+        if polishing:
+            kids = [dict(kid) for kid in polish_kids]
+        elif config.generator is not None:
             pool_kids = config.generator.propose(
                 template=seeds[0], candidate_model=candidate_model,
                 restriction=restriction,
@@ -551,8 +676,13 @@ def run_genetic_loop(
         # chooser's own picks is always measured unscreened (the screen must
         # never own the whole generation), and only measure() below touches
         # the budget -- the screen has no route to it by construction.
+        # A swept generation skips the screen. The sweep already IS the
+        # generation's answer -- an enumerated neighbourhood, deduped and
+        # ordered -- so there is nothing for a surrogate to re-order, and
+        # building the screen's larger pool would spend random draws on
+        # candidates the sweep deliberately did not ask for.
         screen_note: Optional[Dict[str, Any]] = None
-        if config.screening is not None and kids:
+        if config.screening is not None and kids and not polishing:
             # Cheap-fidelity evidence FIRST, so the gate this generation sees
             # the rows the campaign could not afford. It buys evidence about
             # THIS generation's candidates, which is the distribution the
@@ -630,7 +760,10 @@ def run_genetic_loop(
         population = survive(pool)
 
         # --- survival credit: a mechanism is what its children survive ------
-        if config.generator is not None and valid:
+        # Not for a swept generation: the generator drew none of those
+        # children, and crediting it with the sweep's survivors would put a
+        # classical enumeration's wins on a model's counter.
+        if config.generator is not None and valid and not polishing:
             surviving = {_default_candidate_key(c) for c, _o in population}
             for result in valid:
                 config.generator.record_measured(
@@ -701,6 +834,13 @@ def run_genetic_loop(
             entry["reguide_immigrants"] = injected
         if screen_note is not None:
             entry["screen"] = screen_note
+        if polish_note is not None:
+            entry["polish"] = polish_note
+            if polishing:
+                log(f"generation {gen}: the front has not moved for "
+                    f"{polish_stall} charges; sweeping {len(kids)} of the "
+                    f"1-mutation neighbourhood of rank-0 member "
+                    f"{polish_note['member_index']} instead of breeding")
         if config.generator is not None:
             entry["generate"] = config.generator.note()
         if config.portfolio is not None:

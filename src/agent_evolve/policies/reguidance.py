@@ -83,6 +83,24 @@ rate stops being comparable (W1 pilot, seed 20370103: two of four revisions
 refused on the shuffled arm alone, on evidence that named no front value).
 A control is the only sane user of ``True``.
 
+The joint-proposal half carries its own history, and that history is why an
+event marks itself ``v3i`` whenever the channel is bought. Required rather
+than offered, the clause was answered on schedule -- and then died at the
+door: on the analog venue, twenty-four FLAT fields spelled ``bias_nmos__w``,
+every single member was refused as ``shape``, while the same clause over the
+six-field NAS schema passed. What the model was failing there was the
+SPELLING of the schema, not the search, and the oracle named these proposals
+the only carrier of interaction structure in all four usable checkpoints -- so
+a channel that refuses every member over its keys is refusing the one thing it
+was bought for. The repair is bounded, and every part of it is also stated in
+the clause: ONE flatten of a nested member's keys (``{"a": {"b": 1}}`` becomes
+``{"a__b": 1}``), completion of a PARTIAL member from the run's current best
+measured configuration -- which makes a member naming three fields a
+deliberate recombination against the best rather than an error -- and the
+template itself echoed as a literal example member. A member that invents a
+key this schema does not declare is still ``shape``: the harness repairs
+spelling, and never content.
+
 This is the GRADED, mid-run form of the typed locus restriction, which is the
 one measurement-conditioned channel that separated from the unguided null with
 semantics removed; it is not the re-authoring channel that lost to its
@@ -112,7 +130,7 @@ from agent_evolve.policies.weighted_prior import WeightedRestriction
 
 __all__ = ["ReguidanceTelemetry", "ReguidanceOutcome", "Reguidance", "PROMPT",
            "IMMIGRANTS_CLAUSE", "ELITE_TABLE_TITLE", "EVIDENCE_VERSION",
-           "MECHANISM_VERSION", "TILT_CAP"]
+           "MECHANISM_VERSION", "MECHANISM_VERSION_IMMIGRANTS", "TILT_CAP"]
 
 Config = Dict[str, Any]
 #: field -> (values, weights), the installed overlay's one representation.
@@ -254,6 +272,18 @@ Rules, and the harness checks every one of them:
 #: count rows it was shown a digest of. So the clause now states how many
 #: configurations the run has measured and what a repeat costs. Nothing about
 #: admission moved: a repeat is still dropped, and the drop is still counted.
+#:
+#: The KEYS are the third thing the live measurement forced, and the largest.
+#: With the clause required, the analog venue -- 24 flat fields spelled
+#: ``bias_nmos__w`` -- refused EVERY member as ``shape``, where the six-field
+#: NAS schema passed: the model was writing partial members and nesting the
+#: groups the flat names encode. So the clause now shows the schema instead of
+#: describing it (the template rendered as a literal example member), says
+#: what a PARTIAL member means rather than treating it as a mistake (it is
+#: completed from the run's current best measured configuration, which makes
+#: it a recombination against the best), and -- when the last event rejected
+#: any -- names the counts by reason, so the next reply is answering a
+#: measurement rather than repeating one.
 IMMIGRANTS_CLAUSE = """
 Your reply MUST also carry an "immigrants" key holding EXACTLY {m} COMPLETE
 configurations worth measuring next -- recombinations or refinements of what
@@ -264,13 +294,24 @@ every value from that parameter's declared domain:
 
 {{"immigrants": [{{"<parameter>": <value>, ...}}]}}
 
+Every member must carry these exact keys:
+
+{example}
+
+The keys are FLAT: write "group__field", never {{"group": {{"field": ...}}}},
+and never a key this schema does not declare -- an invented key REJECTS the
+whole member. A member that names only SOME of these keys is COMPLETED from
+the run's current best configuration, so a partial member is a deliberate
+recombination against the best rather than an error: name the fields you mean
+to move and leave the rest out.
+
 NOVELTY IS THE POINT: this run has ALREADY MEASURED {measured}
 configurations, and the evidence above is drawn from them. A proposal that
 repeats one of those {measured} is REJECTED without being measured and WASTES
 the slot it took. Every one of the {m} must differ from every configuration
 this run has measured, in at least one parameter -- recombine what the front
 rewards into a joint setting the trace does not already contain.
-"""
+{feedback}"""
 
 #: How many parameters one reply is ASKED to name in ``"weights"``. Not a
 #: refusal threshold and deliberately not one: the harness counts breadth
@@ -302,6 +343,16 @@ EVIDENCE_VERSION = "v2"
 #: so the evidence version stays where it was and a study may pool bundles
 #: across the mechanism change while refusing to pool the mechanisms.
 MECHANISM_VERSION = "v3"
+
+#: The marker an event carries when the joint-proposal channel is BOUGHT.
+#: ``v3i`` is v3 plus the repair of that channel and nothing else: one flatten
+#: of a member's keys, template-fill of a partial member from the run's best
+#: measured configuration, the literal example member in the clause, and the
+#: per-reason feedback line. A run that buys no proposals meets none of those
+#: paths and stays ``v3``, so the two populations a study pools are exactly
+#: the two the change separates -- the marker names the CHANNEL that moved,
+#: not the release the code came from.
+MECHANISM_VERSION_IMMIGRANTS = "v3i"
 
 
 class Reguidance:
@@ -542,7 +593,7 @@ class Reguidance:
                                          int(note["at_charges"]))
         note["rows_shown"] = len(view_rows)
         note["evidence"] = EVIDENCE_VERSION
-        note["mechanism"] = MECHANISM_VERSION
+        note["mechanism"] = self._mechanism()
         note["evidence_sha256"] = evidence_digest(evidence)
         # The rendering itself, not a recipe for reconstructing it. The oracle
         # instrument proved a late-checkpoint prompt UNRECONSTRUCTIBLE from the
@@ -596,9 +647,21 @@ class Reguidance:
         note["proposed_fields"] = sorted(weights)
         note["freed_fields"] = sorted(free)
 
-        immigrants = self._immigrants(raw_immigrants, rows, note)
+        immigrants = self._immigrants(raw_immigrants, rows, specs, note)
         self.telemetry.events.append(note)
         return self._outcome(note, True, immigrants)
+
+    def _mechanism(self) -> str:
+        """Which mechanism authored this event: the channel, not the release.
+
+        The v3i repair touches ONE channel -- the joint proposals -- so only a
+        run that bought them can be affected by it, and only such a run says
+        so. A run with ``immigrants = 0`` renders the same prompt v3 rendered,
+        admits by the same rule and marks itself ``v3``.
+        """
+
+        return (MECHANISM_VERSION_IMMIGRANTS if self.immigrants > 0
+                else MECHANISM_VERSION)
 
     def _outcome(self, note: Dict[str, Any], changed: bool,
                  immigrants: Tuple[Config, ...] = ()) -> ReguidanceOutcome:
@@ -659,8 +722,10 @@ class Reguidance:
         # which rows are RENDERED, never how many the run has measured, so the
         # two arms are asked for novelty against the same standard.
         clause = ("" if self.immigrants <= 0
-                  else IMMIGRANTS_CLAUSE.format(m=self.immigrants,
-                                                measured=int(note["rows"])))
+                  else IMMIGRANTS_CLAUSE.format(
+                      m=self.immigrants, measured=int(note["rows"]),
+                      example=json.dumps(dict(self.template), default=str),
+                      feedback=self._rejection_feedback()))
         return PROMPT.format(
             context=self.domain_context.strip(),
             goals="\n".join(f"  {s.name}: {s.goal}imise" for s in self.objectives),
@@ -677,6 +742,36 @@ class Reguidance:
             max_ratio=f"{self.max_weight_ratio:g}",
             damping=self.damping,
         )
+
+    def _rejection_feedback(self) -> str:
+        """What the LAST event's proposals died of, in one line, or nothing.
+
+        The channel already counted its rejections by reason; until now the
+        only reader was the campaign. The model that wrote the rejected
+        members never learned they were rejected, so a reply that misread the
+        schema misread it again at the next checkpoint -- which is exactly the
+        signature the analog cells wrote, twelve ``shape`` rejections a cell,
+        every cell. The line costs one sentence of prompt, carries no state
+        this policy did not already journal (it is read back off
+        ``telemetry.events``), and says nothing when the last event's
+        proposals were all admitted.
+        """
+
+        for event in reversed(self.telemetry.events):
+            record = event.get("immigrants")
+            if not isinstance(record, dict):
+                continue
+            by_reason = dict(record.get("rejected_by_reason") or {})
+            if not by_reason:
+                return ""
+            worst_first = sorted(by_reason.items(),
+                                 key=lambda item: (-item[1], item[0]))
+            counts = ", ".join(f"{count} rejected as {reason}"
+                               for reason, count in worst_first)
+            return (f"\nLast time: {counts}. Those members bought this run\n"
+                    f"nothing; write these {self.immigrants} so that does not "
+                    "happen again.\n")
+        return ""
 
     def _shared_note(self, name: str) -> str:
         """Say where a sequence parameter's one weight table applies.
@@ -911,6 +1006,7 @@ class Reguidance:
         self,
         raw: Sequence[Any],
         rows: Sequence[Tuple[Config, Mapping[str, float]]],
+        specs: Sequence[ObjectiveSpec],
         note: Dict[str, Any],
     ) -> Tuple[Config, ...]:
         """The REQUIRED k, validated value-by-value like ``llm_init``.
@@ -924,20 +1020,43 @@ class Reguidance:
         channel that did answer. The shortfall is COUNTED instead, on the
         event (proposed against required) and in the run's telemetry, which is
         where a campaign reads how often the required-k ask was met at all.
+
+        What v3i adds happens BEFORE that rule and never inside it:
+        :meth:`_prepare` repairs a member's KEYS -- one flatten, then a fill
+        of the fields a partial member left out -- and the repaired member
+        then meets the same value-by-value gate every whole member meets. A
+        filled member is not laundered: its own values are checked exactly as
+        written, so a partial member holding an undeclared value is
+        ``out_of_domain`` and not an accepted configuration wearing the best
+        row's clothes. Both repairs are counted on the event, because a cell
+        that accepted twelve members has to be able to say how many of them
+        the model actually wrote whole.
         """
 
         if self.immigrants <= 0:
             return ()
         provided = list(raw or ())
         measured = {_key(config) for config, _objectives in rows}
+        # WHERE a partial member's missing fields come from: the run's current
+        # best measured configuration, so completing one is a recombination
+        # against the best rather than against the seed. With no measured row
+        # to read -- the empty-trace boundary -- the template is what is left,
+        # and the event says which of the two it used.
+        best = self._best_measured(rows, specs)
+        fill_from = best if best is not None else dict(self.template)
         accepted: List[Config] = []
         rejected: List[Dict[str, str]] = []
         loci = loci_of(self.template)
+        normalized = 0
+        template_filled = 0
         for member in provided:
             self.telemetry.immigrants_proposed += 1
-            reason = _immigrant_reason(member, self.template, loci,
+            candidate, was_normalized, was_filled = self._prepare(member, fill_from)
+            normalized += int(was_normalized)
+            template_filled += int(was_filled)
+            reason = _immigrant_reason(candidate, self.template, loci,
                                        self.candidate_model)
-            if reason is None and _key(dict(member)) in measured:
+            if reason is None and _key(dict(candidate)) in measured:
                 reason = "already_measured"
             if reason is None and len(accepted) >= self.immigrants:
                 reason = "over_cap"
@@ -946,7 +1065,7 @@ class Reguidance:
                 rejected.append({"reason": reason})
                 continue
             self.telemetry.immigrants_accepted += 1
-            accepted.append(dict(member))
+            accepted.append(dict(candidate))
         shortfall = max(0, self.immigrants - len(provided))
         self.telemetry.immigrants_shortfall += shortfall
         # WHY the channel bought nothing, per event, in one line. The rejection
@@ -962,13 +1081,114 @@ class Reguidance:
         for entry in rejected:
             reason = entry["reason"]
             by_reason[reason] = by_reason.get(reason, 0) + 1
-        note["immigrants"] = {"accepted": len(accepted),
-                              "rejected": rejected,
-                              "rejected_by_reason": by_reason,
-                              "proposed": len(provided),
-                              "required": self.immigrants,
-                              "shortfall": shortfall}
+        record: Dict[str, Any] = {"accepted": len(accepted),
+                                  "rejected": rejected,
+                                  "rejected_by_reason": by_reason,
+                                  "proposed": len(provided),
+                                  "required": self.immigrants,
+                                  "shortfall": shortfall}
+        # Sparse, like the reason split beside it: a repair that never fired
+        # is absent rather than zero, so an event that reports a fill is an
+        # event where the model wrote a partial member.
+        if normalized:
+            record["normalized"] = normalized
+        if template_filled:
+            record["template_filled"] = template_filled
+            record["fill_source"] = ("best_measured" if best is not None
+                                     else "template")
+        note["immigrants"] = record
         return tuple(accepted)
+
+    # -- the key repair, bounded ---------------------------------------------
+
+    def _prepare(self, member: Any,
+                 fill_from: Mapping[str, Any]) -> Tuple[Any, bool, bool]:
+        """A member's keys, repaired at most this far: flatten once, then fill.
+
+        Two repairs, both about SPELLING, and a hard floor under both. The
+        flatten is attempted only when the keys do not already match the
+        schema, it goes exactly one level deep (``{"a": {"b": 1}}`` becomes
+        ``{"a__b": 1}``), and its result is adopted only when it actually
+        lands inside the declared field names -- so a member the flatten does
+        not help is judged as written. The fill completes a member whose keys
+        are a PROPER SUBSET of the schema's, from *fill_from*, in the
+        template's own key order. Anything else -- a key this schema does not
+        declare, a member that names nothing at all -- comes back untouched
+        and is refused as ``shape`` by the same gate as before: the harness
+        repairs how the model spelled the schema and never guesses what it
+        meant.
+
+        Key ORDER is normalised on every path that returns a repaired member,
+        because a JSON object's order is not information while
+        :func:`~agent_evolve.policies.genetic.loci_of` reads it as structure;
+        a member written in the alphabetical order the prompt lists the
+        domains in would otherwise be ``shape`` against a template that
+        happens to be ordered another way.
+
+        Returns the member to validate, whether the flatten was applied, and
+        whether fields were filled.
+        """
+
+        if not isinstance(member, dict):
+            return member, False, False
+        written: Dict[str, Any] = {str(name): value
+                                   for name, value in member.items()}
+        fields = set(self.template)
+        normalized = False
+        if set(written) != fields:
+            flat = _flatten_once(written)
+            if set(flat) != set(written) and set(flat) <= fields:
+                written, normalized = flat, True
+        if not written or not set(written) <= fields:
+            return written, normalized, False
+        if set(written) == fields:
+            ordered = {name: written[name] for name in self.template}
+            return ordered, normalized, False
+        filled: Dict[str, Any] = {}
+        for name, held in self.template.items():
+            if name in written:
+                filled[name] = written[name]
+            else:
+                filled[name] = _copy_value(fill_from.get(name, held))
+        return filled, normalized, True
+
+    def _best_measured(
+        self,
+        rows: Sequence[Tuple[Config, Mapping[str, float]]],
+        specs: Sequence[ObjectiveSpec],
+    ) -> Optional[Config]:
+        """The run's current best configuration, defined so it cannot drift.
+
+        Rank-0 in the pooled rows, then best on the FIRST declared objective,
+        ties broken by the lowest row index. Every part of that is a choice
+        and each is the cheap one: the front is what the evidence the model
+        just read is about, the first objective is the one the campaign
+        declared first, and the index tiebreak makes the fill deterministic
+        for a taped replay. ``None`` only when there is nothing measured to
+        read, which is the boundary the caller names in ``fill_source``.
+        """
+
+        if not rows:
+            return None
+        front = _front_indices(rows, specs)
+        if not front:
+            return None
+        spec = list(specs)[0] if specs else None
+        chosen = front[0]
+        if spec is not None:
+            direction = 1.0 if str(spec.goal) == "max" else -1.0
+            best_score: Optional[float] = None
+            for index in front:
+                value = dict(rows[index][1]).get(spec.name)
+                if value is None or isinstance(value, bool):
+                    continue
+                try:
+                    score = direction * float(value)
+                except (TypeError, ValueError):
+                    continue
+                if best_score is None or score > best_score:
+                    best_score, chosen = score, index
+        return dict(rows[chosen][0])
 
 
 # ------------------------------------------------------------------ helpers
@@ -1108,6 +1328,37 @@ def _distribution(
         return [1.0 / len(domain)] * len(domain)
     table = list(zip(entry[0], entry[1]))
     return _normalize([_lookup(table, value) for value in domain])
+
+
+def _flatten_once(member: Mapping[str, Any]) -> Dict[str, Any]:
+    """One level of nesting, joined with ``__``. The only spelling repaired.
+
+    The analog schema names a group and a field in one flat key
+    (``bias_nmos__w``), and a model handed twenty-four of those writes the
+    groups back as objects often enough that every member of every cell died
+    of it. One level is the whole repair: it inverts exactly the spelling the
+    field names encode, and a second level would be the harness inventing a
+    structure the schema never declared.
+    """
+
+    out: Dict[str, Any] = {}
+    for name, value in member.items():
+        if isinstance(value, dict):
+            for inner, held in value.items():
+                out[f"{name}__{inner}"] = held
+        else:
+            out[str(name)] = value
+    return out
+
+
+def _copy_value(value: Any) -> Any:
+    """A filled field's value, never shared with the row it was read from."""
+
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, tuple):
+        return list(value)
+    return value
 
 
 def _immigrant_reason(member: Any, template: Mapping[str, Any],

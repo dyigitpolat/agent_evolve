@@ -28,8 +28,8 @@ from agent_evolve.core.problem import ObjectiveSpec, ValidationOutcome
 from agent_evolve.policies.measurement_evidence import (
     evidence_digest, render_elite_table, render_measurement_evidence)
 from agent_evolve.policies.reguidance import (
-    ELITE_TABLE_TITLE, EVIDENCE_VERSION, MECHANISM_VERSION, TILT_CAP,
-    Reguidance, ReguidanceTelemetry)
+    ELITE_TABLE_TITLE, EVIDENCE_VERSION, MECHANISM_VERSION,
+    MECHANISM_VERSION_IMMIGRANTS, TILT_CAP, Reguidance, ReguidanceTelemetry)
 from agent_evolve.policies.weighted_prior import WeightedRestriction
 from agent_evolve.session.authorship import (AuthorshipConfig, build_authorship)
 from agent_evolve.session.genetic_loop import GeneticConfig, run_genetic_loop
@@ -453,13 +453,18 @@ def test_the_event_splits_its_rejections_by_reason():
     clause is aimed at, so a campaign has to be able to read it apart from a
     model that misread a declared vocabulary (``out_of_domain``) or wrote
     something that is not a configuration of this schema at all (``shape``).
+
+    The ``shape`` member here names a field the schema does not declare, which
+    is what ``shape`` means under v3i: a member that merely names FEWER fields
+    than the schema is completed from the best measured row and is not a
+    failure at all (see u9f). The reason's meaning narrowed; the split did not.
     """
 
     duplicate = dict(ROWS[0][0], genome=list(ROWS[0][0]["genome"]))
     fresh = {"genome": [1] * (GENOME - 1) + [0], "mode": "c"}
     policy = _policy(_reply({"mode": (["a", "b", "c"], [1, 1, 2])},
                             immigrants=[
-                                {"mode": "c"},                       # shape
+                                {"mode": "c", "speed": "fast"},      # shape
                                 {"genome": [1] * (GENOME - 1) + [2],
                                  "mode": "a"},                       # domain
                                 duplicate,                           # measured
@@ -804,6 +809,275 @@ def test_the_novelty_ground_moves_with_the_run_and_the_reply_shape_does_not():
         )
 
 
+# --- u9f: the v3i key repair -------------------------------------------------
+#
+# Required-k made the channel answer; the KEYS then killed every answer. On the
+# analog venue -- 24 flat fields spelled ``bias_nmos__w`` -- every member of
+# every cell was refused as ``shape``, while the same clause over the six-field
+# NAS schema passed, so what the model failed was the spelling of the schema
+# and not the search. Two bounded repairs, and a hard floor under both: one
+# flatten, one fill from the run's best measured row, and an invented key is
+# still ``shape``.
+
+#: A schema whose field names ENCODE a nesting -- the analog shape, at three
+#: fields instead of twenty-four. A model handed these writes the groups back
+#: as objects, which is the spelling the flatten inverts.
+FLAT_TEMPLATE: Dict[str, Any] = {"bias_nmos__w": 1, "bias_nmos__l": 1,
+                                 "mode": "a"}
+
+
+class _FlatCandidate(BaseModel):
+    bias_nmos__w: Literal[1, 2, 4]
+    bias_nmos__l: Literal[1, 2, 4]
+    mode: Literal["a", "b", "c"]
+
+
+FLAT_ROWS = [
+    ({"bias_nmos__w": 1, "bias_nmos__l": 1, "mode": "a"},
+     {"ones": 1.0, "edges": 1.0}),
+    ({"bias_nmos__w": 2, "bias_nmos__l": 1, "mode": "b"},
+     {"ones": 2.0, "edges": 3.0}),
+]
+
+
+def _flat_policy(reply, **kwargs) -> Reguidance:
+    prompts: List[str] = []
+
+    def complete(prompt: str) -> str:
+        prompts.append(prompt)
+        return reply(prompt) if callable(reply) else reply
+
+    policy = Reguidance(complete, objectives=OBJECTIVES,
+                        candidate_model=_FlatCandidate,
+                        template=dict(FLAT_TEMPLATE), every=1, min_rows=1,
+                        **kwargs)
+    policy.prompts = prompts                    # type: ignore[attr-defined]
+    return policy
+
+
+def _flat_revise(policy: Reguidance, rows=FLAT_ROWS):
+    return policy.maybe_revise(rows=rows, population=(), specs=OBJECTIVES,
+                               restriction=None, charges=len(rows), gen=1)
+
+
+#: A trace whose BEST row on the first objective is not its first row, so a
+#: fill that silently took row 0 would be visible.
+FILL_ROWS = _rows(
+    ([0, 1] * (GENOME // 2), "b", 4, 1),             # rank-0, ones = 4
+    ([1] * GENOME, "a", 8, 3),                       # rank-0, ones = 8: best
+    ([0] * GENOME, "c", 0, 5),                       # dominated
+)
+
+
+def test_a_nested_member_is_flattened_once_and_then_accepted():
+    """The spelling the flat field names encode, inverted exactly once."""
+
+    nested = {"bias_nmos": {"w": 2, "l": 4}, "mode": "b"}
+    policy = _flat_policy(_reply({"mode": (["a", "b", "c"], [2, 1, 1])},
+                                 immigrants=[nested]),
+                          immigrants=1)
+    outcome = _flat_revise(policy)
+
+    assert outcome.immigrants == (
+        {"bias_nmos__w": 2, "bias_nmos__l": 4, "mode": "b"},), (
+        "a member that nested the groups its field names encode was refused, "
+        "which is how every analog cell lost every member it was sent"
+    )
+    record = outcome.note["immigrants"]
+    assert record["accepted"] == 1 and record["normalized"] == 1
+    assert "template_filled" not in record, (
+        "a member that carried every field after the flatten was also filled"
+    )
+    assert policy.telemetry.immigrants_rejected == 0
+
+
+def test_a_nested_member_that_is_also_partial_is_flattened_and_then_filled():
+    """The two repairs compose, and each is counted where it happened."""
+
+    policy = _flat_policy(_reply({"mode": (["a", "b", "c"], [2, 1, 1])},
+                                 immigrants=[{"bias_nmos": {"w": 4}}]),
+                          immigrants=1)
+    outcome = _flat_revise(policy)
+
+    # Best on "ones" (max) among the rank-0 rows is FLAT_ROWS[1]: w=2, l=1,
+    # mode "b". The member names w, so only l and mode are filled.
+    assert outcome.immigrants == (
+        {"bias_nmos__w": 4, "bias_nmos__l": 1, "mode": "b"},)
+    record = outcome.note["immigrants"]
+    assert (record["normalized"], record["template_filled"]) == (1, 1)
+    assert record["fill_source"] == "best_measured"
+
+
+def test_a_member_spelled_with_the_double_underscore_passes_untouched():
+    written = {"bias_nmos__w": 4, "bias_nmos__l": 2, "mode": "c"}
+    policy = _flat_policy(_reply({"mode": (["a", "b", "c"], [2, 1, 1])},
+                                 immigrants=[dict(written)]),
+                          immigrants=1)
+    outcome = _flat_revise(policy)
+
+    assert outcome.immigrants == (written,)
+    record = outcome.note["immigrants"]
+    assert "normalized" not in record and "template_filled" not in record, (
+        "a member the model spelled correctly was recorded as repaired"
+    )
+
+
+def test_a_partial_member_is_completed_from_the_best_measured_row():
+    """Not the seed, not row 0: the rank-0 row best on the FIRST objective.
+
+    A member naming three of twenty-four fields is the model saying which
+    values belong together and staying silent about the rest -- the same
+    silence the weights half is already read that way. Completed from the run's
+    current best it becomes a recombination against the best; refused, it is
+    the whole channel dying of its own prompt (0 accepted, every analog cell).
+    """
+
+    policy = _policy(_reply({"mode": (["a", "b", "c"], [1, 1, 2])},
+                            immigrants=[{"mode": "c"}]),
+                     immigrants=1)
+    outcome = _revise(policy, rows=FILL_ROWS)
+
+    assert outcome.immigrants == ({"genome": [1] * GENOME, "mode": "c"},), (
+        "the fill did not read the rank-0 row with the best first objective"
+    )
+    record = outcome.note["immigrants"]
+    assert record["accepted"] == 1 and record["template_filled"] == 1
+    assert record["fill_source"] == "best_measured"
+    assert record["rejected"] == [] and record["shortfall"] == 0
+    assert (policy.telemetry.immigrants_proposed,
+            policy.telemetry.immigrants_accepted) == (1, 1)
+    assert outcome.immigrants[0]["genome"] is not FILL_ROWS[1][0]["genome"], (
+        "the filled member shares its list with the measured row it was "
+        "completed from, so mutating one mutates a row of the trace"
+    )
+
+
+def test_a_partial_member_holding_a_bad_value_is_still_out_of_domain():
+    """The fill completes what is MISSING; it launders nothing that is there."""
+
+    policy = _policy(_reply({"mode": (["a", "b", "c"], [1, 1, 2])},
+                            immigrants=[{"mode": "z"}]),
+                     immigrants=1)
+    outcome = _revise(policy, rows=FILL_ROWS)
+
+    assert outcome.immigrants == ()
+    record = outcome.note["immigrants"]
+    assert record["rejected_by_reason"] == {"out_of_domain": 1}, (
+        "a partial member's own undeclared value survived the completion"
+    )
+    assert record["template_filled"] == 1, (
+        "the fill fired and went uncounted because the member then failed"
+    )
+    assert policy.telemetry.immigrants_accepted == 0
+
+
+def test_a_member_with_an_undeclared_key_is_still_shape():
+    """The floor under both repairs: spelling is repaired, content is not."""
+
+    invented = {"genome": [1] * GENOME, "mode": "c", "speed": "fast"}
+    nested_invention = {"genome": {"x": 1}, "mode": "c"}
+    policy = _policy(_reply({"mode": (["a", "b", "c"], [1, 1, 2])},
+                            immigrants=[invented, nested_invention]),
+                     immigrants=2)
+    outcome = _revise(policy, rows=FILL_ROWS)
+
+    assert outcome.immigrants == ()
+    record = outcome.note["immigrants"]
+    assert record["rejected_by_reason"] == {"shape": 2}
+    assert "template_filled" not in record and "normalized" not in record, (
+        "a member the harness could not repair was counted as repaired"
+    )
+
+
+def test_a_partial_member_falls_back_to_the_template_when_nothing_is_measured():
+    """The boundary, named on the event rather than assumed away.
+
+    A checkpoint cannot fire on an empty trace, so this is reached only by the
+    channel's own entry point -- but the fill has to be defined there anyway,
+    and an event that filled from the template rather than from the best row
+    has to SAY so, because the two are different proposals.
+    """
+
+    policy = _policy(_reply({"mode": (["a", "b", "c"], [1, 1, 2])}),
+                     immigrants=1)
+    note: Dict[str, Any] = {}
+    accepted = policy._immigrants([{"mode": "c"}], (), OBJECTIVES, note)
+
+    assert accepted == ({"genome": list(TEMPLATE["genome"]), "mode": "c"},)
+    assert note["immigrants"]["fill_source"] == "template"
+    assert note["immigrants"]["template_filled"] == 1
+
+
+def test_the_clause_shows_the_schema_and_says_what_a_partial_member_means():
+    policy = _policy(_reply({"mode": (["a", "b", "c"], [2, 1, 1])}),
+                     immigrants=3)
+    _revise(policy, rows=FRONT_ROWS)
+    prompt = policy.prompts[0]
+    asked = " ".join(prompt.split())
+
+    assert "Every member must carry these exact keys:" in prompt
+    assert json.dumps(dict(TEMPLATE)) in prompt, (
+        "the clause describes the schema without ever showing one member of "
+        "it, which is the state 24-flat-field replies were refused in"
+    )
+    assert ("A member that names only SOME of these keys is COMPLETED from "
+            "the run's current best configuration, so a partial member is a "
+            "deliberate recombination against the best rather than an error")\
+        in asked
+    assert 'The keys are FLAT: write "group__field", never {"group": ' \
+           '{"field": ...}}, and never a key this schema does not declare' \
+        in asked
+
+    none = _policy(_reply({"mode": (["a", "b", "c"], [2, 1, 1])}), immigrants=0)
+    _revise(none, rows=FRONT_ROWS)
+    assert "Every member must carry these exact keys" not in none.prompts[0]
+
+
+def test_the_next_clause_names_what_the_last_event_lost_its_members_to():
+    """The loop the channel never had: the model learns it was rejected.
+
+    Twelve ``shape`` rejections a cell, every cell, is a model repeating a
+    misreading it was never told about. The line is read back off the policy's
+    own journalled events -- no new state -- and says nothing after an event
+    that rejected nothing.
+    """
+
+    replies = iter([
+        _reply({"mode": (["a", "b", "c"], [2, 1, 1])},
+               immigrants=[{"mode": "c", "speed": "fast"},          # shape
+                           {"genome": [1] * GENOME, "x": 2},        # shape
+                           {"genome": [1] * GENOME, "mode": "z"}]),  # domain
+        _reply({"mode": (["a", "b", "c"], [2, 1, 1])},
+               immigrants=[{"genome": [1] * (GENOME - 1) + [0], "mode": "c"},
+                           {"genome": [0, 1] * (GENOME // 2), "mode": "c"},
+                           {"genome": [1, 1, 0, 0] * (GENOME // 4),
+                            "mode": "b"}]),
+        _reply({"mode": (["a", "b", "c"], [2, 1, 1])}),
+    ])
+    policy = _policy(lambda _prompt: next(replies), immigrants=3,
+                     max_events=3, every=1, min_rows=1)
+
+    _revise(policy, rows=FILL_ROWS, charges=4)
+    assert "Last time" not in policy.prompts[0], (
+        "the first event of a run reported a previous event"
+    )
+    assert policy.telemetry.events[0]["immigrants"]["rejected_by_reason"] == {
+        "shape": 2, "out_of_domain": 1}
+
+    _revise(policy, rows=FILL_ROWS + ROWS, charges=8, gen=2)
+    assert ("Last time: 2 rejected as shape, 1 rejected as out_of_domain."
+            in " ".join(policy.prompts[1].split())), (
+        f"the clause carried no feedback from the last event:\n"
+        f"{policy.prompts[1]}"
+    )
+    assert policy.telemetry.events[1]["immigrants"]["rejected_by_reason"] == {}
+
+    _revise(policy, rows=FILL_ROWS + ROWS + FRONT_ROWS, charges=12, gen=3)
+    assert "Last time" not in policy.prompts[2], (
+        "an event that rejected nothing still reported rejections to the next"
+    )
+
+
 # --- u9d: the focused tilt, asked for and metered ---------------------------
 #
 # The ask is an ask. The live pilot's replies tilted or freed all 24 fields of
@@ -873,6 +1147,31 @@ def test_every_event_says_which_mechanism_wrote_it_and_which_evidence_it_read():
             "a study pooling prompts would be pooling two bundles"
         )
         assert policy.telemetry.events[-1]["mechanism"] == "v3"
+
+
+def test_an_event_that_bought_the_proposal_channel_marks_itself_v3i():
+    """The marker names the CHANNEL that moved, not the release it shipped in.
+
+    v3i repairs the joint-proposal channel and nothing else, so a run with
+    ``immigrants = 0`` renders the v3 prompt and admits by the v3 rule -- and
+    says v3. A cell can therefore be pooled by what it actually ran rather
+    than by which build produced it.
+    """
+
+    reply = _reply({"mode": (["a", "b", "c"], [2, 1, 1])})
+    bought = _policy(reply, immigrants=2)
+    note = _revise(bought, rows=FRONT_ROWS).note
+    assert note["mechanism"] == MECHANISM_VERSION_IMMIGRANTS == "v3i"
+    assert note["evidence"] == EVIDENCE_VERSION == "v2", (
+        "the mechanism marker dragged the evidence version with it again"
+    )
+
+    unbought = _policy(reply)
+    assert _revise(unbought, rows=FRONT_ROWS).note["mechanism"] == "v3"
+
+    # The channel was BOUGHT whatever the reply then did with it.
+    refused = _policy("no json here", immigrants=2)
+    assert _revise(refused, rows=FRONT_ROWS).note["mechanism"] == "v3i"
 
 
 # --- u10: a policy failure never kills a run --------------------------------

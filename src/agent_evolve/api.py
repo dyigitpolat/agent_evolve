@@ -327,6 +327,8 @@ def optimize(
     effort: Optional[str] = None,
     journal: Any = None,
     authorship: Any = "auto",
+    polish: str = "off",
+    survival: str = "count",
 ) -> SearchResult:
     """Optimize *problem* within *budget* evaluations.
 
@@ -358,6 +360,17 @@ def optimize(
     that makes model calls; asking for it on a run that cannot is refused
     rather than ignored.
 
+    *polish* (``"off"`` / ``"sweep"``) lets a stalled endgame enumerate the
+    1-mutation neighbourhood of the front instead of breeding it again, which
+    is the move NSGA-II already makes: it beats this loop to the EXACT optimum
+    6W/4L on ten NAS seeds while losing 1W/9L to it at 10% of optimum, so the
+    gap is the last grid step and nothing else. *survival* (``"count"`` /
+    ``"crowding"``) decides survival among equally-dominated members by
+    NSGA-II crowding distance, which is what makes a many-objective unit
+    selectable: on the five-objective fleet unit almost nothing dominates
+    anything and the count-only rule is near-random. Both default to the
+    byte-identical setting and both belong to the genetic strategy.
+
     *effort* pins the model's reasoning effort on every completion call, and
     *journal* (a callable, or a path to a JSONL file) receives one record per
     completed model call -- model served plus token usage -- so a run's spend
@@ -385,6 +398,11 @@ def optimize(
             f"prior must be 'auto' or one of {sorted(_PRIORS)}, got {prior!r}")
     if chooser not in ("off", "llm"):
         raise ValueError(f"chooser must be 'off' or 'llm', got {chooser!r}")
+    if polish not in ("off", "sweep"):
+        raise ValueError(f"polish must be 'off' or 'sweep', got {polish!r}")
+    if survival not in ("count", "crowding"):
+        raise ValueError(
+            f"survival must be 'count' or 'crowding', got {survival!r}")
     if effort is not None and not isinstance(effort, str):
         raise ValueError(
             f"effort must be a provider effort level as a string, got {effort!r}"
@@ -445,6 +463,8 @@ def optimize(
             ("structure_budget", structure_budget not in ("auto", 0)),
             ("prior", prior not in ("auto", "rule")),
             ("chooser", chooser == "llm"),
+            ("polish", polish != "off"),
+            ("survival", survival != "count"),
             ("effort", effort is not None),
             ("journal", journal is not None),
             ("authorship", authorship_config is not None
@@ -658,6 +678,8 @@ def optimize(
                     initial_proposals=policies.initial_proposals,
                     generator=policies.generator,
                     reguidance=policies.reguidance,
+                    polish=polish,
+                    survival=survival,
                 ),
                 chooser=chooser_policy,
                 log=announce,
