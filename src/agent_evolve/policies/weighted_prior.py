@@ -64,22 +64,24 @@ PRIOR_STYLES = ("cautious", "committed")
 #: The smallest share of a locus's sampling mass any DECLARED value may hold
 #: once a prior is installed. Both prior entry points here read it at CALL
 #: time, so it is the one place the floor is set and the one place a study
-#: turns it off (``0.0`` restores the pre-floor arithmetic exactly, byte for
-#: byte -- see :func:`floor_weights`).
+#: turns it on (any positive value; ``0.0`` is the default and keeps the
+#: floorless arithmetic exactly, byte for byte -- see :func:`floor_weights`).
 #:
-#: 0.02 is a defect fix and is disclosed as one. CHANGELOG-ready wording:
-#: *"Installed sampling priors now keep at least 2% of each locus's mass on
-#: every declared value (``weighted_prior.PRIOR_FLOOR``). A prior that zeroed
-#: a region the screen never measured previously ended the run's ability to
-#: sample there at all -- measured on 20 of 20 analog cells, where the zeroed
-#: region held the venue's best configurations. Set ``PRIOR_FLOOR = 0.0`` to
-#: restore the previous behaviour exactly."*
-#:
-#: Why 2% and not 10%: the floor is insurance, not exploration. At the analog
-#: venue's 24 loci a 2% floor costs a draw its prior-preferred value on about
-#: one locus in two, which is inside the mutation noise the loop already runs
-#: with; 10% would be a second exploration mechanism wearing this one's name.
-PRIOR_FLOOR = 0.02
+#: Default OFF, and that is a measured decision, not a hedge. The floor
+#: shipped briefly at 0.02 as a presumed defect fix (a prior that zeroes a
+#: region the screen never measured ends the run's ability to sample there
+#: at all -- observed on 20 of 20 analog cells, where the zeroed region held
+#: the venue's best configurations). The one-factor reading then came back a
+#: wash: floor-on vs floor-off on otherwise identical frozen runs read
+#: 3W/3L with median delta -0.021, the floor rescuing seeds whose box was
+#: wrong (+0.16) and taxing seeds whose box was right (-0.24) in equal
+#: measure. Insurance that costs its premium exactly is not a defect fix,
+#: so the default reverted. Studies that want a falsifiable-in-run box
+#: (feasibility hunting, wrong-prior recovery) opt in with a small value;
+#: 0.02 keeps the cost of a draw's prior-preferred value inside the loop's
+#: own mutation noise at ~24 loci. Larger values are a second exploration
+#: mechanism wearing this one's name -- use ``explore="coverage"`` instead.
+PRIOR_FLOOR = 0.0
 
 
 @dataclass(frozen=True)

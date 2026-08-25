@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — the crossed screen was a diagonal
+
+When every locus's domain was wider than the screen, auto-blocking took no
+locus and the shared `t % len(domain)` index walked ALL loci through one
+ladder in lockstep: the "crossed" screen was the main diagonal of the grid,
+and a prior fit on it boxed the search into the diagonal's neighbourhood
+(measured on the 24-locus analog venue: all 276 locus pairs at rank
+correlation 1.0; the box's ceiling could not contain the venue's best
+configurations). The screen now draws each locus's column as an independent
+shuffled permutation of its full ladder — seeded, one RNG draw regardless of
+domain size, per-level attribution preserved, `structure_budget=0`
+byte-identical to before. Default on, because a diagonal is a defect, not a
+choice; results measured before this fix were measured on the diagonal and
+remain quotable as measured.
+
+### Added — two classical search knobs, default off, and what they measurably are
+
+`explore="coverage"` retargets a declining-schedule share of draws at each
+field's least-measured DECLARED values; `intensify="incumbent"` pins a
+seeded 6–12 field subset of the best member and resamples the rest through
+the prior. Both are classical (zero model calls) and off unless asked for.
+Measured honestly: at their pilot venue the pair LOST the endpoint bar it
+was built for (4/12 vs base, median −0.033) — but the same pair is the only
+configuration, out of every method and 3,000+ specialist evaluations ever
+recorded on that venue, to reach a fully feasible all-specs-met
+configuration at all (2 runs of 18; nothing else, ever). Treat it as a
+feasibility-seeking profile that trades median endpoint for tail discovery,
+not as a default.
+
+### Changed — the prior floor is a knob, not substrate
+
+`weighted_prior.PRIOR_FLOOR` briefly shipped at `0.02` as a presumed defect
+fix. Its one-factor reading came back a wash (3W/3L, median −0.021: the
+floor rescues wrong boxes and taxes right ones in equal measure), so the
+default reverts to `0.0` — byte-identical to the pre-floor arithmetic — and
+the floor stays available per call for studies that want a
+falsifiable-in-run box.
+
+### Fixed — generation cap honors the budget above the sealed ceiling
+
+Portfolio arms at budget 2000 silently stopped ~20% short: the generation
+cap was sized to the sealed ceiling (384) rather than the requested budget.
+The cap now scales with the budget exactly as the population does; inert at
+every budget through 415 (proven exhaustively), first divergence at 416.
+
 ## 0.5.0 — 2026-08-24
 
 Two defects the end-to-end evaluation row found and the test suite could not:
