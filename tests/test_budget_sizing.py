@@ -31,7 +31,11 @@ import pytest
 from pydantic import BaseModel
 
 from agent_evolve import optimize
-from agent_evolve.api import _SEALED_BUDGET_CEILING, _genetic_sizing
+from agent_evolve.api import (
+    _SEALED_BUDGET_CEILING,
+    _generation_cap,
+    _genetic_sizing,
+)
 from agent_evolve.core.problem import ObjectiveSpec, ValidationOutcome
 
 #: budget -> (population, offspring per generation).
@@ -137,6 +141,16 @@ class _Captured(Exception):
         self.config = config
 
 
+#: budget -> the generation cap the loop is built with. Re-pinned 2026-08-25
+#: with the defect fix in `_generation_cap`: at 384 (and everywhere at or
+#: below it, and on up to 415 where the population is still twelve) this is
+#: the literal old expression; at 2000 the old expression gave 133, which was
+#: a THIRD of what the budget needs and stranded a fifth of it. The full
+#: argument, the measurement and the guard live in `_generation_cap`'s
+#: docstring and in `test_generation_cap.py`.
+GENERATION_CAP = {384: 153, 2000: 800}
+
+
 @pytest.mark.parametrize("budget,expected", [(384, (12, 10)), (2000, (62, 60))])
 def test_optimize_builds_the_loop_with_the_sizing_the_table_states(
     monkeypatch, budget: int, expected) -> None:
@@ -153,6 +167,11 @@ def test_optimize_builds_the_loop_with_the_sizing_the_table_states(
     config = caught.value.config
     assert (config.population_size, config.offspring_per_generation) == expected
     assert config.evaluation_budget == budget
-    # The generation cap is a cap and divides by the offspring count: it
-    # adapts to the new sizing rather than being restated beside it.
-    assert config.generations == max(1, 4 * budget // expected[1])
+    # The generation cap is a cap, and a cap that binds before the budget does
+    # is a defect. Pinned as a literal here for the same reason the sizing is:
+    # a formula that is "obviously" equivalent is how a control arm moves.
+    assert config.generations == GENERATION_CAP[budget]
+    assert config.generations == _generation_cap(budget, expected[1])
+    if budget <= _SEALED_BUDGET_CEILING:
+        assert config.generations == max(1, 4 * budget // expected[1]), (
+            "a sealed budget's generation cap moved")

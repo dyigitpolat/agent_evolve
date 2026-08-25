@@ -44,6 +44,15 @@ _PRIORS = ("rule", "rule-weighted", "llm", "llm-weighted",
 #: that buys, so the caller states the number they know and not this one.
 _BATCH = 8
 
+#: The declared parameters of the two slot-taking mechanisms, as constants
+#: rather than literals repeated in a signature and two comparisons. Both
+#: mechanisms are off by default; these are what they run AT when they are
+#: asked for, and every one of them is a measured number rather than a tuned
+#: one (see `GeneticConfig.explore` / `.intensify`).
+_EXPLORE_SCHEDULE = (0.5, 0.1)
+_INTENSIFY_FRACTION = 0.25
+_INTENSIFY_PIN_RANGE = (6, 12)
+
 #: The largest budget any SEALED row was measured at. At or below it the
 #: genetic sizing is a control arm and may not move; above it there is nothing
 #: to hold still. A constant rather than a knob, because a knob is a way to
@@ -77,8 +86,9 @@ def _genetic_sizing(budget: int) -> tuple[int, int]:
     grows with the budget (one member per 32 charges, floored at the old cap of
     twelve and ceilinged at 64, where the per-generation selection cost starts
     to be the thing being paid for) and the offspring count follows it. The
-    generations formula is untouched: it divides by the offspring count and
-    adapts on its own.
+    generations formula is not restated here; it is
+    :func:`_generation_cap`, which had to be repaired for exactly this reason
+    and says so in its own docstring.
     """
 
     if int(budget) > _SEALED_BUDGET_CEILING:
@@ -86,6 +96,61 @@ def _genetic_sizing(budget: int) -> tuple[int, int]:
         return pop, pop - 2
     pop = max(4, min(budget // 4, 12))
     return pop, max(2, pop - 2)
+
+
+#: The largest offspring count any sealed row ever ran with -- the old
+#: population cap of twelve, less its two elites. Every sealed generation cap
+#: was ``4 * budget // offspring`` with an offspring count at or under this
+#: number, so it is the divisor that pins what "four times the budget's worth
+#: of generations" MEANT when it was measured.
+_SEALED_OFFSPRING_CEILING = 10
+
+
+def _generation_cap(budget: int, offspring: int) -> int:
+    """How many generations the loop may run. A CAP, never a schedule.
+
+    Duplicate offspring are served from the evaluation cache without spending
+    budget, so the loop's real stop condition is the budget and this number
+    exists only to bound a run that has stopped making progress. It is
+    therefore a defect when it binds first -- and it did.
+
+    THE DEFECT, and the measurement that found it. The expression was
+    ``4 * budget // offspring``. Below the sealed ceiling the offspring count
+    is at most ten, so it bought at least ``0.4 * budget`` generations: far
+    more than the budget could ever pay for, which is what a cap should be.
+    Above the ceiling ``_genetic_sizing`` grows the population with the budget
+    -- and the offspring count with it -- so the SAME expression bought fewer
+    and fewer generations as the budget rose. At budget 2000 the population is
+    62, the offspring count 60, and the cap collapses to 133 generations.
+    Measured on the cheap tier: the operator-portfolio arm, whose arms
+    re-propose recombinations the population already holds, spent a mean
+    1615.1 evaluations of 2000 (minimum 1418) while its comparator -- which
+    runs the same sizing but produces fewer duplicates -- spent 2000.0 on 12
+    of 12 cells. The matched-budget comparison was decided by how much each
+    arm could SPEND, and 12 of 20 truncated cells were still gaining recall on
+    their last mark when the cap ended them.
+
+    THE FIX, and its guard. The divisor is bounded at
+    :data:`_SEALED_OFFSPRING_CEILING`, so the cap keeps the
+    generations-per-budget ratio the sealed rows were measured with instead of
+    shrinking underneath the new sizing. The guard is the same one
+    :func:`_genetic_sizing` uses and is spelled the same way: at or below
+    ``_SEALED_BUDGET_CEILING`` the old expression is evaluated literally, and
+    because the population there is capped at twelve the two branches also
+    agree everywhere the offspring count is ten or fewer -- inert to budget
+    415 inclusive, not merely to 384.
+
+    CHANGELOG-ready wording: *"Above a budget of 384 the generation cap no
+    longer shrinks as the population grows. Large-budget runs -- particularly
+    with ``authorship.operators``, whose arms produce more duplicates --
+    previously ended with up to 20% of the evaluation budget unspent. Sealed
+    budgets are unaffected."*
+    """
+
+    offspring = max(1, int(offspring))
+    if int(budget) <= _SEALED_BUDGET_CEILING:
+        return max(1, 4 * int(budget) // offspring)
+    return max(1, 4 * int(budget) // min(offspring, _SEALED_OFFSPRING_CEILING))
 
 
 def _describe(problem: Any) -> str:
@@ -246,6 +311,23 @@ def _llm_refusal_message(*, extra_missing: bool) -> str:
     )
 
 
+def _moved(value: Any, default: tuple) -> bool:
+    """Whether a pair-valued knob was actually moved off its default.
+
+    ``[0.5, 0.1]`` and ``(0.5, 0.1)`` are the same request, so the comparison
+    is on contents rather than on type; anything that is not a sequence at all
+    reads as moved, and the loop then refuses it by name. Used only to decide
+    whether the caller ASKED for something the authoring strategy cannot
+    honour -- a knob nobody moved is this package's own default and refusing a
+    run over it would be the package arguing with itself.
+    """
+
+    try:
+        return tuple(value) != default
+    except TypeError:
+        return True
+
+
 def _check_structure_budget(structure_budget: int, budget: int) -> None:
     """The screen is charged against the search it informs, so it must fit."""
 
@@ -329,6 +411,11 @@ def optimize(
     authorship: Any = "auto",
     polish: str = "off",
     survival: str = "count",
+    explore: str = "off",
+    explore_schedule: tuple = _EXPLORE_SCHEDULE,
+    intensify: str = "off",
+    intensify_fraction: float = _INTENSIFY_FRACTION,
+    intensify_pin_range: tuple = _INTENSIFY_PIN_RANGE,
 ) -> SearchResult:
     """Optimize *problem* within *budget* evaluations.
 
@@ -371,6 +458,26 @@ def optimize(
     anything and the count-only rule is near-random. Both default to the
     byte-identical setting and both belong to the genetic strategy.
 
+    *explore* (``"off"`` / ``"coverage"``) and *intensify* (``"off"`` /
+    ``"incumbent"``) are the two halves of one fix, and neither is expected to
+    pay alone. Exploration spends a declining share of each generation's
+    offspring slots on a fresh draw from each locus's least-measured DECLARED
+    values -- the schema's whole domain, never the prior's narrowed support --
+    because on the analog venue every screen-fitted prior installed a ceiling
+    the venue's optimum sits above: best in-box evaluation -0.4002 reward9
+    against -0.0566 outside, with 100 of the pooled top-100 outside.
+    Intensification spends a further share on the current best member with 6-12
+    of its loci pinned and the rest resampled, which is what a third-party
+    optimizer's "coordinated combinations" turn out to be when its winning
+    populations are measured. Alone, exploration buys uniform sampling of a
+    bigger region: the two of our cells that already spend 82-96% of their
+    charges outside the box come back no better than the cells that stay in.
+    *explore_schedule* ``(e0, e_min)``, *intensify_fraction* and
+    *intensify_pin_range* are the declared parameters, at their measured
+    values; both mechanisms take offspring SLOTS rather than extra charges, so
+    neither changes what a budget buys. Genetic-strategy knobs, both
+    default-off, and off is byte-identical.
+
     *effort* pins the model's reasoning effort on every completion call, and
     *journal* (a callable, or a path to a JSONL file) receives one record per
     completed model call -- model served plus token usage -- so a run's spend
@@ -403,6 +510,11 @@ def optimize(
     if survival not in ("count", "crowding"):
         raise ValueError(
             f"survival must be 'count' or 'crowding', got {survival!r}")
+    if explore not in ("off", "coverage"):
+        raise ValueError(f"explore must be 'off' or 'coverage', got {explore!r}")
+    if intensify not in ("off", "incumbent"):
+        raise ValueError(
+            f"intensify must be 'off' or 'incumbent', got {intensify!r}")
     if effort is not None and not isinstance(effort, str):
         raise ValueError(
             f"effort must be a provider effort level as a string, got {effort!r}"
@@ -465,6 +577,12 @@ def optimize(
             ("chooser", chooser == "llm"),
             ("polish", polish != "off"),
             ("survival", survival != "count"),
+            ("explore", explore != "off"),
+            ("explore_schedule", _moved(explore_schedule, _EXPLORE_SCHEDULE)),
+            ("intensify", intensify != "off"),
+            ("intensify_fraction", intensify_fraction != _INTENSIFY_FRACTION),
+            ("intensify_pin_range",
+             _moved(intensify_pin_range, _INTENSIFY_PIN_RANGE)),
             ("effort", effort is not None),
             ("journal", journal is not None),
             ("authorship", authorship_config is not None
@@ -660,13 +778,15 @@ def optimize(
             # `generations` is a cap, not a schedule. Duplicate offspring hit
             # the evaluation cache without spending budget, so a fixed
             # generation count would end the run with budget unspent; the
-            # loop's real stop condition is the budget.
+            # loop's real stop condition is the budget. `_generation_cap` is
+            # where that sentence is kept true -- it stopped being true above
+            # the sealed ceiling, and its docstring carries the measurement.
             result = run_genetic_loop(
                 problem=bound,
                 config=GeneticConfig(
                     population_size=pop,
                     offspring_per_generation=offspring,
-                    generations=max(1, 4 * budget // max(1, offspring)),
+                    generations=_generation_cap(budget, offspring),
                     seed=seed,
                     seeds=seeds,
                     evaluation_budget=budget,
@@ -680,6 +800,14 @@ def optimize(
                     reguidance=policies.reguidance,
                     polish=polish,
                     survival=survival,
+                    explore=explore,
+                    # Handed through as given rather than coerced: the loop
+                    # validates both pairs by name, and a coercion here would
+                    # turn its message into a bare TypeError from a tuple().
+                    explore_schedule=explore_schedule,
+                    intensify=intensify,
+                    intensify_fraction=intensify_fraction,
+                    intensify_pin_range=intensify_pin_range,
                 ),
                 chooser=chooser_policy,
                 log=announce,

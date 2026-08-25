@@ -53,6 +53,140 @@ def test_crossed_screen_matches_free_loci_across_blocks():
     assert len({(c["depth"], c["mesh"]) for c in screen}) == 1
 
 
+# --- the free ladder is space-filling, not the main diagonal ----------------
+#
+# Until 2026-08-25 every free locus read the same ladder index, so a screen with
+# nothing crossable WAS the space's main diagonal. These tests pin the repair
+# and keep the defect's own statistic in the file as the control.
+
+_LEVELS = tuple(range(20))
+
+
+def _analog_shaped_model(n_loci: int = 24, levels: tuple = _LEVELS):
+    """24 loci x 20 declared levels, screened at 16 rows: the analog venue's shape.
+
+    Nothing is crossable here -- the smallest domain already outruns the budget
+    -- so the whole design is the free ladder, which is exactly the case that
+    produced the diagonal.
+    """
+    from pydantic import create_model
+    model = create_model(
+        "Analog",
+        **{f"f{i}": (Literal[levels], ...) for i in range(n_loci)})
+    return model, {f"f{i}": levels[0] for i in range(n_loci)}
+
+
+def _level_indices(screen, model, template):
+    """Each row as a vector of LEVEL INDICES, one column per locus."""
+    from agent_evolve.policies.genetic import loci_of, locus_domain, read_locus
+    loci = list(loci_of(template))
+    domains = {lc: locus_domain(model, lc) for lc in loci}
+    return [[domains[lc].index(read_locus(row, lc)) for lc in loci] for row in screen]
+
+
+def _spearman(a, b):
+    def ranked(xs):
+        order = sorted(range(len(xs)), key=lambda i: xs[i])
+        rank = [0.0] * len(xs)
+        i = 0
+        while i < len(order):
+            j = i
+            while j + 1 < len(order) and xs[order[j + 1]] == xs[order[i]]:
+                j += 1
+            share = (i + j) / 2.0
+            for k in range(i, j + 1):
+                rank[order[k]] = share
+            i = j + 1
+        return rank
+    ra, rb = ranked(a), ranked(b)
+    ma, mb = sum(ra) / len(ra), sum(rb) / len(rb)
+    num = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+    da = sum((x - ma) ** 2 for x in ra) ** 0.5
+    db = sum((y - mb) ** 2 for y in rb) ** 0.5
+    return 0.0 if da == 0 or db == 0 else num / (da * db)
+
+
+def _mean_abs_pairwise_rho(rows):
+    columns = list(zip(*rows))
+    pairs = [abs(_spearman(columns[i], columns[j]))
+             for i in range(len(columns)) for j in range(i + 1, len(columns))]
+    return sum(pairs) / len(pairs)
+
+
+def test_the_free_ladder_is_decorrelated_and_the_diagonal_is_the_control():
+    model, template = _analog_shaped_model()
+    rows = _level_indices(
+        crossed_screen(template, model, size=16, rng=random.Random(11)),
+        model, template)
+    assert len(rows) == 16 and len(rows[0]) == 24
+
+    # The control: what this function built before the fix -- every locus on one
+    # shared index. Its statistic is exactly 1.0, and its row 0 is the space's
+    # minimum corner.
+    diagonal = [[t % len(_LEVELS)] * 24 for t in range(16)]
+    assert _mean_abs_pairwise_rho(diagonal) == pytest.approx(1.0)
+    assert diagonal[0] == [0] * 24
+
+    assert _mean_abs_pairwise_rho(rows) < 0.3
+    # and no row is a single level held across every locus
+    assert not any(len(set(row)) == 1 for row in rows)
+
+
+def test_the_screen_reaches_levels_the_diagonal_could_never_show():
+    # The measured consequence of the diagonal: 16 rows over a 20-level ladder
+    # never showed a locus above level 15, which is the box every analog prior
+    # was fit inside. A space-filling design reaches the top of the ladder.
+    model, template = _analog_shaped_model()
+    rows = _level_indices(
+        crossed_screen(template, model, size=16, rng=random.Random(12)),
+        model, template)
+    assert max(max(row) for row in rows) > 15
+    assert max(t % len(_LEVELS) for t in range(16)) == 15, "the diagonal's ceiling"
+
+
+def _flat_model(n_loci: int = 6, levels: tuple = (0, 1, 2, 3)):
+    from pydantic import create_model
+    model = create_model(
+        "Flat", **{f"g{i}": (Literal[levels], ...) for i in range(n_loci)})
+    return model, {f"g{i}": levels[0] for i in range(n_loci)}
+
+
+def test_every_locus_still_sweeps_its_whole_ladder():
+    # Decorrelation must not cost coverage: each locus's column is whole
+    # permutations, so every level appears floor(rows / levels) times at least.
+    model, template = _flat_model()
+    screen = crossed_screen(template, model, size=16, blocking=(),
+                            rng=random.Random(13))
+    assert len(screen) == 16
+    for name in template:
+        counts = {level: 0 for level in (0, 1, 2, 3)}
+        for row in screen:
+            counts[row[name]] += 1
+        assert set(counts) == {0, 1, 2, 3}
+        assert min(counts.values()) >= 16 // 4
+
+
+def test_attribution_keeps_its_per_level_n_after_the_fix():
+    model, template = _flat_model()
+    screen = crossed_screen(template, model, size=16, blocking=(),
+                            rng=random.Random(14))
+    attr = attribute([(c, {"energy": float(sum(c.values())), "speed": 1.0})
+                      for c in screen], SPECS, model)
+    for name in template:
+        summaries = attr.for_locus(name)
+        assert len(summaries) == 4
+        assert min(s.n for s in summaries) >= 16 // 4
+
+
+def test_the_design_is_exact_given_the_seed():
+    model, template = _analog_shaped_model()
+    a = crossed_screen(template, model, size=16, rng=random.Random(15))
+    b = crossed_screen(template, model, size=16, rng=random.Random(15))
+    c = crossed_screen(template, model, size=16, rng=random.Random(16))
+    assert a == b
+    assert a != c, "a different seed must give a different design"
+
+
 def test_crossed_screen_respects_the_budget_exactly():
     for size in (1, 3, 4, 7, 12):
         got = crossed_screen(TEMPLATE, Arch, size=size, rng=random.Random(size))
@@ -148,6 +282,32 @@ def test_structure_phase_off_by_default_and_charges_nothing():
                                                 evaluation_budget=12, seed=1))
     assert res.evaluations <= 12
     assert not any("structure" in h for h in res.history)
+
+
+def test_the_screen_fix_leaves_the_unscreened_fossil_byte_identical():
+    """A run that buys no screen must not move one byte when the screen changes.
+
+    The digest below was taken from the pre-fix build (2026-08-25) over the
+    full sequence of configurations the problem was asked to evaluate. The
+    screen fix is default-ON, so this is the guard that says where its blast
+    radius stops: ``structure_budget=0`` never calls :func:`crossed_screen`,
+    and every fossil row recorded that way stays exactly quotable.
+    """
+    import hashlib
+    import json
+
+    from agent_evolve.contract import as_problem
+    from agent_evolve.session.genetic_loop import GeneticConfig, run_genetic_loop
+    p = _and_gate_problem()
+    run_genetic_loop(
+        problem=as_problem(p),
+        config=GeneticConfig(population_size=4, offspring_per_generation=3,
+                             generations=20, evaluation_budget=32,
+                             structure_budget=0, seed=20260825))
+    blob = json.dumps(p.seen, sort_keys=True, default=str).encode()
+    assert len(p.seen) == 30
+    assert hashlib.sha256(blob).hexdigest() == (
+        "ba38d56c8502ce82b649db2de18333813efadf4121165022351e9a067042fbac")
 
 
 def test_structure_phase_spends_its_budget_and_installs_a_prior():
@@ -258,6 +418,18 @@ def test_pooled_screen_makes_pure_then_spiked_candidates():
     # then spiked: the value holds every other position
     assert screen[3]["genome"][0::2] == ["a", "a", "a"]
     assert len(set(screen[3]["genome"])) > 1, "a spike is not a pure repeat"
+
+
+def test_the_pooled_design_is_untouched_by_the_ladder_fix():
+    # The pooled variant returns before the free ladder is ever built: its
+    # pure-then-spiked sequence is a property of the vocabulary, not of a seed.
+    a = crossed_screen(SEQ_TEMPLATE, _Seq, size=7, pool_by_field=True,
+                       rng=random.Random(21))
+    b = crossed_screen(SEQ_TEMPLATE, _Seq, size=7, pool_by_field=True,
+                       rng=random.Random(22))
+    c = crossed_screen(SEQ_TEMPLATE, _Seq, size=7, pool_by_field=True)
+    assert a == b == c
+    assert a[0]["genome"] == ["a"] * 6
 
 
 def test_pooled_attribution_counts_every_position_as_an_observation():

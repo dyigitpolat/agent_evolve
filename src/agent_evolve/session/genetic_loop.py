@@ -27,7 +27,10 @@ from agent_evolve.core.results import SearchResult, dominates
 from agent_evolve.core.telemetry import harvest_telemetry
 from agent_evolve.policies.genetic import (
     Locus,
+    coverage_candidate,
+    coverage_counts,
     crossover,
+    incumbent_candidate,
     loci_of,
     mutate,
     one_mutation_neighbourhood,
@@ -37,7 +40,8 @@ from agent_evolve.policies.genetic import (
 from agent_evolve.session.evaluate import EvaluationCache, evaluate_batch
 
 __all__ = ["OperatorChoice", "OperatorChooser", "GeneticConfig", "run_genetic_loop",
-           "random_chooser", "domination_rank"]
+           "random_chooser", "domination_rank", "explore_probability",
+           "best_member"]
 
 Config = Dict[str, Any]
 
@@ -184,6 +188,61 @@ class GeneticConfig:
     #: generation breeds as usual. Ignored when there is no budget to reserve
     #: a fraction OF.
     polish_reserve: float = 0.15
+    #: DECLARED-DOMAIN EXPLORATION. "coverage" spends some of each
+    #: generation's offspring slots on a fresh configuration drawn from each
+    #: locus's LEAST-MEASURED DECLARED values -- counted over the schema's
+    #: whole domain and never over the prior's narrowed support. "off" -- the
+    #: default -- is byte-identical to the pre-exploration seam: no slot is
+    #: taken, no RNG stream is created, no key is tracked and no counter moves.
+    #:
+    #: The measurement it answers. On the analog venue every installed prior
+    #: allowed at most level 13-15 of a 23-32 level ladder; pooling 12,899 real
+    #: evaluations, the best inside that box reads -0.4002 reward9 and the best
+    #: outside it -0.0566, and 100 of the pooled top-100 carry at least one
+    #: coordinate the box excludes. HEBO reaches 95.6% coverage of the declared
+    #: (field, value) cells by charge 80; our arms stall at 72.1%, and the
+    #: frozen arm adds no new declared value at all after the screen
+    #: (INVESTIGATION.md, S5).
+    #:
+    #: It is HALF a fix, and the other half is `intensify` below: the two of
+    #: our cells that already spend 82-96% of their charges outside the box
+    #: come back with -0.457 and -0.452, no better than the cells that stay in.
+    #: Leaving the box without intensification pays nothing.
+    explore: str = "off"
+    #: ``(e0, e_min)``: the probability that any one offspring slot is an
+    #: exploration draw, declining LINEARLY in the fraction of the evaluation
+    #: budget already charged. Both ends are declared rather than tuned; a run
+    #: with no evaluation budget has no horizon to decline over and holds at
+    #: ``e0``. See :func:`explore_probability`.
+    explore_schedule: tuple = (0.5, 0.1)
+    #: INCUMBENT INTENSIFICATION. "incumbent" spends a fraction of each
+    #: generation's offspring slots -- after the exploration slots -- on the
+    #: current best member with a seeded random subset of its loci PINNED and
+    #: the rest resampled through the prior in force. "off" -- the default --
+    #: is byte-identical to the pre-intensification seam, on the same terms as
+    #: `explore`.
+    #:
+    #: This is what "coordinated combinations" turned out to be when the
+    #: populations that motivated it were actually measured: HEBO's winners are
+    #: ONE incumbent-anchored cluster (single-linkage at Hamming <= 10 gives
+    #: exactly one cluster in 6 of 6 cells), with zero of 156
+    #: entropy-controlled coordinate pairs above z = 2 and a modal purity of
+    #: 0.695-0.842 -- a product of marginals pinned to an incumbent, not a
+    #: couplings table. And what it does that we do not is collapse: mean
+    #: |delta level| to the incumbent 4.21 -> 0.24 across budget quartiles,
+    #: against our 3.61 -> 2.98 (INVESTIGATION.md, S5). Classical, zero model
+    #: calls.
+    intensify: str = "off"
+    #: The share of a generation's offspring slots an intensification may take,
+    #: FLOORED to a whole slot and capped by what exploration left. 0.25 of six
+    #: offspring is one slot, which is the point: intensification is a bet
+    #: placed beside the generation, not instead of it.
+    intensify_fraction: float = 0.25
+    #: ``(low, high)``: how many loci one intensified child pins, drawn uniform
+    #: on the closed interval and clamped to the genome's own length. The band
+    #: is HEBO's measured modal-purity band over 24 loci -- 6 to 12 fields --
+    #: rather than a tuned pair.
+    intensify_pin_range: tuple = (6, 12)
     #: How survival breaks ties inside one domination count. "count" -- the
     #: default -- keeps the measurement order and is byte-identical.
     #: "crowding" prefers the members that are most alone in objective space
@@ -222,6 +281,92 @@ def domination_rank(
         float(sum(1 for other in objectives_of if dominates(other, this)))
         for this in objectives_of
     ]
+
+
+#: How many times a slot may redraw before it is given back to breeding. A
+#: mechanism that cannot produce anything the run has not already measured has
+#: nothing to say this generation, and saying it eight times is enough to
+#: establish that; the slot then breeds rather than shrinking the generation,
+#: because an arm that spends fewer charges than its control is not a
+#: comparison.
+_DEDUP_ATTEMPTS = 8
+
+
+def explore_probability(
+    schedule: Sequence[float], *, spent: int, budget: Optional[int]
+) -> float:
+    """The per-slot exploration probability after *spent* of *budget* charges.
+
+    Linear in the fraction of the budget already charged: ``e0`` at the first
+    charge, ``e_min`` at the last, exactly halfway between them at half the
+    budget, and pinned at ``e_min`` by a run that somehow charges past its own
+    budget. A run with no declared budget has nothing to decline over and holds
+    at ``e0`` rather than inventing a horizon -- the same rule the polish
+    reserve uses for the same reason.
+
+    A declining schedule rather than a constant because the measured target
+    declines: HEBO's rate of proposing a value it has never measured is 0.288
+    in its first budget quartile and 0.001 in every later one
+    (INVESTIGATION.md, S5). Exploration is a phase, and a phase that never ends
+    is a uniform sampler wearing a schedule.
+    """
+
+    e0, e_min = float(schedule[0]), float(schedule[1])
+    if budget is None or budget <= 0:
+        return e0
+    progress = min(1.0, max(0.0, float(spent) / float(budget)))
+    # Written as the convex combination rather than `e0 + (e_min - e0) * p`,
+    # which is the same line of algebra and not the same arithmetic: the second
+    # form returns 0.09999999999999998 at the end of a (0.5, 0.1) schedule, so
+    # the declared floor would be a number the function never actually reaches.
+    return e0 * (1.0 - progress) + e_min * progress
+
+
+def best_member(
+    population: Sequence[tuple[Config, Mapping[str, float]]],
+    ranks: Sequence[float],
+    specs: Sequence[ObjectiveSpec],
+) -> Optional[Config]:
+    """The incumbent: the rank-0 member best on the FIRST declared objective.
+
+    A population with several objectives has no single best member, so the one
+    an intensification anchors on has to be CHOSEN, and the choice is declared
+    here rather than left to whatever order survival happened to produce.
+    Among the members nothing dominates, the one with the best value on
+    ``specs[0]``, read through that objective's own goal; among those, the one
+    measured EARLIEST, because population order is measurement order within a
+    rank and a first-wins tiebreak makes the anchor reproducible from the seed
+    alone. Returns None for an empty population, which is the only case with no
+    incumbent to name.
+    """
+
+    if not population or not specs:
+        return None
+    sign = 1.0 if specs[0].goal == "min" else -1.0
+    best: Optional[tuple[float, Config]] = None
+    for (config, objectives), rank in zip(population, ranks):
+        if rank != 0:
+            continue
+        value = sign * float(objectives[specs[0].name])
+        if best is None or value < best[0]:    # strict: the earliest wins ties
+            best = (value, config)
+    return None if best is None else best[1]
+
+
+def _pair(value: Any, name: str) -> tuple:
+    """A knob declared as two numbers, read as two numbers or refused by name."""
+
+    try:
+        items = tuple(value)
+    except TypeError:
+        items = ()
+    if len(items) != 2:
+        raise ValueError(f"{name} must be a pair, got {value!r}")
+    return items
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def random_chooser(rng: random.Random, n_loci: int) -> OperatorChooser:
@@ -272,7 +417,35 @@ def run_genetic_loop(
     if config.survival not in ("count", "crowding"):
         raise ValueError(
             f"survival must be 'count' or 'crowding', got {config.survival!r}")
+    if config.explore not in ("off", "coverage"):
+        raise ValueError(
+            f"explore must be 'off' or 'coverage', got {config.explore!r}")
+    if config.intensify not in ("off", "incumbent"):
+        raise ValueError(
+            f"intensify must be 'off' or 'incumbent', got {config.intensify!r}")
     polish_on = config.polish == "sweep"
+    explore_on = config.explore == "coverage"
+    intensify_on = config.intensify == "incumbent"
+    # The numeric knobs are validated whether or not their mechanism is on. A
+    # nonsense schedule sitting quietly beside `explore="off"` is a bug waiting
+    # for the day someone turns the mechanism on, and it costs nothing to say
+    # so now.
+    schedule = _pair(config.explore_schedule, "explore_schedule")
+    if not all(_is_number(x) and 0.0 <= float(x) <= 1.0 for x in schedule):
+        raise ValueError(
+            "explore_schedule must be (e0, e_min), two probabilities in "
+            f"[0, 1], got {config.explore_schedule!r}")
+    if not _is_number(config.intensify_fraction) or not (
+            0.0 <= float(config.intensify_fraction) <= 1.0):
+        raise ValueError(
+            "intensify_fraction must be a fraction in [0, 1], got "
+            f"{config.intensify_fraction!r}")
+    pin_low, pin_high = _pair(config.intensify_pin_range, "intensify_pin_range")
+    if not all(isinstance(x, int) and not isinstance(x, bool)
+               for x in (pin_low, pin_high)) or pin_low < 1 or pin_high < pin_low:
+        raise ValueError(
+            "intensify_pin_range must be (low, high), two integers with "
+            f"1 <= low <= high, got {config.intensify_pin_range!r}")
 
     specs = list(problem.objectives)
     candidate_model = getattr(problem, "candidate_model", None)
@@ -325,17 +498,19 @@ def run_genetic_loop(
 
     # What the run has already put in front of the evaluator, by configuration
     # identity. The evaluation cache keys the MATERIALIZED artifact, which the
-    # loop cannot compute for a candidate it has not built yet, so the sweep's
-    # dedup reads this instead: every configuration handed to measure(),
-    # whether it was charged, served from cache or refused. Populated only
-    # under polish, so "off" leaves no side effect behind at all.
+    # loop cannot compute for a candidate it has not built yet, so every
+    # mechanism that has to dedup its own proposals reads this instead: every
+    # configuration handed to measure(), whether it was charged, served from
+    # cache or refused. Populated only under the mechanisms that need it, so
+    # all of them off leaves no side effect behind at all.
     seen_keys: Set[str] = set()
+    track_seen = polish_on or explore_on or intensify_on
 
     def measure(configs: List[Config], gen: int) -> List[Any]:
         room = budget_left()
         if room <= 0:
             return []
-        if polish_on:
+        if track_seen:
             seen_keys.update(_default_candidate_key(c) for c in configs[:room])
         valid, failed, _ordered = evaluate_batch(
             problem, configs[:room], specs, cache=cache
@@ -522,6 +697,17 @@ def run_genetic_loop(
     # exactly the same draws whether or not screening is on, or "off" stops
     # being byte-identical to the pre-screening seam.
     rng_pool = random.Random(0 if config.seed is None else (config.seed ^ 0x5CEE11))
+    # Each slot-taking mechanism draws from its OWN stream, for the same reason
+    # the pool does, and one reason more: the 2x2 ablation that measures them
+    # (base / +explore / +intensify / both) must not have one arm's draws move
+    # because the other arm was switched on. A stream is created only when its
+    # mechanism is on, so "off" constructs nothing.
+    rng_explore = (random.Random(0 if config.seed is None
+                                 else (config.seed ^ 0xC0FFEE))
+                   if explore_on else None)
+    rng_intensify = (random.Random(0 if config.seed is None
+                                   else (config.seed ^ 0x1CE111))
+                     if intensify_on else None)
 
     # --- endgame polish state ------------------------------------------------
     # The stall tracker reads the population and the charge counter and draws
@@ -606,17 +792,101 @@ def run_genetic_loop(
                            "proposed": len(polish_kids),
                            "member_index": member_index}
 
+        # --- exploration and intensification: two slots, one rule ------------
+        # Both mechanisms take offspring SLOTS out of this generation -- never
+        # extra charges -- and the order is declared: exploration first, then
+        # intensification of whatever is left, then normal breeding fills the
+        # rest, so the generation spends exactly the charges it would have
+        # spent anyway. Polish supersedes both: a sweep already IS the
+        # generation's answer, and taking slots out of an enumerated
+        # neighbourhood would leave the enumeration incomplete for no gain.
+        # Neither draws a model call.
+        extra_kids: List[Config] = []
+        explore_count = 0
+        intensify_count = 0
+        if (explore_on or intensify_on) and not polishing:
+            proposed_keys: Set[str] = set()
+
+            def admit(candidate: Config) -> bool:
+                """Take *candidate* unless the run has already proposed it."""
+
+                key = _default_candidate_key(candidate)
+                if key in seen_keys or key in proposed_keys:
+                    return False
+                proposed_keys.add(key)
+                extra_kids.append(candidate)
+                return True
+
+            if explore_on:
+                probability = explore_probability(
+                    schedule, spent=spent(),
+                    budget=config.evaluation_budget)
+                # Coverage is counted over the run's OWN trace -- every row it
+                # charged, including the screen's and the initial population's
+                # -- and against the DECLARED domain. See `coverage_counts`
+                # for why the declared domain and not the allowed one.
+                counts = coverage_counts(
+                    [row for row, _objectives in state.evaluated],
+                    seeds[0], candidate_model)
+                for _slot in range(want):
+                    if rng_explore.random() >= probability:
+                        continue
+                    for _attempt in range(_DEDUP_ATTEMPTS):
+                        candidate = coverage_candidate(
+                            seeds[0], candidate_model, counts=counts,
+                            rng=rng_explore)
+                        if admit(candidate):
+                            explore_count += 1
+                            # This generation's own draws count against the
+                            # next slot's tally. Without that, two slots in one
+                            # generation see the same least-measured values and
+                            # propose the same configuration twice.
+                            coverage_counts([candidate], seeds[0],
+                                            candidate_model, counts=counts)
+                            break
+
+            if intensify_on:
+                # Floored to a whole slot, and rounded to nine places first so
+                # that the declared arithmetic is the arithmetic: 0.3 of ten
+                # slots is 2.9999999999999996 in binary, and flooring that
+                # gives two where three was asked for.
+                slots = min(want - len(extra_kids),
+                            int(round(float(config.intensify_fraction) * want,
+                                      9)))
+                incumbent = best_member(population, ranks, specs)
+                if incumbent is not None:
+                    anchor_loci = loci_of(incumbent)
+                    for _slot in range(max(0, slots)):
+                        for _attempt in range(_DEDUP_ATTEMPTS):
+                            # q is clamped to the genome: a pin band read off a
+                            # 24-locus venue must not ask a 6-locus one to hold
+                            # loci it does not have.
+                            pinned = min(len(anchor_loci),
+                                         rng_intensify.randint(pin_low, pin_high))
+                            candidate = incumbent_candidate(
+                                incumbent, candidate_model,
+                                pin=rng_intensify.sample(anchor_loci, pinned),
+                                rng=rng_intensify, restriction=restriction)
+                            if admit(candidate):
+                                intensify_count += 1
+                                break
+
+        # What breeding is left to fill. With both mechanisms off this is
+        # `want` exactly, and every arithmetic below it is the arithmetic that
+        # was there before they existed.
+        want_bred = want - len(extra_kids)
+
         # An authored generator draws the whole generation, so there is no
         # parent choice to make and the chooser is not consulted -- calling it
         # and discarding the answer would spend a model call on nothing.
-        if config.generator is None and not polishing:
-            choices = list(pick(ranked, want, state))[:want]
+        if config.generator is None and not polishing and want_bred > 0:
+            choices = list(pick(ranked, want_bred, state))[:want_bred]
             # A chooser that returns too few must not silently shrink the
             # generation: the arm would then spend less budget than the control
             # it is compared against. Top up at random and record how many, so
             # the shortfall shows up in the result instead of in the conclusion.
-            if len(choices) < want:
-                filled = want - len(choices)
+            if len(choices) < want_bred:
+                filled = want_bred - len(choices)
                 choices = list(choices) + list(
                     random_chooser(rng, n_loci)(ranked, filled, None)
                 )
@@ -651,14 +921,20 @@ def run_genetic_loop(
         pool_kids: Optional[List[Config]] = None
         if polishing:
             kids = [dict(kid) for kid in polish_kids]
+        elif want_bred <= 0:
+            # Exploration and intensification between them filled the
+            # generation. There is no breeding left to construct, and asking a
+            # constructor for zero candidates -- a generator especially, which
+            # would spend a model call on it -- is a call with no answer.
+            kids = []
         elif config.generator is not None:
             pool_kids = config.generator.propose(
                 template=seeds[0], candidate_model=candidate_model,
                 restriction=restriction,
                 archive=[c for c, _o in population],
-                want=want, rng=rng_pool,
+                want=want_bred, rng=rng_pool,
                 seed=(config.seed or 0) * 1000 + gen)
-            kids = [dict(kid) for kid in pool_kids[:want]]
+            kids = [dict(kid) for kid in pool_kids[:want_bred]]
         elif config.portfolio is not None:
             pairs = [
                 (population[choice.parent_a % len(population)][0],
@@ -714,17 +990,18 @@ def run_genetic_loop(
                     # the ones it cannot see, so it reserves more of the
                     # generation for the chooser's unscreened picks.
                     floor_n = min(len(kids), max(1, math.ceil(
-                        config.screening.exploration_floor_for(report) * want)))
+                        config.screening.exploration_floor_for(report)
+                        * want_bred)))
                     keep = list(range(floor_n))
                     for index in report.order:
-                        if len(keep) >= want:
+                        if len(keep) >= want_bred:
                             break
                         if index >= floor_n:
                             keep.append(index)
-                    kids = [pool_kids[index] for index in keep[:want]]
+                    kids = [pool_kids[index] for index in keep[:want_bred]]
                     if pool_origins is not None:
                         kid_origins = [pool_origins[index]
-                                       for index in keep[:want]]
+                                       for index in keep[:want_bred]]
                     screen_note = {
                         "pool": len(pool_kids), "held_out": floor_n,
                         "advanced": len(kids) - floor_n, "active": True,
@@ -738,6 +1015,14 @@ def run_genetic_loop(
                         "objectives_declared": list(report.declared_objectives),
                         "partial": bool(report.partial),
                     }
+
+        # The slots taken above go in ahead of the offspring and bypass the
+        # screen, exactly as the immigrants below do and for the same reason:
+        # the screen orders what BREEDING constructed, and a draw made to leave
+        # the region the screen's own surrogate was fitted in is not a
+        # candidate that surrogate has any standing to re-order.
+        if extra_kids:
+            kids = [dict(kid) for kid in extra_kids] + list(kids)
 
         # --- immigrants: authored members, ahead of the offspring -----------
         # They bypass the screen exactly as the initial proposals do: the
@@ -832,6 +1117,13 @@ def run_genetic_loop(
             entry["reguide"] = reguide_note
         if injected:
             entry["reguide_immigrants"] = injected
+        if explore_on:
+            # Recorded whenever the mechanism is on, including the zero: a
+            # generation whose schedule drew no slot, or whose draws all
+            # collided with the trace, is a measured zero and not an absence.
+            entry["explore"] = explore_count
+        if intensify_on:
+            entry["intensify"] = intensify_count
         if screen_note is not None:
             entry["screen"] = screen_note
         if polish_note is not None:
@@ -847,8 +1139,8 @@ def run_genetic_loop(
             entry["portfolio"] = config.portfolio.summary()
         history.append(entry)
         if filled:
-            log(f"generation {gen}: the chooser supplied {want - filled} of "
-                f"{want} choices; {filled} were filled at random")
+            log(f"generation {gen}: the chooser supplied {want_bred - filled} "
+                f"of {want_bred} choices; {filled} were filled at random")
         log(f"generation {gen}: {len(valid)} evaluated, {spent()} of "
             f"{config.evaluation_budget} budget used")
 

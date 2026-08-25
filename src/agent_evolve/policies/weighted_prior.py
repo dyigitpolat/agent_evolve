@@ -18,6 +18,17 @@ only narrow, misses are counted, seeds survive, and the unwind test applies
 wherever the prior actually excludes something. A prior that excludes nothing
 makes no refutable claim; it only biases draws, and its worst case is bounded
 by the declared domain.
+
+THE PRIOR FLOOR (2026-08-25). A prior that excludes IS refutable in principle
+and was not refutable in practice: the loop's unwind test only fires when the
+restricted search fails to match a screen point the prior excluded, and the
+screen is the very instrument whose blind spot put the exclusion there. Twenty
+of twenty analog cells never reopened an excluded value for the rest of the
+run, and the region the prior had zeroed held the venue's best configurations.
+So every prior installed here now keeps a FLOOR of sampling mass -- see
+:data:`PRIOR_FLOOR` and :func:`floor_weights` -- on every value the schema
+declares. A wrong box then costs draws instead of costing the answer, and the
+run itself can refute it.
 """
 
 from __future__ import annotations
@@ -40,6 +51,8 @@ __all__ = [
     "statistical_weighted_prior",
     "WeightedPriorTelemetry",
     "llm_weighted_prior_proposer",
+    "floor_weights",
+    "PRIOR_FLOOR",
     "PROMPT",
     "COMMITTED_PROMPT",
     "PRIOR_STYLES",
@@ -47,6 +60,26 @@ __all__ = [
 
 #: How the prompt's last instruction reads. See :data:`COMMITTED_PROMPT`.
 PRIOR_STYLES = ("cautious", "committed")
+
+#: The smallest share of a locus's sampling mass any DECLARED value may hold
+#: once a prior is installed. Both prior entry points here read it at CALL
+#: time, so it is the one place the floor is set and the one place a study
+#: turns it off (``0.0`` restores the pre-floor arithmetic exactly, byte for
+#: byte -- see :func:`floor_weights`).
+#:
+#: 0.02 is a defect fix and is disclosed as one. CHANGELOG-ready wording:
+#: *"Installed sampling priors now keep at least 2% of each locus's mass on
+#: every declared value (``weighted_prior.PRIOR_FLOOR``). A prior that zeroed
+#: a region the screen never measured previously ended the run's ability to
+#: sample there at all -- measured on 20 of 20 analog cells, where the zeroed
+#: region held the venue's best configurations. Set ``PRIOR_FLOOR = 0.0`` to
+#: restore the previous behaviour exactly."*
+#:
+#: Why 2% and not 10%: the floor is insurance, not exploration. At the analog
+#: venue's 24 loci a 2% floor costs a draw its prior-preferred value on about
+#: one locus in two, which is inside the mutation noise the loop already runs
+#: with; 10% would be a second exploration mechanism wearing this one's name.
+PRIOR_FLOOR = 0.02
 
 
 @dataclass(frozen=True)
@@ -159,11 +192,81 @@ class WeightedRestriction:
         return tuple(mapped)
 
 
+def floor_weights(
+    values: Sequence[Any],
+    weights: Sequence[float],
+    *,
+    domain: Sequence[Any] | None = None,
+    floor: float | None = None,
+) -> tuple[tuple[Any, ...], tuple[float, ...]]:
+    """``(values, weights)`` with no declared value below *floor* of the mass.
+
+    One generic operation, used by both prior entry points, so a floored prior
+    means the same thing whoever proposed it.
+
+    *domain* is the schema's declared vocabulary for the locus. A value the
+    proposal OMITS is an exclusion written as an absence, so the domain is
+    folded in at weight zero before the floor is applied -- otherwise the
+    cheapest way to zero a region would also be the one way to escape the
+    floor. Omit *domain* (the screen-derived prior, whose vocabulary is
+    whatever the screen measured) and the entry's own values are the domain.
+
+    The floor is applied as a MIXTURE with the uniform distribution -- ``w' =
+    (1 - a) * w + a / k``, with ``a`` the smallest weight that lifts the
+    minimum to the floor -- and not by clipping. Two properties follow, and
+    both are the reason for the shape:
+
+    * **Order is preserved, strictly.** Clipping ties every below-floor value
+      at the floor and throws away the proposal's ranking of exactly the
+      values it was least sure about. A mixture keeps ``w_i > w_j`` wherever
+      the proposal said so.
+    * **The concentration cap survives.** For positive vectors the max/min
+      ratio of a convex combination with the uniform vector is at most the
+      ratio of the input, so a prior admitted under a ``max_weight_ratio``
+      bound is still inside it after flooring. Flooring can only make a prior
+      flatter.
+
+    ``floor <= 0`` returns *values* and *weights* unchanged, and so does any
+    entry already at or above the floor: the return is the caller's own
+    tuples, not a rebuilt copy, so a run with nothing to floor takes the
+    pre-floor arithmetic byte for byte. The effective floor is capped at
+    ``1/k`` -- k values cannot each hold more than an equal share -- so a floor
+    larger than that flattens the locus to uniform rather than failing.
+    """
+
+    kept_values = tuple(values)
+    kept_weights = tuple(float(w) for w in weights)
+    floor = PRIOR_FLOOR if floor is None else float(floor)
+    if floor <= 0.0 or not kept_values:
+        return tuple(values), tuple(weights)
+
+    table = {v: w for v, w in zip(kept_values, kept_weights)}
+    full = tuple(domain) if domain else ()
+    if full and all(v in full for v in kept_values):
+        # Domain order, so a floored entry reads in the schema's own order
+        # whoever proposed it. Reached only when the floor actually binds.
+        kept_values = full
+        kept_weights = tuple(table.get(v, 0.0) for v in full)
+
+    total = math.fsum(kept_weights)
+    if total <= 0.0:                    # rejected upstream; nothing to floor
+        return tuple(values), tuple(weights)
+    k = len(kept_values)
+    shares = [w / total for w in kept_weights]
+    effective = min(floor, 1.0 / k)
+    lowest = min(shares)
+    if lowest >= effective:
+        return tuple(values), tuple(weights)
+    alpha = min(1.0, max(0.0, (effective - lowest) / (1.0 / k - lowest)))
+    return kept_values, tuple((1.0 - alpha) * s + alpha / k for s in shares)
+
+
 def statistical_weighted_prior(
     attr: Attribution,
     candidate_model: Any = None,
     *,
     min_levels: int = 2,
+    prior_floor: float | None = None,
 ) -> WeightedRestriction:
     """The credential-free graded prior: weight levels by the screen's evidence.
 
@@ -174,6 +277,12 @@ def statistical_weighted_prior(
     A locus whose rates all tie is left free -- the honest reading of a screen
     that separated nothing. This ships as the rule any model-proposed weighted
     prior has to beat.
+
+    *prior_floor* defaults to :data:`PRIOR_FLOOR`, read at call time. Laplace
+    smoothing already keeps every SCREENED level positive, so the floor is
+    inert here at any screen small enough for ``0.5/(n+1)`` to stay above it
+    and binds only on the wide screens where a single unlucky level would
+    otherwise be arithmetically erased. Pass ``0.0`` for the pre-floor numbers.
     """
 
     weighted: dict[str, tuple[tuple[Any, ...], tuple[float, ...]]] = {}
@@ -186,7 +295,10 @@ def statistical_weighted_prior(
         }
         if len(set(rates.values())) < 2:
             continue
-        weighted[name.split("[")[0]] = (tuple(rates), tuple(rates.values()))
+        # No `domain=`: the screen's vocabulary is what this proposer can
+        # speak for, and a level it never measured is not one it excluded.
+        weighted[name.split("[")[0]] = floor_weights(
+            tuple(rates), tuple(rates.values()), floor=prior_floor)
     return WeightedRestriction(weighted)
 
 
@@ -272,6 +384,7 @@ def llm_weighted_prior_proposer(
     telemetry: WeightedPriorTelemetry | None = None,
     domain_context: str = "",
     style: str = "cautious",
+    prior_floor: float | None = None,
 ) -> Callable[[Attribution, Any], WeightedRestriction]:
     """A prior proposer that elicits a GRADED prior and repairs nothing.
 
@@ -288,6 +401,17 @@ def llm_weighted_prior_proposer(
     :data:`COMMITTED_PROMPT`). It changes the prompt's last sentence and
     nothing else: same reply shape, same parse, same validation, so the two
     arms differ by the clause alone.
+
+    *prior_floor* defaults to :data:`PRIOR_FLOOR`, read at call time, and is
+    applied at INSTALL -- after the reply has been accepted whole, never as a
+    repair that would let a rejected reply through. This is the path the floor
+    exists for: a reply's omission of a value is an exclusion, so the declared
+    domain is folded back in at the floor and the accepted weights keep their
+    order above it. One consequence, stated rather than discovered: with the
+    floor on, a floored locus's ``allowed`` is its full declared domain, so
+    the prior stops making an exclusion claim there and the loop's unwind test
+    has nothing to unwind on it. That is the trade the floor buys -- an
+    unfalsifiable exclusion is replaced by a bounded bias.
     """
 
     from agent_evolve.policies.semantics import objective_lines, parameter_lines
@@ -374,7 +498,12 @@ def llm_weighted_prior_proposer(
             support = {v for v, w in zip(values, clean) if w > 0.0}
             if len(set(clean)) == 1 and support == set(domain):
                 continue                      # the full domain, evenly: free
-            weighted[name] = (tuple(values), tuple(clean))
+            # The floor lands HERE and not in the parse: what is admitted is
+            # what the model wrote, and what is installed is what the loop
+            # will sample from. Reading the reply and installing it are two
+            # different acts and only the second one is insured.
+            weighted[name] = floor_weights(
+                values, clean, domain=domain, floor=prior_floor)
 
         if not weighted:
             tel.empty += 1

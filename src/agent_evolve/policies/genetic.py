@@ -34,6 +34,9 @@ __all__ = [
     "mutate",
     "one_mutation_neighbourhood",
     "uniform_candidate",
+    "coverage_counts",
+    "coverage_candidate",
+    "incumbent_candidate",
     "tournament",
     "crowding_distances",
     "truncation_survival",
@@ -623,6 +626,135 @@ def uniform_candidate(
             drew = True
     if not drew:
         return mutate(template, candidate_model, rng=r, restriction=restriction)
+    return out
+
+
+def coverage_counts(
+    rows: Iterable[Mapping[str, Any]],
+    template: Mapping[str, Any],
+    candidate_model: Any,
+    *,
+    counts: "dict[Locus, list[int]] | None" = None,
+) -> "dict[Locus, list[int]]":
+    """How many of *rows* carry each DECLARED value of each locus.
+
+    The tally is aligned to :func:`locus_domain`'s declared order, one slot per
+    declared value, and it is NEVER narrowed by a prior. That is the
+    load-bearing choice rather than an oversight: a coverage channel that
+    counts only the values a restriction still allows cannot notice that the
+    region it was handed is the wrong one. Measured on the analog venue, every
+    installed prior's ceiling was level 13-15 of a 23-32 level ladder, the best
+    in-box evaluation of 12,899 reads -0.4002 while the best outside reads
+    -0.0566, and 100 of the pooled top-100 carry at least one coordinate the
+    box excludes (INVESTIGATION.md, S5). Counting inside the box would have
+    reported that venue fully covered.
+
+    Loci come from *template*, so a ragged row that does not carry one
+    contributes nothing to it rather than an invented zero, and loci the schema
+    does not constrain get no tally at all -- there is no coverage to speak of
+    where there are no declared values to cover.
+
+    *counts*, when given, is EXTENDED by *rows* in place and returned: a caller
+    that wants this generation's own draws counted against the next one does
+    not re-walk the whole trace to do it.
+    """
+
+    loci = loci_of(template)
+    domains = {lc: locus_domain(candidate_model, lc) for lc in loci}
+    tally: dict[Locus, list[int]] = {} if counts is None else counts
+    for locus, domain in domains.items():
+        if domain and (locus not in tally or len(tally[locus]) != len(domain)):
+            tally[locus] = [0] * len(domain)
+    for row in rows:
+        for locus, domain in domains.items():
+            if not domain:
+                continue
+            try:
+                value = read_locus(row, locus)
+            except (KeyError, IndexError, TypeError):
+                continue                    # this row does not carry this locus
+            for index, declared in enumerate(domain):
+                if declared == value:
+                    tally[locus][index] += 1
+                    break
+    return tally
+
+
+def coverage_candidate(
+    template: Mapping[str, Any],
+    candidate_model: Any,
+    *,
+    counts: "Mapping[Locus, Sequence[int]]",
+    rng: random.Random | None = None,
+) -> dict[str, Any]:
+    """A fresh candidate drawn from each locus's LEAST-MEASURED declared values.
+
+    Every locus with a declared domain is resampled -- this is a fresh
+    configuration, not a mutant -- and the values it may be resampled to are
+    exactly the ones *counts* has seen fewest of. Ties draw uniformly among the
+    tied values, so a run that has measured nothing yet draws uniformly over
+    the whole declared domain and the channel degrades to what it should
+    degrade to.
+
+    No restriction and no weights. The prior is the box, and the whole point of
+    this draw is to leave it: a coverage draw graded by the prior's own mass
+    would spend its slot re-covering the region the prior already prefers.
+    Loci the schema does not constrain keep the template's value, for the same
+    reason :func:`uniform_candidate` does -- inventing values the problem never
+    declared is not sampling.
+    """
+
+    r = rng or random.Random()
+    out = dict(template)
+    for locus in loci_of(template):
+        domain = locus_domain(candidate_model, locus)
+        if not domain:
+            continue
+        seen = tuple(counts.get(locus) or ())
+        if len(seen) != len(domain):
+            seen = (0,) * len(domain)       # no tally for it is no coverage
+        fewest = min(seen)
+        least = tuple(value for value, count in zip(domain, seen)
+                      if count == fewest)
+        out = write_locus(out, locus, r.choice(least))
+    return out
+
+
+def incumbent_candidate(
+    incumbent: Mapping[str, Any],
+    candidate_model: Any,
+    *,
+    pin: Iterable[Locus],
+    rng: random.Random | None = None,
+    restriction: SamplingPrior | None = None,
+) -> dict[str, Any]:
+    """*incumbent* with the loci in *pin* held, every other locus resampled.
+
+    The classical reading of what a third-party optimizer's winning population
+    actually is. Measured against HEBO's own top decile: one incumbent-anchored
+    cluster in 6 of 6 cells at single-linkage Hamming <= 10, zero of 156
+    entropy-controlled coordinate pairs above z = 2, and a modal purity of
+    0.695-0.842 over 6-12 fields (INVESTIGATION.md, S5). That is not a learned
+    coupling table -- it is one member with most of its fields frozen and the
+    rest redrawn, which is what this function is.
+
+    The unpinned loci are drawn through *restriction* exactly as
+    :func:`uniform_candidate` draws them, so an intensification samples the
+    prior in force rather than a second distribution nobody declared. Loci with
+    no declared domain keep the incumbent's value whether they were pinned or
+    not: there is nothing to resample them from.
+    """
+
+    r = rng or random.Random()
+    held = frozenset(pin)
+    out = dict(incumbent)
+    for locus in loci_of(incumbent):
+        if locus in held:
+            continue
+        domain = locus_domain(candidate_model, locus, restriction=restriction)
+        if not domain:
+            continue
+        out = write_locus(out, locus, _draw(r, domain, locus, restriction))
     return out
 
 

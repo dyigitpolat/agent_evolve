@@ -21,6 +21,13 @@ says "nothing is excludable" no matter who reads it. Measured: on the same
 venue, a marginally-balanced 8-run screen identified one of two deciding loci,
 while a crossed 4-run screen identified both. Fewer evaluations, better design.
 
+Crossing the few loci that fit is only half of it, and the half this module
+shipped without: the loci that do NOT fit in the crossing must still be
+decorrelated from each other, or the design collapses onto the space's main
+diagonal and every prior fit from it lives in a box the diagonal happened to
+pass through. That defect shipped, was measured, and is fixed -- see
+:func:`crossed_screen`.
+
 A prior governs SAMPLING, not the caller's input. Seeds are data the caller
 supplied and survive a restriction untouched; only drawn candidates -- fresh
 initialization and mutation -- are confined. A prior that could delete a seed
@@ -101,13 +108,46 @@ def crossed_screen(
 
     The blocking loci are fully crossed -- every combination of their values
     appears equally often -- so their contrasts are not confounded with each
-    other. Every remaining locus walks the same ladder of values inside each
-    block, so its levels are matched across blocks rather than correlated with
-    them.
+    other. Every remaining locus walks its OWN ladder of values, and the same
+    ladder of rows is reused inside each block, so a free locus's levels stay
+    matched across blocks rather than correlated with them.
 
     Chosen automatically when *blocking* is omitted: the loci with the smallest
     declared domains, taking as many as fit in *size*. Small domains are where
     structural switches live, and they are the cheapest to cross.
+
+    **Fixed 2026-08-25 -- the free ladder was a DIAGONAL, and it boxed every
+    prior this package ever fit.** Until this change every free locus read the
+    same ladder index ``t``, so row ``t`` set *every* free locus to level
+    ``t % len(domain)``. On the 24-locus analog venue (20 declared levels per
+    locus, ``size=16``, nothing crossable) the 16 "crossed" rows were literally
+    the main diagonal: row 0 every locus at its minimum, row 8 every locus at
+    mid-ladder, row 15 every locus at level 15 -- byte-reproduced from the
+    frozen ``results_probe320`` traces. The consequences were measured, not
+    inferred. The installed prior's maximum allowed level index was 13-15 in
+    20 of 20 analog cells and never once above 15, while over the venue's
+    12,899 valid evaluations the best in-box point (all 24 coordinates at level
+    <= 15) scores reward9 **-0.4002** against a true best of **-0.0566**, and
+    **100 of the pooled top 100 sit outside the box**. Our own finals sat at
+    -0.353 ... -0.555: at the ceiling of the box, not failing inside it. The
+    same shared index walked 5 of 6 NAS loci in lockstep, and on the fleet 15
+    of 16 screen rows had ``e1=e2=e3=e4=e5``, which handed 7 of 12 seeds
+    *identical* allowed sets for those five loci.
+
+    Every screen-using row recorded before 2026-08-25 therefore measured a
+    diagonal. Those rows remain quotable as measured on the substrate they ran
+    on; they are not evidence about a space-filling screen, and no prior-quality
+    claim survives being carried across this fix without a rerun.
+
+    The repair is a deterministic latin-hypercube-style assignment. Each free
+    locus gets its own column: its level indices, permuted with the run's
+    ``rng``, laid down the rows and re-permuted every time the ladder is longer
+    than the domain. Loci are decorrelated from one another because their
+    permutations are independent, while each still sweeps its full ladder --
+    every level appears at least ``rows // len(domain)`` times, which is the
+    per-level n :func:`attribute` needs. The design is default-on and exact
+    given the seed. A run with ``structure_budget=0`` never reaches this
+    function at all, so the pre-fix fossil is byte-unchanged.
 
     ``pool_by_field`` changes the design for SEQUENCE fields, whose positions
     share one vocabulary: crossing them is out of reach (k^n cells) and
@@ -150,10 +190,9 @@ def crossed_screen(
     per_cell = max(1, size // max(1, cells))
     # One shared ladder of settings for the non-blocking loci, reused verbatim
     # in every block: that is what keeps their levels matched across blocks.
-    ladder = [
-        {lc: domains[lc][t % len(domains[lc])] for lc in rest}
-        for t in range(per_cell)
-    ]
+    # Within the ladder each locus walks its own permutation, which is what
+    # keeps the rows off the diagonal (see this function's docstring).
+    ladder = _free_ladder(rest, domains, per_cell, random.Random(r.getrandbits(64)))
 
     out: list[dict[str, Any]] = []
     combos = list(itertools.product(*[domains[lc] for lc in block])) or [()]
@@ -173,6 +212,39 @@ def crossed_screen(
             cfg = write_locus(cfg, lc, r.choice(domains[lc]))
         out.append(cfg)
     return out[:size]
+
+
+def _free_ladder(
+    loci: Sequence[Locus],
+    domains: Mapping[Locus, Sequence[Any]],
+    rows: int,
+    rng: random.Random,
+) -> list[dict[Locus, Any]]:
+    """One value per locus per row, sweeping each ladder without the diagonal.
+
+    Every locus gets an independent column: its declared levels shuffled, laid
+    down the rows, and reshuffled for each further pass when *rows* outruns the
+    domain. Two properties fall out and both are load-bearing. Coverage is
+    exactly what a balanced ladder gave -- ``rows // len(domain)`` appearances
+    of every level at minimum, because each pass is a whole permutation -- so
+    :func:`attribute` keeps its per-level n. And the columns are independent,
+    so no locus's contrast is confounded with another's; the shared index that
+    made them identical is what put every prior in a box (:func:`crossed_screen`).
+
+    Reshuffling per pass rather than cycling one permutation matters: cycling
+    would give only ``len(domain)`` distinct rows repeated, which spends the
+    screen's budget on duplicates of the same corner.
+    """
+
+    columns: dict[Locus, list[Any]] = {}
+    for locus in loci:
+        domain = list(domains[locus])
+        column: list[Any] = []
+        while len(column) < rows:
+            rng.shuffle(domain)
+            column.extend(domain)
+        columns[locus] = column[:rows]
+    return [{locus: columns[locus][t] for locus in loci} for t in range(rows)]
 
 
 def _pooled_screen(
