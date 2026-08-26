@@ -31,6 +31,7 @@ from agent_evolve.policies.genetic import (
     coverage_counts,
     crossover,
     incumbent_candidate,
+    local_probe_candidate,
     loci_of,
     mutate,
     one_mutation_neighbourhood,
@@ -243,6 +244,27 @@ class GeneticConfig:
     #: is HEBO's measured modal-purity band over 24 loci -- 6 to 12 fields --
     #: rather than a tuned pair.
     intensify_pin_range: tuple = (6, 12)
+    #: CONSOLIDATION BURST, a sub-mode of `intensify` (requires "incumbent";
+    #: 0 -- the default -- changes nothing, byte for byte). When any
+    #: evaluation strictly improves any single objective's best-so-far, the
+    #: next N intensification slots probe THAT member's one-locus
+    #: neighbourhood (:func:`local_probe_candidate`) instead of pin-resampling
+    #: the ranked incumbent; a newer advance retargets and refills the count.
+    #: No extra charges: the burst retargets slots intensification already
+    #: holds.
+    #:
+    #: The measured defect this answers: both runs that ever reached the
+    #: analog venue's fully-feasible plateau then spent 3.4% and 12.4% of
+    #: their remaining charges on it, while all 44 one-step neighbours of the
+    #: discovery measured on-plateau -- because an intensified child resamples
+    #: its unpinned loci through a prior that repels from a region it never
+    #: predicted, and elite offspring mutate through the same prior. The probe
+    #: is prior-free and one declared step wide on one locus. Advances are
+    #: front-loaded (24-42 per 320-charge run, 0-7 in the last quarter), so
+    #: the burst displaces early intensification -- measured NEGATIVE alone
+    #: (5W/7L, median -0.046) -- and costs late budget nearly nothing where
+    #: advances are rare.
+    intensify_burst: int = 0
     #: How survival breaks ties inside one domination count. "count" -- the
     #: default -- keeps the measurement order and is byte-identical.
     #: "crowding" prefers the members that are most alone in objective space
@@ -446,6 +468,18 @@ def run_genetic_loop(
         raise ValueError(
             "intensify_pin_range must be (low, high), two integers with "
             f"1 <= low <= high, got {config.intensify_pin_range!r}")
+    if not isinstance(config.intensify_burst, int) or isinstance(
+            config.intensify_burst, bool) or config.intensify_burst < 0:
+        raise ValueError(
+            "intensify_burst must be an integer >= 0, got "
+            f"{config.intensify_burst!r}")
+    if config.intensify_burst > 0 and not intensify_on:
+        # A burst is a retargeting of intensification's own slots; without
+        # them it would be a silent no-op, and this package refuses those.
+        raise ValueError(
+            "intensify_burst requires intensify='incumbent': the burst "
+            "retargets intensification slots and there are none to retarget")
+    burst_on = intensify_on and config.intensify_burst > 0
 
     specs = list(problem.objectives)
     candidate_model = getattr(problem, "candidate_model", None)
@@ -709,6 +743,28 @@ def run_genetic_loop(
                                    else (config.seed ^ 0x1CE111))
                      if intensify_on else None)
 
+    # --- consolidation-burst state ------------------------------------------
+    # Pure bookkeeping until a burst is live: the tracker reads results and
+    # draws nothing, so with the knob at 0 nothing below constructs, consumes,
+    # or records anything and "off" stays byte-identical. The bests seeded
+    # here are the run's starting bests -- screen rows and the initial
+    # population included -- so a burst answers ADVANCES made by the search,
+    # which is the measured walk-away defect, not the init pool's luck.
+    burst_best: Dict[str, float] = {}
+    burst_anchor: Optional[Config] = None
+    burst_left = 0
+    if burst_on:
+        for _row, _objectives in state.evaluated:
+            for spec in specs:
+                value = _objectives.get(spec.name)
+                if value is None:
+                    continue
+                value = float(value)
+                held = burst_best.get(spec.name)
+                if held is None or (value > held if spec.goal == "max"
+                                    else value < held):
+                    burst_best[spec.name] = value
+
     # --- endgame polish state ------------------------------------------------
     # The stall tracker reads the population and the charge counter and draws
     # nothing: a tracker that touched the RNG would make "off" and "sweep"
@@ -804,6 +860,7 @@ def run_genetic_loop(
         extra_kids: List[Config] = []
         explore_count = 0
         intensify_count = 0
+        burst_count = 0
         if (explore_on or intensify_on) and not polishing:
             proposed_keys: Set[str] = set()
 
@@ -857,6 +914,24 @@ def run_genetic_loop(
                 if incumbent is not None:
                     anchor_loci = loci_of(incumbent)
                     for _slot in range(max(0, slots)):
+                        # A live burst retargets this slot at the member that
+                        # last advanced an objective best: one-locus probes of
+                        # a discovery, instead of a pin-resample through a
+                        # prior that repels from it. The counter burns per
+                        # SLOT, not per admission, so an anchor whose
+                        # neighbourhood the run has exhausted cannot pin the
+                        # mechanism to a dead point for the rest of the run.
+                        if burst_left > 0 and burst_anchor is not None:
+                            burst_left -= 1
+                            for _attempt in range(_DEDUP_ATTEMPTS):
+                                candidate = local_probe_candidate(
+                                    burst_anchor, candidate_model,
+                                    rng=rng_intensify)
+                                if admit(candidate):
+                                    intensify_count += 1
+                                    burst_count += 1
+                                    break
+                            continue
                         for _attempt in range(_DEDUP_ATTEMPTS):
                             # q is clamped to the genome: a pin band read off a
                             # 24-locus venue must not ask a 6-locus one to hold
@@ -1044,6 +1119,27 @@ def run_genetic_loop(
         pool.extend((r.configuration, dict(r.objectives)) for r in valid)
         population = survive(pool)
 
+        # --- did anything just advance an objective best? -------------------
+        # Reads only; no RNG. The LAST advancer in evaluation order becomes
+        # the burst anchor -- the freshest information wins -- and a new
+        # advance during a live burst retargets it and refills the count.
+        if burst_on and valid:
+            triggered = None
+            for result in valid:
+                for spec in specs:
+                    value = result.objectives.get(spec.name)
+                    if value is None:
+                        continue
+                    value = float(value)
+                    held = burst_best.get(spec.name)
+                    if held is None or (value > held if spec.goal == "max"
+                                        else value < held):
+                        burst_best[spec.name] = value
+                        triggered = result.configuration
+            if triggered is not None:
+                burst_anchor = dict(triggered)
+                burst_left = config.intensify_burst
+
         # --- survival credit: a mechanism is what its children survive ------
         # Not for a swept generation: the generator drew none of those
         # children, and crediting it with the sweep's survivors would put a
@@ -1124,6 +1220,9 @@ def run_genetic_loop(
             entry["explore"] = explore_count
         if intensify_on:
             entry["intensify"] = intensify_count
+        if burst_on:
+            # Same terms as explore/intensify: the zero is a measured zero.
+            entry["burst"] = burst_count
         if screen_note is not None:
             entry["screen"] = screen_note
         if polish_note is not None:

@@ -33,6 +33,7 @@ __all__ = [
     "crossover",
     "mutate",
     "one_mutation_neighbourhood",
+    "local_probe_candidate",
     "uniform_candidate",
     "coverage_counts",
     "coverage_candidate",
@@ -593,6 +594,54 @@ def one_mutation_neighbourhood(
         for value in sorted((v for v in domain if v != current),
                             key=lambda v: _nearness(v, current)):
             yield write_locus(config, locus, value)
+
+
+def local_probe_candidate(
+    anchor: Mapping[str, Any],
+    candidate_model: Any,
+    *,
+    rng: random.Random,
+    span: int = 2,
+) -> dict[str, Any]:
+    """*anchor* with ONE locus moved to one of its *span* nearest other values.
+
+    The consolidation move, and the measured defect it answers: when a run
+    finds a configuration that advances an objective's best, nothing in the
+    loop looks next door. Both runs that ever reached the analog venue's
+    fully-feasible plateau then spent 3.4% and 12.4% of their remaining
+    charges on it -- while every one of the discovery's 44 one-step
+    neighbours was measured (post hoc) to be on the plateau too. The
+    incumbent path could not hold it: an intensification resamples its
+    unpinned loci THROUGH THE PRIOR, and the prior actively repels from a
+    discovery it never predicted (8 of that discovery's 24 fields sat above
+    the installed prior's lid, at floor-level mass at best). This function is
+    the prior-free complement: keep everything, move one locus one or two
+    declared steps.
+
+    No restriction, deliberately, for the same reason
+    :func:`coverage_candidate` takes none: the whole point of the probe is to
+    hold a region the prior may be wrong about. Nearness is
+    :func:`one_mutation_neighbourhood`'s -- numeric axes by distance,
+    unordered domains falling back to the schema's own declared order under a
+    stable sort -- so a probe on a grid tries the adjacent rungs first and a
+    probe on an enumeration tries its declared neighbours. Loci with fewer
+    than two declared values cannot move and are never picked; an anchor with
+    no movable locus at all comes back unchanged, which the caller's dedup
+    then correctly refuses.
+    """
+
+    movable = []
+    for locus in loci_of(anchor):
+        domain = locus_domain(candidate_model, locus)
+        if domain and len(domain) >= 2:
+            movable.append((locus, domain))
+    if not movable:
+        return dict(anchor)
+    locus, domain = movable[rng.randrange(len(movable))]
+    current = read_locus(anchor, locus)
+    nearest = sorted((v for v in domain if v != current),
+                     key=lambda v: _nearness(v, current))[:max(1, span)]
+    return write_locus(anchor, locus, nearest[rng.randrange(len(nearest))])
 
 
 def uniform_candidate(
