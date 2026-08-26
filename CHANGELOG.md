@@ -27,9 +27,18 @@ Measured honestly: at their pilot venue the pair LOST the endpoint bar it
 was built for (4/12 vs base, median −0.033) — but the same pair is the only
 configuration, out of every method and 3,000+ specialist evaluations ever
 recorded on that venue, to reach a fully feasible all-specs-met
-configuration at all (2 runs of 18; nothing else, ever). Treat it as a
+configuration at all (2 runs of 42; nothing else, ever). Treat it as a
 feasibility-seeking profile that trades median endpoint for tail discovery,
 not as a default.
+
+A third knob exists because the discovery kept escaping: `intensify_burst`
+retargets intensification's slots at one-locus prior-free probes of the
+last objective-best advancer (the two plateau-reaching runs held their
+discovery for only 3.4% and 12.4% of remaining charges — the prior repels
+from regions it never predicted). Its own one-factor measurement then
+missed its pre-declared bar (4W/8L at fresh-seed pairs; the trigger
+saturates early and displaces intensification wholesale), so it ships
+default-off with this sentence rather than a recommendation.
 
 ### Changed — the prior floor is a knob, not substrate
 
