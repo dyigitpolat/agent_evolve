@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-08-28
 
 ### Fixed — the crossed screen was a diagonal
 
@@ -16,6 +16,17 @@ domain size, per-level attribution preserved, `structure_budget=0`
 byte-identical to before. Default on, because a diagonal is a defect, not a
 choice; results measured before this fix were measured on the diagonal and
 remain quotable as measured.
+
+Measured consequences, both directions: on the 24-locus analog venue the
+default pipeline's median endpoint improved +0.1048 and the installed
+prior's reach rose past the old lid (5/6 cells), with the venue's
+first-ever fully feasible configurations found on the repaired substrate.
+On the small-domain NAS venue -- whose old screen was itself 5/6 lockstep
+-- endpoints are NEUTRAL at N=8 (1W/5T/2L, medians equal), while
+time-to-0.80-regret got slower (median 18 vs 5 evaluations): the old
+lockstep screen happened to embed a strong archetype row early on that
+unit. Endpoint-neutral plus structurally correct won the default;
+the anytime observation is stated rather than absorbed.
 
 ### Added — two classical search knobs, default off, and what they measurably are
 

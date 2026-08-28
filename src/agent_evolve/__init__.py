@@ -31,7 +31,7 @@ from agent_evolve.proposers.random_proposer import RandomProposer
 #: The one place the version is written. `pyproject.toml` declares
 #: `dynamic = ["version"]` and reads this literal, so the distribution metadata
 #: and the importable attribute cannot disagree.
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 #: The supported public surface.
 __all__ = [
