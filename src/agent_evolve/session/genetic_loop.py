@@ -26,6 +26,7 @@ from agent_evolve.core.problem import ObjectiveSpec
 from agent_evolve.core.results import SearchResult, dominates
 from agent_evolve.core.telemetry import harvest_telemetry
 from agent_evolve.policies.genetic import (
+    EliteMixture,
     Locus,
     coverage_candidate,
     coverage_counts,
@@ -265,6 +266,15 @@ class GeneticConfig:
     #: (5W/7L, median -0.046) -- and costs late budget nearly nothing where
     #: advances are rare.
     intensify_burst: int = 0
+    #: ELITE MIXTURE at the value draw: with this weight, mutation and
+    #: intensification's unpinned resamples draw each locus from a mixture of
+    #: the prior in force and the CURRENT front's empirical values (see
+    #: :class:`EliteMixture` for the measured story: the prior repels from
+    #: discoveries it never predicted, and no trigger can tell a jackpot from
+    #: a routine advance at entry time). 0.0 -- the default -- constructs
+    #: nothing and is byte-identical. The mixture only ever rides a prior:
+    #: with no restriction in force, draws are untouched.
+    elite_mix: float = 0.0
     #: How survival breaks ties inside one domination count. "count" -- the
     #: default -- keeps the measurement order and is byte-identical.
     #: "crowding" prefers the members that are most alone in objective space
@@ -480,6 +490,12 @@ def run_genetic_loop(
             "intensify_burst requires intensify='incumbent': the burst "
             "retargets intensification slots and there are none to retarget")
     burst_on = intensify_on and config.intensify_burst > 0
+    if not _is_number(config.elite_mix) or not (0.0 <= float(config.elite_mix) < 1.0):
+        raise ValueError(
+            f"elite_mix must be a mixing weight in [0, 1), got "
+            f"{config.elite_mix!r}")
+    mixer = (EliteMixture(float(config.elite_mix))
+             if float(config.elite_mix) > 0.0 else None)
 
     specs = list(problem.objectives)
     candidate_model = getattr(problem, "candidate_model", None)
@@ -743,6 +759,13 @@ def run_genetic_loop(
                                    else (config.seed ^ 0x1CE111))
                      if intensify_on else None)
 
+    # The prior the DRAW SEAMS see: the elite mixture over the restriction in
+    # force, or the restriction itself when the mixture is off. Recomputed at
+    # every point the restriction rebinds (unwind, revision), because the
+    # mixture rides the prior rather than replacing it -- restriction=None
+    # keeps the pre-prior stream untouched, mixture or no mixture.
+    draw_prior = restriction if mixer is None else mixer.over(restriction)
+
     # --- consolidation-burst state ------------------------------------------
     # Pure bookkeeping until a burst is live: the tracker reads results and
     # draws nothing, so with the knob at 0 nothing below constructs, consumes,
@@ -788,6 +811,10 @@ def run_genetic_loop(
         # combine, and a rank is the comparable form of "how good is this one".
         ranks = domination_rank([obj for _c, obj in population], specs)
         ranked = [(c, r) for (c, _o), r in zip(population, ranks)]
+        if mixer is not None:
+            # The mixture's elite component: last survival's rank-0 members.
+            mixer.front_rows = tuple(
+                c for (c, _o), rank in zip(population, ranks) if rank == 0)
         filled = 0
         choices: Sequence[OperatorChoice] = ()
 
@@ -941,7 +968,7 @@ def run_genetic_loop(
                             candidate = incumbent_candidate(
                                 incumbent, candidate_model,
                                 pin=rng_intensify.sample(anchor_loci, pinned),
-                                rng=rng_intensify, restriction=restriction)
+                                rng=rng_intensify, restriction=draw_prior)
                             if admit(candidate):
                                 intensify_count += 1
                                 break
@@ -984,7 +1011,7 @@ def run_genetic_loop(
                 )
             kid = crossover(a, b, mask=mask)
             return mutate(kid, candidate_model, rate=config.mutation_rate,
-                          restriction=restriction,
+                          restriction=draw_prior,
                           loci=choice.mutate_loci, rng=r)
 
         kid_origins: Optional[List[str]] = None
@@ -1182,6 +1209,7 @@ def run_genetic_loop(
                 for excluded in screen_front)
             if not beat_something:
                 restriction = None
+                draw_prior = None if mixer is None else mixer.over(None)
                 structure_record["unwound"] = gen
                 log(f"generation {gen}: the prior stopped paying; restriction "
                     "dropped for the remainder")
@@ -1199,6 +1227,8 @@ def run_genetic_loop(
                 specs=specs, restriction=restriction, charges=spent(), gen=gen)
             if outcome.restriction is not None:
                 restriction = outcome.restriction
+                draw_prior = (restriction if mixer is None
+                              else mixer.over(restriction))
             if outcome.immigrants:
                 immigrants = [dict(member) for member in outcome.immigrants]
             reguide_note = outcome.note
@@ -1223,6 +1253,10 @@ def run_genetic_loop(
         if burst_on:
             # Same terms as explore/intensify: the zero is a measured zero.
             entry["burst"] = burst_count
+        if mixer is not None:
+            # Cumulative draws where the front actually held an opinion; the
+            # measured zero (prior right, front agreeing) is part of the story.
+            entry["elite_mix_opined"] = mixer.opined
         if screen_note is not None:
             entry["screen"] = screen_note
         if polish_note is not None:

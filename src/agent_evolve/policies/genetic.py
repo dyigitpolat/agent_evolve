@@ -30,6 +30,7 @@ __all__ = [
     "locus_is_projected",
     "SamplingPrior",
     "DomainRestriction",
+    "EliteMixture",
     "crossover",
     "mutate",
     "one_mutation_neighbourhood",
@@ -149,6 +150,98 @@ class DomainRestriction:
         """Uniform over the narrowed support: the hard 0/1 special case."""
 
         return None
+
+
+class EliteMixture:
+    """``(1-eps)*prior + eps*front-marginal`` at the value draw, two seams only.
+
+    The repair for a measured repulsion, after its triggered form was measured
+    and killed. The two runs that ever reached the analog venue's
+    fully-feasible plateau then abandoned it (3.4% and 12.4% post-hit
+    occupancy against a 44/44-feasible one-step neighbourhood), because every
+    prior-mediated resample pulls toward mass the prior assigned BEFORE the
+    discovery existed -- 8 of the discovery's 24 fields sat above the
+    installed prior's lid. The triggered burst that tried to fix this missed
+    its own bar (4W/8L): its trigger fired ~58 times a run, and the census
+    that followed showed why no trigger can work -- at entry time a jackpot is
+    indistinguishable from routine front entries by any domination or record
+    statistic (jackpots purged 0-1 of their fronts and improved 1-2 bests,
+    inside a class of 1,400+ routine events).
+
+    So: no trigger. With mixing weight ``epsilon``, a draw's value
+    distribution becomes a mixture of the prior in force and the empirical
+    marginal of the CURRENT nondominated front, per locus, over exactly the
+    values the draw was already choosing among. Where the prior is right the
+    front agrees with it and the mixture is nearly the prior; where the front
+    has found something the prior repels from, the discovery's values keep
+    circulating. This is the classical estimation-of-distribution move, and
+    it also widens the measured 1/24-per-locus prior-to-offspring bandwidth
+    the revision channel was blocked by.
+
+    Deliberately narrow: ``narrow`` delegates to the base prior untouched (the
+    mixture never reopens an exclusion -- that is the floor knob's job, and it
+    is a different, measured decision); a locus on which the front holds no
+    declared value returns the base's own answer, INCLUDING ``None`` -- so a
+    draw that was unweighted stays on the unweighted ``r.choice`` stream and
+    an off-front run does not drift byte-wise. The loop threads this wrapper
+    into exactly two seams -- mutation and intensification's unpinned resample
+    -- and nowhere else: gen-0 fills, polish enumeration, authored generators,
+    and the revision channel all keep the raw prior.
+    """
+
+    def __init__(self, epsilon: float) -> None:
+        eps = float(epsilon)
+        if not 0.0 < eps < 1.0:
+            raise ValueError(
+                f"elite_mix must be a mixing weight in (0, 1), got {epsilon!r}")
+        self.epsilon = eps
+        self.base: "SamplingPrior | None" = None
+        self.front_rows: "Sequence[Mapping[str, Any]]" = ()
+        self.opined = 0                 # draws where the front had an opinion
+
+    def over(self, base: "SamplingPrior | None") -> "SamplingPrior | None":
+        """The prior draws should go through, given the one in force."""
+
+        if base is None:
+            return None                 # mixture rides a prior, never replaces one
+        self.base = base
+        return self
+
+    def narrow(self, locus: "Locus", domain: tuple[Any, ...]) -> tuple[Any, ...]:
+        assert self.base is not None
+        return self.base.narrow(locus, domain)
+
+    def weights_for(
+        self, locus: "Locus", values: Sequence[Any]
+    ) -> "tuple[float, ...] | None":
+        assert self.base is not None
+        base_w = None
+        weigher = getattr(self.base, "weights_for", None)
+        if callable(weigher):
+            base_w = weigher(locus, values)
+        counts = []
+        for value in values:
+            n = 0
+            for row in self.front_rows:
+                try:
+                    if read_locus(row, locus) == value:
+                        n += 1
+                except (KeyError, IndexError, TypeError):
+                    continue            # a row that does not carry the locus
+            counts.append(n)
+        total = sum(counts)
+        if total == 0:
+            return base_w
+        self.opined += 1
+        if base_w is None:
+            base_norm = [1.0 / len(values)] * len(values)
+        else:
+            s = sum(base_w)
+            base_norm = ([w / s for w in base_w] if s > 0.0
+                         else [1.0 / len(values)] * len(values))
+        eps = self.epsilon
+        return tuple((1.0 - eps) * b + eps * (c / total)
+                     for b, c in zip(base_norm, counts))
 
 
 def locus_domain(
