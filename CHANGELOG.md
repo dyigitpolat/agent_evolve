@@ -40,6 +40,22 @@ missed its pre-declared bar (4W/8L at fresh-seed pairs; the trigger
 saturates early and displaces intensification wholesale), so it ships
 default-off with this sentence rather than a recommendation.
 
+### Added — the elite mixture, and its measured sentence
+
+`elite_mix=EPS` (default 0.0, byte-identical off) makes the two
+prior-mediated draw seams — mutation and intensification's unpinned
+resample — draw each locus from `(1-EPS)*prior + EPS*front-marginal`. It
+exists because the prior measurably repels from discoveries it never
+predicted, and because a census of 7,580 front entries showed no trigger
+can tell a discovery from a routine advance at entry time. Its one-factor
+measurement then read a wash with harm (5W/1T/6L, median −0.006, three
+seeds worse by >0.10) with engagement verified healthy (~1,100 mixture
+draws per run), so it ships default-off carrying this sentence. Together
+with `intensify_burst` (4W/8L), that is two independent repairs of the
+walk-away defect measured null-to-harmful by their own pre-declared bars:
+the defect is real; draw-distribution repairs do not convert it into
+endpoint value on the venue that exposed it.
+
 ### Changed — the prior floor is a knob, not substrate
 
 `weighted_prior.PRIOR_FLOOR` briefly shipped at `0.02` as a presumed defect
