@@ -313,7 +313,12 @@ def test_the_stall_counts_charges_and_not_generations() -> None:
     notes = _notes(result)
     assert len(notes) == 25                 # the generations really did run
     assert not any(note["engaged"] for note in notes.values())
-    assert problem.charges <= 2             # ... and charged only the seeds
+    # X2c spends the stranded budget on forced-novel fill draws after the
+    # generations end (disclosed in history); the stall-counter claim is
+    # about the LOOP phase, which still charged only the seeds.
+    filled = sum(h.get("fill", 0)
+                 for h in result.history if isinstance(h, dict))
+    assert problem.charges - filled <= 2
 
 
 # --------------------------------------------------------------------------

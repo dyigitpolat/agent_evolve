@@ -34,7 +34,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from agent_evolve.policies.genetic import Locus, loci_of, locus_domain, read_locus
+from agent_evolve.policies.genetic import (
+    Locus, loci_of, locus_domain, read_locus, write_locus)
 
 __all__ = ["InitTelemetry", "author_initial_population", "INIT_PROMPT",
            "SPLIT_INIT_PROMPT", "INIT_STYLES"]
@@ -182,6 +183,39 @@ def _rejection(member: Any, template: Config, candidate_model: Any) -> Optional[
     return None
 
 
+def _snap_member(member: Any, candidate_model: Any) -> Any:
+    """Numeric "about X" values snapped to their nearest declared rung.
+
+    The measured defect (REFINEMENT_ROUND.md, X2a): 11.5% of authored init
+    cells carried off-ladder numerics -- 1.61461 where the rungs are 1.50394
+    and 1.6623 -- and whole-member rejection discarded the member. The model
+    speaks continuous; the grid is quantized; snapping WITHIN the declared
+    span is a codec, not a repair: out-of-span values are left untouched and
+    still judged by :func:`_rejection`, and non-numeric domains never snap.
+    """
+
+    from agent_evolve.policies.weighted_prior import snap_to_rung
+
+    if not isinstance(member, dict):
+        return member
+    out = dict(member)
+    try:
+        loci = loci_of(out)
+    except Exception:
+        return member
+    changed = False
+    for locus in loci:
+        domain = locus_domain(candidate_model, locus)
+        if not domain:
+            continue
+        value = read_locus(out, locus)
+        snapped = snap_to_rung(value, domain)
+        if snapped != value and snapped in domain:
+            out = write_locus(out, locus, snapped)
+            changed = True
+    return out if changed else member
+
+
 def author_initial_population(
     complete: Callable[[str], str],
     *,
@@ -251,6 +285,7 @@ def author_initial_population(
             if subset:
                 setattr(tel, f"{subset}_proposed",
                         getattr(tel, f"{subset}_proposed") + 1)
+            member = _snap_member(member, candidate_model)
             reason = _rejection(member, template, candidate_model)
             if reason == "shape":
                 tel.rejected_shape += 1

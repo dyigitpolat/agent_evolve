@@ -53,6 +53,8 @@ __all__ = [
     "llm_weighted_prior_proposer",
     "floor_weights",
     "PRIOR_FLOOR",
+    "band_fill",
+    "snap_to_rung",
     "PROMPT",
     "COMMITTED_PROMPT",
     "PRIOR_STYLES",
@@ -263,6 +265,82 @@ def floor_weights(
     return kept_values, tuple((1.0 - alpha) * s + alpha / k for s in shares)
 
 
+
+def _numeric_domain(domain: "tuple[Any, ...]") -> bool:
+    return bool(domain) and all(
+        isinstance(v, (int, float)) and not isinstance(v, bool) for v in domain)
+
+
+def snap_to_rung(value: Any, domain: "tuple[Any, ...]") -> Any:
+    """*value* snapped to the nearest declared rung of a NUMERIC domain.
+
+    The trace forensics that motivated this (REFINEMENT_ROUND.md, X2a): 11.5%
+    of authored init cells and a share of prior values are "about X" numbers
+    -- 1.61461 on a ladder whose rungs are 1.50394 and 1.6623 -- which
+    whole-reply rejection then discards wholesale. The model speaks
+    continuous; the grid is quantized; snapping within the domain's span is a
+    codec, not a repair: no value outside [min, max] of the declared rungs is
+    ever admitted, and non-numeric domains are untouched (returns *value*
+    unchanged, so the caller's own validation still judges it).
+    """
+
+    if not _numeric_domain(domain):
+        return value
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    lo, hi = min(domain), max(domain)
+    if not (lo <= float(value) <= hi):
+        return value
+    return min(domain, key=lambda rung: abs(float(rung) - float(value)))
+
+
+def band_fill(
+    values: "tuple[Any, ...] | list",
+    weights: "tuple[float, ...] | list",
+    *,
+    domain: "tuple[Any, ...]",
+) -> "tuple[tuple[Any, ...], tuple[float, ...]]":
+    """Unnamed rungs INSIDE the reply's own band get interpolated weights.
+
+    The measured defect (trace forensics, 24 tapes): replies name a band by
+    listing a few of its rungs, and 68.2% of the declared rungs lying
+    STRICTLY INSIDE that band got weight zero -- permanently, since the floor
+    is off. The reply's own extremes define the band; the schema's enumeration
+    forced the holes. This closes the holes and nothing else: on a NUMERIC
+    ordered domain, every unnamed rung between two named ones takes the linear
+    interpolation (in ladder-index space) of its named neighbours' weights;
+    named entries keep their exact weights, including explicit zeros; rungs
+    outside the named band stay excluded, so the prior's outer exclusion claim
+    survives and the unwind test still has something to test. Non-numeric
+    domains come back unchanged.
+    """
+
+    if not _numeric_domain(domain) or len(values) < 2:
+        return tuple(values), tuple(float(w) for w in weights)
+    index_of = {v: i for i, v in enumerate(domain)}
+    named = sorted(
+        ((index_of[v], float(w)) for v, w in zip(values, weights)
+         if v in index_of),
+        key=lambda pair: pair[0])
+    if len(named) < 2:
+        return tuple(values), tuple(float(w) for w in weights)
+    table = dict(named)                      # a duplicated rung: last wins
+    lo, hi = named[0][0], named[-1][0]
+    anchors = sorted(table)
+    out_v: list = []
+    out_w: list = []
+    for i in range(lo, hi + 1):
+        if i in table:
+            out_v.append(domain[i]); out_w.append(table[i])
+            continue
+        left = max(a for a in anchors if a < i)
+        right = min(a for a in anchors if a > i)
+        t = (i - left) / (right - left)
+        out_v.append(domain[i])
+        out_w.append((1.0 - t) * table[left] + t * table[right])
+    return tuple(out_v), tuple(out_w)
+
+
 def statistical_weighted_prior(
     attr: Attribution,
     candidate_model: Any = None,
@@ -315,6 +393,8 @@ class WeightedPriorTelemetry:
     empty: int = 0
     restricted_loci: int = 0
     errors: int = 0
+    snapped_values: int = 0
+    band_filled_rungs: int = 0
     proposals: list = field(default_factory=list)
 
     def as_dict(self) -> dict[str, int]:
@@ -326,6 +406,8 @@ class WeightedPriorTelemetry:
             "empty": self.empty,
             "restricted_loci": self.restricted_loci,
             "errors": self.errors,
+            "snapped_values": self.snapped_values,
+            "band_filled_rungs": self.band_filled_rungs,
             "proposals": len(self.proposals),
         }
 
@@ -483,6 +565,13 @@ def llm_weighted_prior_proposer(
                 return WeightedRestriction({})
             domain = tuple(domains[name])
             if any(v not in domain for v in values):
+                # X2a: continuous-to-grid codec, in-span only, numeric only.
+                snapped = [snap_to_rung(v, domain) for v in values]
+                tel.snapped_values += sum(
+                    1 for old, new in zip(values, snapped)
+                    if old != new and new in domain)
+                values = snapped
+            if any(v not in domain for v in values):
                 tel.out_of_domain += 1
                 return WeightedRestriction({})
             clean: list[float] = []
@@ -504,8 +593,17 @@ def llm_weighted_prior_proposer(
             # what the model wrote, and what is installed is what the loop
             # will sample from. Reading the reply and installing it are two
             # different acts and only the second one is insured.
+            # X2a: a snap can land two "about X" values on one rung; the
+            # rung keeps their combined intent.
+            merged: dict[Any, float] = {}
+            for v, w in zip(values, clean):
+                merged[v] = merged.get(v, 0.0) + w
+            values = list(merged)
+            clean = [merged[v] for v in values]
+            filled_v, filled_w = band_fill(values, clean, domain=domain)
+            tel.band_filled_rungs += max(0, len(filled_v) - len(values))
             weighted[name] = floor_weights(
-                values, clean, domain=domain, floor=prior_floor)
+                filled_v, filled_w, domain=domain, floor=prior_floor)
 
         if not weighted:
             tel.empty += 1

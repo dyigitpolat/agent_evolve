@@ -304,8 +304,13 @@ def test_the_screen_fix_leaves_the_unscreened_fossil_byte_identical():
         config=GeneticConfig(population_size=4, offspring_per_generation=3,
                              generations=20, evaluation_budget=32,
                              structure_budget=0, seed=20260825))
-    blob = json.dumps(p.seen, sort_keys=True, default=str).encode()
-    assert len(p.seen) == 30
+    # X2c (2026-08-30) spends the 2 evaluations this scenario used to strand
+    # on the generation cap, so the run now charges its full 32. The fossil
+    # guard becomes a PREFIX guard: the 30 loop-phase charges must stay byte
+    # for byte what the pre-fix build recorded, and the 2 trailing fill
+    # charges are the disclosed budget-honesty spend.
+    blob = json.dumps(p.seen[:30], sort_keys=True, default=str).encode()
+    assert len(p.seen) == 32
     assert hashlib.sha256(blob).hexdigest() == (
         "ba38d56c8502ce82b649db2de18333813efadf4121165022351e9a067042fbac")
 
@@ -332,16 +337,23 @@ def test_restricted_search_stays_inside_the_prior():
     from agent_evolve.contract import as_problem
     from agent_evolve.session.genetic_loop import GeneticConfig, run_genetic_loop
     p = _and_gate_problem()
-    run_genetic_loop(
+    res = run_genetic_loop(
         problem=as_problem(p),
         config=GeneticConfig(population_size=4, offspring_per_generation=3,
                              generations=20, evaluation_budget=20,
                              structure_budget=4, seed=3))
     after_screen = p.seen[4:]
     assert after_screen, "the run must continue past the screen"
+    # X2c may spend stranded budget on deliberately UNRESTRICTED forced-novel
+    # draws after the generations end; the sampling invariant governs the
+    # loop's own phase, so the trailing fill charges are sliced off by the
+    # count the history discloses.
+    filled = sum(h.get("fill", 0)
+                 for h in res.history if isinstance(h, dict))
+    loop_charges = after_screen[:len(after_screen) - filled] if filled else after_screen
     # The prior governs SAMPLING, not the caller's own input: the seed survives
-    # untouched, and everything the loop draws respects the restriction.
-    drawn = [c for c in after_screen if c != TEMPLATE]
+    # untouched, and everything the loop itself draws respects the restriction.
+    drawn = [c for c in loop_charges if c != TEMPLATE]
     assert drawn, "the loop must draw something of its own"
     assert all(c["width"] == 8 and c["regs"] is True for c in drawn)
     assert TEMPLATE in after_screen, "a prior must not delete the caller's seed"

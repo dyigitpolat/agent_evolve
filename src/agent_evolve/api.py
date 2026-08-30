@@ -418,6 +418,7 @@ def optimize(
     intensify_pin_range: tuple = _INTENSIFY_PIN_RANGE,
     intensify_burst: int = 0,
     elite_mix: float = 0.0,
+    actuation: str = "off",
 ) -> SearchResult:
     """Optimize *problem* within *budget* evaluations.
 
@@ -587,6 +588,7 @@ def optimize(
              _moved(intensify_pin_range, _INTENSIFY_PIN_RANGE)),
             ("intensify_burst", intensify_burst != 0),
             ("elite_mix", elite_mix != 0.0),
+            ("actuation", actuation != "off"),
             ("effort", effort is not None),
             ("journal", journal is not None),
             ("authorship", authorship_config is not None
@@ -814,6 +816,7 @@ def optimize(
                     intensify_pin_range=intensify_pin_range,
                     intensify_burst=intensify_burst,
                     elite_mix=elite_mix,
+                    actuation=actuation,
                 ),
                 chooser=chooser_policy,
                 log=announce,

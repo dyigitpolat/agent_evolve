@@ -34,6 +34,7 @@ from agent_evolve.policies.genetic import (
     incumbent_candidate,
     local_probe_candidate,
     loci_of,
+    read_locus,
     mutate,
     one_mutation_neighbourhood,
     truncation_survival,
@@ -275,6 +276,15 @@ class GeneticConfig:
     #: nothing and is byte-identical. The mixture only ever rides a prior:
     #: with no restriction in force, draws are untouched.
     elite_mix: float = 0.0
+    #: ACTUATION BANDWIDTH (REFINEMENT_ROUND.md X4). "fresh-boost" raises the
+    #: mutation rate to min(1/3, 8/n_loci) while an installed or revised
+    #: prior is FRESH (its first G generations, G = max(4, budget //
+    #: (4*offspring))), reverting to the 1/n default after. The trace
+    #: forensics measured the 1/n seam as the ceiling on how fast guidance
+    #: can reach evaluations (fresh-draw rate 0.0373 against the 1/24
+    #: ceiling; post-revision distribution shifts statistically identical to
+    #: untouched loci). "off" -- the default -- is byte-identical.
+    actuation: str = "off"
     #: How survival breaks ties inside one domination count. "count" -- the
     #: default -- keeps the measurement order and is byte-identical.
     #: "crowding" prefers the members that are most alone in objective space
@@ -496,6 +506,10 @@ def run_genetic_loop(
             f"{config.elite_mix!r}")
     mixer = (EliteMixture(float(config.elite_mix))
              if float(config.elite_mix) > 0.0 else None)
+    if config.actuation not in ("off", "fresh-boost"):
+        raise ValueError(
+            f"actuation must be 'off' or 'fresh-boost', got {config.actuation!r}")
+    boost_on = config.actuation == "fresh-boost"
 
     specs = list(problem.objectives)
     candidate_model = getattr(problem, "candidate_model", None)
@@ -765,6 +779,11 @@ def run_genetic_loop(
     # mixture rides the prior rather than replacing it -- restriction=None
     # keeps the pre-prior stream untouched, mixture or no mixture.
     draw_prior = restriction if mixer is None else mixer.over(restriction)
+    cage_streak = 0                     # X2b: consecutive gens best-outside
+    #: X4: the generation through which the CURRENT prior counts as fresh.
+    boost_gens = max(4, (config.evaluation_budget or 0)
+                     // max(1, 4 * config.offspring_per_generation))
+    boost_until = boost_gens if (boost_on and restriction is not None) else -1
 
     # --- consolidation-burst state ------------------------------------------
     # Pure bookkeeping until a burst is live: the tracker reads results and
@@ -1010,7 +1029,11 @@ def run_genetic_loop(
                     bool(r.getrandbits(1)) for _ in range(want_bits - len(mask))
                 )
             kid = crossover(a, b, mask=mask)
-            return mutate(kid, candidate_model, rate=config.mutation_rate,
+            rate = config.mutation_rate
+            if boost_on and restriction is not None and gen <= boost_until:
+                rate = max(rate or (1.0 / max(1, n_loci)),
+                           min(1.0 / 3.0, 8.0 / max(1, n_loci)))
+            return mutate(kid, candidate_model, rate=rate,
                           restriction=draw_prior,
                           loci=choice.mutate_loci, rng=r)
 
@@ -1213,6 +1236,54 @@ def run_genetic_loop(
                 structure_record["unwound"] = gen
                 log(f"generation {gen}: the prior stopped paying; restriction "
                     "dropped for the remainder")
+        # --- X2b: the falsified cage (REFINEMENT_ROUND.md) -------------------
+        # The bet test above passes too easily (dominating one screen row is
+        # cheap): measured, it fired on 2 of 24 NAS cells while 8 held
+        # supports that excluded every optimum. The sharper falsification is
+        # the run's own scoreboard: if a member that is BEST on some declared
+        # objective sits OUTSIDE the prior's support -- and stays best for 3
+        # straight generations -- then the exclusion claim ("good is inside")
+        # is refuted by the best thing this run has ever measured, and the
+        # restriction drops. A transient escape does not fire it.
+        if restriction is not None and not structure_record.get("unwound") and gen >= 4:
+            allowed_map = dict(getattr(restriction, "allowed", {}) or {})
+            def _violates(member: Config) -> bool:
+                for locus in loci_of(member):
+                    want = allowed_map.get(locus.field)
+                    if want and read_locus(member, locus) not in tuple(want):
+                        return True
+                return False
+            falsified = False
+            if allowed_map:
+                for spec in specs:
+                    sign = 1.0 if spec.goal == "min" else -1.0
+                    ranked_pop = sorted(
+                        population,
+                        key=lambda pair: sign * float(pair[1][spec.name]))
+                    champion, champ_obj = ranked_pop[0]
+                    if not _violates(champion):
+                        continue
+                    inside = [pair for pair in ranked_pop
+                              if not _violates(pair[0])]
+                    # The champion sits outside the support AND nothing the
+                    # support has produced matches it: the exclusion of the
+                    # champion's region is unjustified by the box's own
+                    # results, which is the falsification.
+                    if not inside or (
+                        sign * float(inside[0][1][spec.name])
+                        > sign * float(champ_obj[spec.name])):
+                        falsified = True
+                        break
+            cage_streak = cage_streak + 1 if falsified else 0
+            if cage_streak >= 3:
+                restriction = None
+                draw_prior = None if mixer is None else mixer.over(None)
+                structure_record["unwound"] = gen
+                structure_record["unwound_cage"] = gen
+                cage_streak = 0
+                log(f"generation {gen}: a per-objective best has sat outside "
+                    "the prior's support for 3 generations; the cage is "
+                    "falsified and the restriction drops")
 
         # --- the prior is also REVISABLE ------------------------------------
         # The unwind above can only drop a prior; it cannot correct one. A
@@ -1229,6 +1300,8 @@ def run_genetic_loop(
                 restriction = outcome.restriction
                 draw_prior = (restriction if mixer is None
                               else mixer.over(restriction))
+                if boost_on:
+                    boost_until = gen + boost_gens
             if outcome.immigrants:
                 immigrants = [dict(member) for member in outcome.immigrants]
             reguide_note = outcome.note
@@ -1257,6 +1330,9 @@ def run_genetic_loop(
             # Cumulative draws where the front actually held an opinion; the
             # measured zero (prior right, front agreeing) is part of the story.
             entry["elite_mix_opined"] = mixer.opined
+        if boost_on:
+            entry["actuation_boost"] = bool(
+                restriction is not None and gen <= boost_until)
         if screen_note is not None:
             entry["screen"] = screen_note
         if polish_note is not None:
@@ -1276,6 +1352,63 @@ def run_genetic_loop(
                 f"of {want_bred} choices; {filled} were filled at random")
         log(f"generation {gen}: {len(valid)} evaluated, {spent()} of "
             f"{config.evaluation_budget} budget used")
+
+    # --- X2c: no stranded budget (REFINEMENT_ROUND.md) -----------------------
+    # A run that exhausts its generations while budget remains used to stop --
+    # measured on the F2 row, seven of twenty-four cells stranded up to 219 of
+    # 384 evaluations because a caged mutation channel proposed 78-96%
+    # duplicates. Budget honesty, the B-G family: whatever evaluations were
+    # promised get spent, here on forced-novel uniform draws over the DECLARED
+    # domains (no restriction -- the fill exists precisely because the guided
+    # channels ran dry), dedup-checked, until the budget is gone or novelty
+    # exhausts. Runs that spent their budget in the loop skip this block
+    # byte-identically.
+    if config.evaluation_budget is not None and budget_left() > 0:
+        fill_spent = 0
+        # seen_keys is only maintained under the mechanisms that need it, so
+        # the fill derives seen-ness from the run's own measurement record
+        # (valid AND failed both went in front of the evaluator).
+        fill_seen: Set[str] = set(seen_keys)
+        fill_seen.update(
+            _default_candidate_key(r.configuration) for r, _m in all_meta)
+        while budget_left() > 0:
+            before_fill = budget_left()
+            batch: List[Config] = []
+            batch_keys: Set[str] = set()
+            attempts = 0
+            want_fill = min(budget_left(), config.offspring_per_generation)
+            while len(batch) < want_fill and attempts < 60 * want_fill:
+                attempts += 1
+                candidate = uniform_candidate(
+                    dict(seeds[0]), candidate_model, rng=rng_pool)
+                key = _default_candidate_key(candidate)
+                if key in fill_seen or key in batch_keys:
+                    continue
+                batch_keys.add(key)
+                batch.append(candidate)
+            if not batch:
+                log(f"fill: novelty exhausted with {budget_left()} of "
+                    f"{config.evaluation_budget} unspent")
+                break
+            fill_valid = measure(batch, config.generations + 1)
+            pool = list(population)
+            pool.extend((r.configuration, dict(r.objectives))
+                        for r in fill_valid)
+            population = survive(pool)
+            fill_seen.update(batch_keys)
+            fill_spent += before_fill - budget_left()
+            if budget_left() >= before_fill:
+                # A whole batch bought no evaluation (validation failures
+                # charge nothing): chargeability, not novelty, is the
+                # blocker, and looping would spin forever. Say so and stop.
+                log(f"fill: a batch of {len(batch)} bought no evaluation; "
+                    f"{budget_left()} of {config.evaluation_budget} unspent")
+                break
+        if fill_spent:
+            history.append({"fill": fill_spent,
+                            "budget_left": budget_left()})
+            log(f"fill: spent {fill_spent} stranded evaluations on "
+                "forced-novel draws after the generation cap")
 
     if structure_record:
         history.append({"structure": dict(structure_record)})

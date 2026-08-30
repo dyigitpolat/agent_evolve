@@ -417,13 +417,24 @@ def test_intensification_pins_the_incumbent_and_draws_the_rest_from_the_prior(
     prior-drawn ones -- and q must lie in the declared band.
     """
 
+    # The cage here is DELIBERATELY maximally wrong (the all-zero seed is the
+    # venue optimum and sits outside the {7} support) so prior-drawn values
+    # are identifiable. X2b now falsifies exactly such a cage once its warmup
+    # and streak elapse (generation 6), so the budget ends the run before the
+    # falsification window opens and the invariant is measured while the
+    # restriction is in force.
     problem = _Ladder()
     result = _run(problem, intensify="incumbent", intensify_fraction=1.0,
                   restriction=DomainRestriction({"genome": (7,)}),
-                  intensify_pin_range=(6, 12))
+                  intensify_pin_range=(6, 12), evaluation_budget=18)
     # The initial population is the seed and the one distinct uniform draw.
     assert problem.stream[0] == [0] * _WIDTH
-    offspring = problem.stream[2:]
+    # X2c spends any stranded budget on deliberately UNRESTRICTED fill draws
+    # after the generations end; the intensify invariant governs the loop's
+    # own offspring, so the disclosed fill count is sliced off the tail.
+    filled = sum(h.get("fill", 0)
+                 for h in result.history if isinstance(h, dict))
+    offspring = problem.stream[2:len(problem.stream) - filled or None]
     assert offspring
     for row in offspring:
         assert set(row) <= {0, 7}

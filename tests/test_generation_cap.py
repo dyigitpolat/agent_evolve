@@ -156,6 +156,15 @@ def test_the_old_expression_is_what_stranded_the_budget(monkeypatch):
     monkeypatch.setattr(api, "_SEALED_BUDGET_CEILING", 10 ** 9)
     stranded = optimize(_Knapsack(), budget=2000, seed=20375042,
                         authorship="operators")
-    assert stranded.evaluations < 1500, (
+    # X2c (2026-08-30) now RESCUES the stranded budget with forced-novel
+    # fill draws, so the historical defect shows up as a large disclosed
+    # fill rather than as unspent evaluations: the old cap still ends the
+    # loop early (the defect this file names), and the fill spends what it
+    # stranded (the repair the refinement round added).
+    filled = sum(h.get("fill", 0)
+                 for h in stranded.history if isinstance(h, dict))
+    assert filled > 400, (
         "the pre-fix expression no longer strands the budget on this venue, "
         "so this file is no longer measuring the defect it names")
+    assert stranded.evaluations >= 1950, (
+        "the fill phase must spend what the old cap stranded")
