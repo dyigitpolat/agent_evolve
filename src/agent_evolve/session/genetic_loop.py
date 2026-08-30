@@ -27,6 +27,7 @@ from agent_evolve.core.results import SearchResult, dominates
 from agent_evolve.core.telemetry import harvest_telemetry
 from agent_evolve.policies.genetic import (
     EliteMixture,
+    ball_candidate,
     Locus,
     coverage_candidate,
     coverage_counts,
@@ -285,6 +286,26 @@ class GeneticConfig:
     #: ceiling; post-revision distribution shifts statistically identical to
     #: untouched loci). "off" -- the default -- is byte-identical.
     actuation: str = "off"
+    #: THE INCUMBENT-BALL WALK (REFINEMENT_ROUND.md X3). "ball" spends a
+    #: fraction of each generation's offspring slots -- after exploration and
+    #: intensification -- on small steps around the current per-objective
+    #: champions: each ordered locus moves within +/- r(t) ladder levels,
+    #: with r annealing linearly from 4 to 1 over the evaluation budget
+    #: (budgetless runs hold r=2). Shaped by the specialist traces: the
+    #: winning optimizer contracts to a sub-level ball and walks, while this
+    #: loop's improvement events were measured as 5-level teleports with
+    #: 0.9% of evaluations near its own champion. "off" is byte-identical.
+    walk: str = "off"
+    #: The share of a generation's offspring slots the walk may take, floored
+    #: to whole slots, after exploration and intensification take theirs.
+    walk_fraction: float = 0.25
+    #: THE JOINT-CANDIDATE POOL (REFINEMENT_ROUND.md X1): the share of a
+    #: generation's offspring slots drawn from the prior reply's directly
+    #: named configurations (WeightedRestriction.candidates), weighted,
+    #: dedup-checked, partial fragments completed through the prior in
+    #: force. 0.0 -- the default -- never touches the pool even when the
+    #: reply populated it.
+    joint_share: float = 0.0
     #: How survival breaks ties inside one domination count. "count" -- the
     #: default -- keeps the measurement order and is byte-identical.
     #: "crowding" prefers the members that are most alone in objective space
@@ -510,6 +531,20 @@ def run_genetic_loop(
         raise ValueError(
             f"actuation must be 'off' or 'fresh-boost', got {config.actuation!r}")
     boost_on = config.actuation == "fresh-boost"
+    if config.walk not in ("off", "ball"):
+        raise ValueError(f"walk must be 'off' or 'ball', got {config.walk!r}")
+    if not _is_number(config.walk_fraction) or not (
+            0.0 <= float(config.walk_fraction) <= 1.0):
+        raise ValueError(
+            f"walk_fraction must be a fraction in [0, 1], got "
+            f"{config.walk_fraction!r}")
+    walk_on = config.walk == "ball"
+    if not _is_number(config.joint_share) or not (
+            0.0 <= float(config.joint_share) <= 1.0):
+        raise ValueError(
+            f"joint_share must be a fraction in [0, 1], got "
+            f"{config.joint_share!r}")
+    joint_on = float(config.joint_share) > 0.0
 
     specs = list(problem.objectives)
     candidate_model = getattr(problem, "candidate_model", None)
@@ -568,7 +603,7 @@ def run_genetic_loop(
     # cache or refused. Populated only under the mechanisms that need it, so
     # all of them off leaves no side effect behind at all.
     seen_keys: Set[str] = set()
-    track_seen = polish_on or explore_on or intensify_on
+    track_seen = polish_on or explore_on or intensify_on or walk_on
 
     def measure(configs: List[Config], gen: int) -> List[Any]:
         room = budget_left()
@@ -772,6 +807,12 @@ def run_genetic_loop(
     rng_intensify = (random.Random(0 if config.seed is None
                                    else (config.seed ^ 0x1CE111))
                      if intensify_on else None)
+    rng_walk = (random.Random(0 if config.seed is None
+                              else (config.seed ^ 0xBA11))
+                if walk_on else None)
+    rng_joint = (random.Random(0 if config.seed is None
+                               else (config.seed ^ 0x10147))
+                 if joint_on else None)
 
     # The prior the DRAW SEAMS see: the elite mixture over the restriction in
     # force, or the restriction itself when the mixture is off. Recomputed at
@@ -907,7 +948,9 @@ def run_genetic_loop(
         explore_count = 0
         intensify_count = 0
         burst_count = 0
-        if (explore_on or intensify_on) and not polishing:
+        walk_count = 0
+        joint_count = 0
+        if (explore_on or intensify_on or walk_on or joint_on) and not polishing:
             proposed_keys: Set[str] = set()
 
             def admit(candidate: Config) -> bool:
@@ -919,6 +962,27 @@ def run_genetic_loop(
                 proposed_keys.add(key)
                 extra_kids.append(candidate)
                 return True
+
+            if joint_on:
+                pool_entries = list(getattr(restriction, "candidates", ()) or ())
+                slots = min(want - len(extra_kids),
+                            int(round(float(config.joint_share) * want, 9)))
+                if pool_entries and slots > 0:
+                    weights_j = [max(1e-9, w) for _f, w in pool_entries]
+                    for _slot in range(slots):
+                        for _attempt in range(_DEDUP_ATTEMPTS):
+                            fragment, _w = pool_entries[
+                                rng_joint.choices(
+                                    range(len(pool_entries)),
+                                    weights=weights_j, k=1)[0]]
+                            base_draw = uniform_candidate(
+                                dict(seeds[0]), candidate_model,
+                                rng=rng_joint, restriction=draw_prior)
+                            candidate = dict(base_draw)
+                            candidate.update(fragment)
+                            if admit(candidate):
+                                joint_count += 1
+                                break
 
             if explore_on:
                 probability = explore_probability(
@@ -990,6 +1054,31 @@ def run_genetic_loop(
                                 rng=rng_intensify, restriction=draw_prior)
                             if admit(candidate):
                                 intensify_count += 1
+                                break
+
+            if walk_on:
+                slots = min(want - len(extra_kids),
+                            int(round(float(config.walk_fraction) * want, 9)))
+                if slots > 0:
+                    if config.evaluation_budget:
+                        progress = min(1.0, spent() / config.evaluation_budget)
+                        radius = max(1, round(4 * (1.0 - progress)))
+                    else:
+                        radius = 2
+                    anchors = []
+                    for spec in specs:
+                        sign = 1.0 if spec.goal == "min" else -1.0
+                        anchors.append(min(
+                            population,
+                            key=lambda pair: sign * float(pair[1][spec.name]))[0])
+                    for slot in range(slots):
+                        anchor = anchors[slot % len(anchors)]
+                        for _attempt in range(_DEDUP_ATTEMPTS):
+                            candidate = ball_candidate(
+                                anchor, candidate_model,
+                                rng=rng_walk, radius=radius)
+                            if admit(candidate):
+                                walk_count += 1
                                 break
 
         # What breeding is left to fill. With both mechanisms off this is
@@ -1326,6 +1415,10 @@ def run_genetic_loop(
         if burst_on:
             # Same terms as explore/intensify: the zero is a measured zero.
             entry["burst"] = burst_count
+        if walk_on:
+            entry["walk"] = walk_count
+        if joint_on:
+            entry["joint"] = joint_count
         if mixer is not None:
             # Cumulative draws where the front actually held an opinion; the
             # measured zero (prior right, front agreeing) is part of the story.

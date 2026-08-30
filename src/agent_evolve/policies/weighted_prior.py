@@ -104,6 +104,16 @@ class WeightedRestriction:
     weighted: Mapping[str, tuple[tuple[Any, ...], tuple[float, ...]]] = field(
         default_factory=dict
     )
+    #: X1, the joint-candidate channel (REFINEMENT_ROUND.md): weighted whole
+    #: or partial configurations the reply named DIRECTLY. The trace
+    #: forensics found live replies already smuggling 4-8 joint configs
+    #: through the marginals (17/24 tapes), which a product-of-marginals
+    #: draw reproduces with probability ~1e-17; this field is where they
+    #: survive instead. Entries are ({field: value, ...}, weight) pairs,
+    #: validated per value at admission; the loop's joint_share knob decides
+    #: whether any slot ever draws them, so a populated field with the knob
+    #: off changes nothing.
+    candidates: tuple = ()
     misses: list[str] = field(default_factory=list, compare=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -395,6 +405,8 @@ class WeightedPriorTelemetry:
     errors: int = 0
     snapped_values: int = 0
     band_filled_rungs: int = 0
+    joint_accepted: int = 0
+    joint_rejected: int = 0
     proposals: list = field(default_factory=list)
 
     def as_dict(self) -> dict[str, int]:
@@ -408,6 +420,8 @@ class WeightedPriorTelemetry:
             "errors": self.errors,
             "snapped_values": self.snapped_values,
             "band_filled_rungs": self.band_filled_rungs,
+            "joint_accepted": self.joint_accepted,
+            "joint_rejected": self.joint_rejected,
             "proposals": len(self.proposals),
         }
 
@@ -432,7 +446,19 @@ weight zero and is not sampled; a locus you omit stays free. You are not
 choosing a candidate and must not propose one. {closing}
 
 Reply with ONLY this JSON shape and no other text:
-{{"weights": {{"<param>": {{"values": [...], "weights": [...]}}}}, "free": ["<param>", ...]}}"""
+{{"weights": {{"<param>": {{"values": [...], "weights": [...]}}}}, "free": ["<param>", ...]{joints_shape}}}"""
+
+_JOINTS_CLAUSE = """
+
+Weights are per-parameter marginals and cannot express COMBINATIONS. If the
+evidence suggests specific joint configurations -- parameters that work
+together -- name up to {k} of them directly as candidates: each a complete or
+partial configuration with a non-negative weight (higher weight, more draws).
+Values must come from the declared domains; omitted parameters stay free."""
+
+_JOINTS_SHAPE = (
+    ', "candidates": [{{"config": {{"<param>": <value>, ...}}, '
+    '"weight": <w>}}, ...]')
 
 _CAUTIOUS_CLOSE = (
     "Over-restricting a\nfrontier-spreading parameter destroys diversity: "
@@ -469,6 +495,7 @@ def llm_weighted_prior_proposer(
     domain_context: str = "",
     style: str = "cautious",
     prior_floor: float | None = None,
+    joints: int = 0,
 ) -> Callable[[Attribution, Any], WeightedRestriction]:
     """A prior proposer that elicits a GRADED prior and repairs nothing.
 
@@ -505,6 +532,11 @@ def llm_weighted_prior_proposer(
             f"weighted prior style must be one of {PRIOR_STYLES}, got "
             f"{style!r}")
     template = COMMITTED_PROMPT if style == "committed" else PROMPT
+    if joints > 0:
+        template = template.replace(
+            "Reply with ONLY this JSON shape",
+            _JOINTS_CLAUSE.format(k=int(joints)).strip()
+            + "\n\nReply with ONLY this JSON shape")
     tel = telemetry if telemetry is not None else WeightedPriorTelemetry()
     goals = ", ".join(objective_lines(objectives))
     preamble = f"{domain_context.strip()}\n\n" if domain_context.strip() else ""
@@ -517,6 +549,7 @@ def llm_weighted_prior_proposer(
         prompt = preamble + template.format(
             n=attr.n_evaluated,
             goals=goals,
+            joints_shape=(_JOINTS_SHAPE if joints > 0 else ""),
             schema="\n".join(f"  {line}" for line in described)
             if described else
             "\n".join(f"  {k}: one of {list(v)}" for k, v in domains.items()),
@@ -605,14 +638,46 @@ def llm_weighted_prior_proposer(
             weighted[name] = floor_weights(
                 filled_v, filled_w, domain=domain, floor=prior_floor)
 
-        if not weighted:
+        joint_pool: list = []
+        if joints > 0:
+            for item in (raw.get("candidates") or [])[: int(joints)]:
+                if not isinstance(item, dict):
+                    continue
+                fragment = item.get("config")
+                weight = item.get("weight", 1.0)
+                if (not isinstance(fragment, dict) or not fragment
+                        or isinstance(weight, bool)
+                        or not isinstance(weight, (int, float))
+                        or not math.isfinite(float(weight))
+                        or float(weight) < 0.0):
+                    tel.joint_rejected += 1
+                    continue
+                clean_frag: dict = {}
+                ok = True
+                for fname, fvalue in fragment.items():
+                    if fname not in domains:
+                        ok = False
+                        break
+                    fdomain = tuple(domains[fname])
+                    snapped = snap_to_rung(fvalue, fdomain)
+                    if snapped not in fdomain:
+                        ok = False
+                        break
+                    clean_frag[fname] = snapped
+                if ok and clean_frag:
+                    joint_pool.append((clean_frag, float(weight)))
+                    tel.joint_accepted += 1
+                else:
+                    tel.joint_rejected += 1
+
+        if not weighted and not joint_pool:
             tel.empty += 1
             return WeightedRestriction({})
         tel.restricted_loci += len(weighted)
         tel.proposals.append(
             {k: (list(v[0]), list(v[1])) for k, v in weighted.items()}
         )
-        return WeightedRestriction(weighted)
+        return WeightedRestriction(weighted, candidates=tuple(joint_pool))
 
     propose.telemetry = tel                    # type: ignore[attr-defined]
     propose.mechanism = "weighted_prior"       # type: ignore[attr-defined]

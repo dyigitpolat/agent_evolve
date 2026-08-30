@@ -274,7 +274,11 @@ Reply with ONLY this JSON shape and no other text:
 
 
 def test_the_cautious_prompt_has_not_moved_by_one_character():
-    assert PROMPT == CAUTIOUS_PROMPT_TODAY
+    # X1 (2026-08-30) added a {joints_shape} placeholder that formats to the
+    # EMPTY string unless a caller invites joint candidates, so the default
+    # call's rendered prompt is character-identical to the sealed rows'.
+    # The pin therefore compares the template with the placeholder removed.
+    assert PROMPT.replace("{joints_shape}", "") == CAUTIOUS_PROMPT_TODAY
 
 
 def test_cautious_is_the_default_and_renders_the_same_bytes():

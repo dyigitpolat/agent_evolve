@@ -419,6 +419,10 @@ def optimize(
     intensify_burst: int = 0,
     elite_mix: float = 0.0,
     actuation: str = "off",
+    walk: str = "off",
+    walk_fraction: float = 0.25,
+    joints: int = 0,
+    joint_share: float = 0.0,
 ) -> SearchResult:
     """Optimize *problem* within *budget* evaluations.
 
@@ -518,6 +522,10 @@ def optimize(
     if intensify not in ("off", "incumbent"):
         raise ValueError(
             f"intensify must be 'off' or 'incumbent', got {intensify!r}")
+    if joint_share > 0.0 and joints <= 0:
+        raise ValueError(
+            "joint_share spends the reply's candidates block, and joints=0 "
+            "never invites one: raise joints or drop joint_share")
     if effort is not None and not isinstance(effort, str):
         raise ValueError(
             f"effort must be a provider effort level as a string, got {effort!r}"
@@ -589,6 +597,9 @@ def optimize(
             ("intensify_burst", intensify_burst != 0),
             ("elite_mix", elite_mix != 0.0),
             ("actuation", actuation != "off"),
+            ("walk", walk != "off"),
+            ("joints", joints != 0),
+            ("joint_share", joint_share != 0.0),
             ("effort", effort is not None),
             ("journal", journal is not None),
             ("authorship", authorship_config is not None
@@ -748,7 +759,8 @@ def optimize(
                         domain_context=domain_card(bound),
                         style=("committed"
                                if prior == "llm-weighted-committed"
-                               else "cautious"))
+                               else "cautious"),
+                        joints=int(joints))
 
             if authorship_config is None:
                 if complete is not None:
@@ -817,6 +829,9 @@ def optimize(
                     intensify_burst=intensify_burst,
                     elite_mix=elite_mix,
                     actuation=actuation,
+                    walk=walk,
+                    walk_fraction=walk_fraction,
+                    joint_share=joint_share,
                 ),
                 chooser=chooser_policy,
                 log=announce,

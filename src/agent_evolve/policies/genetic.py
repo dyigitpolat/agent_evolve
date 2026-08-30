@@ -35,6 +35,7 @@ __all__ = [
     "mutate",
     "one_mutation_neighbourhood",
     "local_probe_candidate",
+    "ball_candidate",
     "uniform_candidate",
     "coverage_counts",
     "coverage_candidate",
@@ -735,6 +736,49 @@ def local_probe_candidate(
     nearest = sorted((v for v in domain if v != current),
                      key=lambda v: _nearness(v, current))[:max(1, span)]
     return write_locus(anchor, locus, nearest[rng.randrange(len(nearest))])
+
+
+def ball_candidate(
+    anchor: Mapping[str, Any],
+    candidate_model: Any,
+    *,
+    rng: random.Random,
+    radius: int,
+) -> dict[str, Any]:
+    """*anchor* with every ordered locus stepped within +/- *radius* levels.
+
+    The walk operator (REFINEMENT_ROUND.md X3), shaped by what the specialist
+    traces actually do: the winning optimizer contracts to a ~0.4-level ball
+    around its incumbent by its first model-driven batch and then takes
+    ~0.3-level improving steps -- while this loop's own evaluations landed
+    within 2 levels of its champion 0.9% of the time and its improvement
+    events were 5-level teleports. A ball sample steps each NUMERIC ordered
+    locus by a uniform draw in [-radius, +radius] of the anchor's ladder
+    index (clamped to the declared ends); an unordered locus resamples
+    uniformly with the mutation-default probability 1/n, since a categorical
+    axis has no "nearby". Radius 1 is the smallest walk; the caller anneals.
+    """
+
+    out = dict(anchor)
+    loci = loci_of(anchor)
+    n = max(1, len(loci))
+    for locus in loci:
+        domain = locus_domain(candidate_model, locus)
+        if not domain or len(domain) < 2:
+            continue
+        current = read_locus(out, locus)
+        numeric = all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                      for v in domain)
+        if numeric and current in domain:
+            index = list(domain).index(current)
+            step = rng.randint(-max(1, radius), max(1, radius))
+            out = write_locus(
+                out, locus,
+                domain[max(0, min(len(domain) - 1, index + step))])
+        elif rng.random() < 1.0 / n:
+            choices = tuple(v for v in domain if v != current) or domain
+            out = write_locus(out, locus, choices[rng.randrange(len(choices))])
+    return out
 
 
 def uniform_candidate(
