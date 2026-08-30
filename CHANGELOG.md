@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — the machine stops destroying admitted guidance
+
+Trace forensics over the runtime tapes measured a three-stage loss between
+what the model says and what the evolution does; three default-on repairs
+close the first two stages, each measured before shipping. The **band
+codec**: replies name value bands whose unnamed interior rungs were zeroed
+permanently (68.2% of in-band rungs) — now linearly interpolated, with
+off-ladder numerics snapped to the nearest declared rung at both admission
+points. The **falsified cage**: a per-objective champion sitting outside
+the prior's support that nothing inside can match, persisting three
+generations, drops the restriction (the old test fired on 2 of 24 cells
+while 8 optimum-excluding cages held; the new one falsified 16 of 17 in
+its gate row). **No stranded budget**: a run that exhausts its generations
+with budget remaining spends it on forced-novel draws (7 of 24 cells had
+stranded up to 219 of 384 evaluations). Measured on the row that motivated
+them, with the fresh-prior actuation boost (`actuation="fresh-boost"`) and
+the 1-mutation endgame sweep: the NAS endpoint row went from 10/24
+wins+ties and a 0.92× hard-target ratio to **16/24 and 1.27×** against the
+same standing NSGA-II cells, and the analog frozen arm gained +0.055 to
++0.098 median at 9/12 signs.
+
+### Added — three knobs with their measured sentences
+
+`walk="ball"` (annealed-radius steps around per-objective champions) read
+an endpoint wash with partial localization (6.45 → 4.01 levels; the
+specialist sits at 0.35) at a 25% share — off by default. `joints=K` +
+`joint_share` invite and spend weighted joint candidate configurations in
+the prior reply; live models supplied 4–8 per reply with zero formatting
+rejections, and the endpoint read a wash at N=12 — off by default, the
+mechanical completeness recorded. `elite_mix` remains off per its earlier
+wash. The measured NAS configuration is `actuation="fresh-boost"` +
+`polish="sweep"` on the default substrate.
+
 ## 0.6.0 — 2026-08-28
 
 ### Fixed — the crossed screen was a diagonal
